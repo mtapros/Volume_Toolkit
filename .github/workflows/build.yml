@@ -59,7 +59,6 @@ jobs:
             "build-tools;28.0.2" \
             "ndk;25.2.9519653"
 
-          # Legacy SDK Tools shim for OpenCV CMake detection
           mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" "$ANDROID_SDK_ROOT/tools/bin/avdmanager"
@@ -87,7 +86,7 @@ jobs:
             --permission android.permission.CHANGE_WIFI_STATE \
             --permission android.permission.READ_EXTERNAL_STORAGE \
             --permission android.permission.WRITE_EXTERNAL_STORAGE \
-            --orientation landscape \
+            --orientation portrait \
             --arch arm64-v8a \
             --android-api 27 \
             --ndk-api 21 \
