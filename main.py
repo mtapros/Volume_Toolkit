@@ -205,10 +205,10 @@ class PreviewOverlay(FloatLayout):
             pts = []
             for i in range(1, n):
                 x = fx + fw * (i / n)
-                pts.extend([x, fy, x, fy + fh])
+                pts += [x, fy, x, fy + fh]
             for i in range(1, n):
                 y = fy + fh * (i / n)
-                pts.extend([fx, y, fx + fw, y])
+                pts += [fx, y, fx + fw, y]
             self._ln_grid.points = pts
         else:
             self._ln_grid.points = []
@@ -817,18 +817,6 @@ class DesktopCanonApp(App):
         else:
             note = self.qr_status.text if self.qr_status.text else "QR: none"
 
-        # Anti-jank: 5px movement threshold
-        if points and self._latest_qr_points:
-            moved = False
-            for i in range(min(len(points), len(self._latest_qr_points))):
-                dx = abs(points[i][0] - self._latest_qr_points[i][0])
-                dy = abs(points[i][1] - self._latest_qr_points[i][1])
-                if dx > 5 or dy > 5:
-                    moved = True
-                    break
-            if not moved and text == self._latest_qr_text:
-                return
-
         Clock.schedule_once(lambda *_: self._set_qr_ui(text, points, note=note), 0)
 
     def _set_qr_ui(self, text, points, note="QR: none"):
@@ -1235,4 +1223,4 @@ class DesktopCanonApp(App):
 
 
 if __name__ == "__main__":
-    CanonLiveViewApp().run()
+    DesktopCanonApp().run()
