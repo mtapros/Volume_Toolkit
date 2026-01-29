@@ -87,11 +87,11 @@ jobs:
             --permission android.permission.CHANGE_WIFI_STATE \
             --permission android.permission.READ_EXTERNAL_STORAGE \
             --permission android.permission.WRITE_EXTERNAL_STORAGE \
-            --orientation sensor \
+            --orientation landscape \
             --arch arm64-v8a \
             --android-api 27 \
             --ndk-api 21 \
-            --blacklist-requirements sqlite3,tkinter \
+            --blacklist sqlite3,tkinter \
             --presplash-color "#000000" \
             --window
 
