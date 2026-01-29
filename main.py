@@ -332,7 +332,10 @@ class DesktopCanonApp(App):
         self._session.verify = False
 
     def build(self):
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
+        # Wrap in ScrollView for Android screen compatibility
+        scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8), size_hint_y=None)
+        root.bind(minimum_height=root.setter('height'))
 
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         header.add_widget(Label(text="Desktop Canon CCAPI Tool (R6 II)", font_size=sp(18)))
@@ -428,7 +431,8 @@ class DesktopCanonApp(App):
         self._reschedule_display_loop(int(self.fps_slider.value))
         self._set_controls_idle()
         self.log("Desktop CCAPI GUI ready")
-        return root
+        scroll.add_widget(root)
+        return scroll
 
     # ---------- logging / HTTPS ----------
 
