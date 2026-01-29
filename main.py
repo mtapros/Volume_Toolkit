@@ -332,7 +332,7 @@ class DesktopCanonApp(App):
         self._session.verify = False
 
     def build(self):
-        # Wrap in ScrollView for Android screen compatibility
+        # Scrollable UI for Android
         scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8), size_hint_y=None)
         root.bind(minimum_height=root.setter('height'))
@@ -431,8 +431,7 @@ class DesktopCanonApp(App):
         self._reschedule_display_loop(int(self.fps_slider.value))
         self._set_controls_idle()
         self.log("Desktop CCAPI GUI ready")
-        scroll.add_widget(root)
-        return scroll
+        return root
 
     # ---------- logging / HTTPS ----------
 
