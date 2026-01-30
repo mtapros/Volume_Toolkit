@@ -72,7 +72,7 @@ jobs:
           p4a apk \
             --private . \
             --package org.example.canonliveview \
-            --name VolumeToolkit \
+            --name "Volume Toolkit" \
             --version 1.0.1 \
             --bootstrap sdl2 \
             --requirements python3,kivy==2.3.0,pillow,numpy,opencv,pyjnius,requests,urllib3 \
