@@ -79,7 +79,7 @@ jobs:
             --name CanonLiveView \
             --version 0.1.0 \
             --bootstrap sdl2 \
-            --requirements python3,kivy==2.3.0,pillow,numpy,opencv,pyjnius \
+            --requirements python3,kivy==2.3.0,pillow,numpy,opencv,pyjnius,requests,urllib3 \
             --permission android.permission.INTERNET \
             --permission android.permission.ACCESS_NETWORK_STATE \
             --permission android.permission.ACCESS_WIFI_STATE \
