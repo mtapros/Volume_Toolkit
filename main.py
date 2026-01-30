@@ -323,6 +323,12 @@ class CanonLiveViewApp(App):
         self.selected_headers = []
         self._headers_popup = None
 
+        # Student picker (CSV sort/filter)
+        self.student_list_mode = "sort"  # "sort" or "filter"
+        self.student_list_key = None     # header name
+        self.student_filter_text = ""
+        self._student_picker_popup = None
+
         # Thumbnails
         self._thumb_textures = []
         self._thumb_images = []
@@ -562,6 +568,7 @@ class CanonLiveViewApp(App):
         add_toggle("QR detect (OpenCV)", True, lambda v: self._set_qr_enabled(v))
         add_button("Load CSV…", lambda: self._open_csv_filechooser())
         add_button("Select headers…", lambda: self._open_headers_popup())
+        add_button("Select student…", lambda: self._open_student_picker_popup())
         add_button("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
 
         add_header("Capture")
@@ -1051,11 +1058,26 @@ class CanonLiveViewApp(App):
         self.csv_rows = rows
         self.log(f"CSV headers: {headers}")
         self.log(f"CSV rows: {len(rows)}")
-
-        preferred = ["LAST_NAME", "FIRST_NAME", "GRADE", "TEACHER", "STUDENT_ID"]
+        preferred = [
+            # Common variants
+            "LASTNAME", "FIRSTNAME", "GRADE", "TEACHER", "STUDENTID",
+            "LAST_NAME", "FIRST_NAME", "STUDENT_ID",
+        ]
         self.selected_headers = [h for h in preferred if h in headers]
         if not self.selected_headers and headers:
             self.selected_headers = headers[:3]
+
+        # Default student list sort/filter settings (persist across imports unless key missing)
+        if getattr(self, 'student_list_mode', None) not in ('sort', 'filter'):
+            self.student_list_mode = 'sort'
+        if (getattr(self, 'student_list_key', None) is None) or (self.student_list_key not in headers):
+            self.student_list_key = None
+            for cand in ("LASTNAME", "LAST_NAME", "STUDENTID", "STUDENT_ID", "FIRSTNAME", "FIRST_NAME"):
+                if cand in headers:
+                    self.student_list_key = cand
+                    break
+            if (self.student_list_key is None) and headers:
+                self.student_list_key = headers[0]
 
     def _open_headers_popup(self):
         if not self.csv_headers:
@@ -1065,6 +1087,83 @@ class CanonLiveViewApp(App):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
         root.add_widget(Label(text="Select columns to include in Author (joined with _):",
                               size_hint=(1, None), height=dp(40), font_size=sp(12)))
+
+        # Shared student list sort/filter settings (used by Student selection)
+        if (self.student_list_key is None) or (self.student_list_key not in self.csv_headers):
+            self.student_list_key = self.csv_headers[0]
+        if self.student_list_mode not in ('sort', 'filter'):
+            self.student_list_mode = 'sort'
+
+        mode_row = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
+        mode_row.add_widget(Label(text="Student list", size_hint=(None, 1), width=dp(92), font_size=sp(12)))
+
+        updating = {"flag": False}
+
+        cb_sort = CheckBox(active=(self.student_list_mode != 'filter'), size_hint=(None, 1), width=dp(32))
+        mode_row.add_widget(cb_sort)
+        mode_row.add_widget(Label(text="Sort", size_hint=(None, 1), width=dp(40), font_size=sp(12)))
+
+        cb_filter = CheckBox(active=(self.student_list_mode == 'filter'), size_hint=(None, 1), width=dp(32))
+        mode_row.add_widget(cb_filter)
+        mode_row.add_widget(Label(text="Filter", size_hint=(None, 1), width=dp(45), font_size=sp(12)))
+
+        key_btn = Button(text=f"Key: {self.student_list_key}", size_hint=(1, 1), font_size=sp(12))
+        mode_row.add_widget(key_btn)
+        root.add_widget(mode_row)
+
+        filter_row = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
+        filter_row.add_widget(Label(text="Filter text", size_hint=(None, 1), width=dp(90), font_size=sp(12)))
+        filter_input = TextInput(text=self.student_filter_text or "", multiline=False, font_size=sp(12))
+        filter_row.add_widget(filter_input)
+        root.add_widget(filter_row)
+
+        def update_filter_visibility():
+            show = (self.student_list_mode == 'filter')
+            filter_row.opacity = 1 if show else 0
+            filter_row.disabled = (not show)
+
+        def set_mode(mode):
+            updating['flag'] = True
+            self.student_list_mode = mode
+            cb_sort.active = (mode == 'sort')
+            cb_filter.active = (mode == 'filter')
+            updating['flag'] = False
+            update_filter_visibility()
+
+        def on_sort_active(_inst, val):
+            if updating['flag']:
+                return
+            if val:
+                set_mode('sort')
+
+        def on_filter_active(_inst, val):
+            if updating['flag']:
+                return
+            if val:
+                set_mode('filter')
+
+        cb_sort.bind(active=on_sort_active)
+        cb_filter.bind(active=on_filter_active)
+
+        key_dd = DropDown(auto_dismiss=True)
+        for h in self.csv_headers:
+            b = Button(text=h, size_hint_y=None, height=dp(36), font_size=sp(12))
+            b.bind(on_release=lambda btn: key_dd.select(btn.text))
+            key_dd.add_widget(b)
+
+        def on_key_select(_dd, header):
+            self.student_list_key = header
+            key_btn.text = f"Key: {header}"
+
+        key_dd.bind(on_select=on_key_select)
+        key_btn.bind(on_release=lambda *_: key_dd.open(key_btn))
+
+        def on_filter_text(_inst, _val):
+            self.student_filter_text = filter_input.text
+
+        filter_input.bind(text=on_filter_text)
+
+        update_filter_visibility()
 
         sv = ScrollView(size_hint=(1, 1))
         inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
@@ -1112,6 +1211,218 @@ class CanonLiveViewApp(App):
 
         popup.open()
         self._headers_popup = popup
+
+
+    def _student_row_display(self, row: dict) -> str:
+        """Human-friendly single-line display for a CSV row."""
+        headers = self.csv_headers or []
+
+        def v(k):
+            return (row.get(k) or "").strip()
+
+        ln = v("LASTNAME") or v("LAST_NAME")
+        fn = v("FIRSTNAME") or v("FIRST_NAME")
+        sid = v("STUDENTID") or v("STUDENT_ID")
+        grade = v("GRADE")
+        teacher = v("TEACHER")
+
+        parts = []
+        if ln or fn:
+            name = (ln + (", " + fn if fn else "")).strip(", ")
+            parts.append(name)
+        if grade:
+            parts.append(f"Grade {grade}")
+        if teacher:
+            parts.append(f"{teacher}")
+        if sid:
+            parts.append(f"ID {sid}")
+
+        if parts:
+            return " | ".join(parts)
+
+        for h in headers[:6]:
+            if v(h):
+                return v(h)
+        return "(empty row)"
+
+
+    def _build_student_payload(self, row: dict) -> str:
+        """Build Author payload from the selected headers and a row dict."""
+        vals = []
+        for h in (self.selected_headers or []):
+            s = (row.get(h) or "").strip()
+            if s:
+                vals.append(s)
+        return "_".join(vals)
+
+
+    def _apply_student_list_mode(self, rows):
+        """Apply current sort/filter settings to rows and return a new list."""
+        key = self.student_list_key
+        mode = self.student_list_mode
+        # lstrip(): ignore leading spaces in user input
+        ftxt = (self.student_filter_text or "").lstrip().lower()
+
+        def keyval(r):
+            if not key:
+                return ""
+            # lstrip(): ignore leading spaces in data
+            return (r.get(key) or "").lstrip()
+
+        out = list(rows or [])
+        if mode == 'filter' and key and ftxt:
+            out = [r for r in out if keyval(r).lower().startswith(ftxt)]
+        elif mode == 'sort' and key:
+            out.sort(key=lambda r: keyval(r).lower())
+        return out
+
+
+    def _open_student_picker_popup(self):
+        if not self.csv_rows or not self.csv_headers:
+            self.log("No CSV loaded; cannot select student")
+            return
+
+        if (self.student_list_key is None) or (self.student_list_key not in self.csv_headers):
+            self.student_list_key = self.csv_headers[0]
+
+        if self.student_list_mode not in ('sort', 'filter'):
+            self.student_list_mode = 'sort'
+
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Select a student (tap a row)", size_hint=(1, None), height=dp(28), font_size=sp(13)))
+
+        # Controls
+        controls = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
+        controls.add_widget(Label(text="Mode", size_hint=(None, 1), width=dp(50), font_size=sp(12)))
+
+        updating = {"flag": False}
+
+        cb_sort = CheckBox(active=(self.student_list_mode != 'filter'), size_hint=(None, 1), width=dp(32))
+        controls.add_widget(cb_sort)
+        controls.add_widget(Label(text="Sort", size_hint=(None, 1), width=dp(40), font_size=sp(12)))
+
+        cb_filter = CheckBox(active=(self.student_list_mode == 'filter'), size_hint=(None, 1), width=dp(32))
+        controls.add_widget(cb_filter)
+        controls.add_widget(Label(text="Filter", size_hint=(None, 1), width=dp(45), font_size=sp(12)))
+
+        key_btn = Button(text=f"Key: {self.student_list_key}", size_hint=(1, 1), font_size=sp(12))
+        controls.add_widget(key_btn)
+        root.add_widget(controls)
+
+        filter_row = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
+        filter_row.add_widget(Label(text="Filter text", size_hint=(None, 1), width=dp(90), font_size=sp(12)))
+        filter_input = TextInput(text=self.student_filter_text or "", multiline=False, font_size=sp(12))
+        filter_row.add_widget(filter_input)
+        root.add_widget(filter_row)
+
+        selected_lbl = Label(text="Selected: (none)", size_hint=(1, None), height=dp(22), font_size=sp(12))
+        root.add_widget(selected_lbl)
+
+        sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
+        inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        inner.bind(minimum_height=inner.setter("height"))
+        sv.add_widget(inner)
+        root.add_widget(sv)
+
+        btns = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
+        push_btn = Button(text="Push to Author")
+        close_btn = Button(text="Close")
+        btns.add_widget(push_btn)
+        btns.add_widget(close_btn)
+        root.add_widget(btns)
+
+        popup = Popup(title="Students", content=root, size_hint=(0.95, 0.95))
+        self._student_picker_popup = popup
+
+        state = {"selected_row": None}
+
+        def update_filter_visibility():
+            show = (self.student_list_mode == 'filter')
+            filter_row.opacity = 1 if show else 0
+            filter_row.disabled = (not show)
+
+        def set_mode(mode):
+            updating["flag"] = True
+            self.student_list_mode = mode
+            cb_sort.active = (mode == 'sort')
+            cb_filter.active = (mode == 'filter')
+            updating["flag"] = False
+            update_filter_visibility()
+            rebuild_list()
+
+        def on_sort_active(_inst, val):
+            if updating["flag"]:
+                return
+            if val:
+                set_mode('sort')
+
+        def on_filter_active(_inst, val):
+            if updating["flag"]:
+                return
+            if val:
+                set_mode('filter')
+
+        cb_sort.bind(active=on_sort_active)
+        cb_filter.bind(active=on_filter_active)
+
+        key_dd = DropDown(auto_dismiss=True)
+        for h in self.csv_headers:
+            b = Button(text=h, size_hint_y=None, height=dp(36), font_size=sp(12))
+            b.bind(on_release=lambda btn: key_dd.select(btn.text))
+            key_dd.add_widget(b)
+
+        def on_key_select(_dd, header):
+            self.student_list_key = header
+            key_btn.text = f"Key: {header}"
+            rebuild_list()
+
+        key_dd.bind(on_select=on_key_select)
+        key_btn.bind(on_release=lambda *_: key_dd.open(key_btn))
+
+        def on_filter_text(_inst, _val):
+            self.student_filter_text = filter_input.text
+            if self.student_list_mode == 'filter':
+                rebuild_list()
+
+        filter_input.bind(text=on_filter_text)
+
+        def select_row(row):
+            state["selected_row"] = row
+            payload = self._build_student_payload(row)
+            self.manual_payload = payload
+            selected_lbl.text = f"Selected: {self._student_row_display(row)}"
+
+        def rebuild_list():
+            inner.clear_widgets()
+            rows = self._apply_student_list_mode(self.csv_rows)
+
+            max_rows = 400
+            shown = rows[:max_rows]
+
+            for r in shown:
+                line = self._student_row_display(r)
+                b = Button(text=line, size_hint_y=None, height=dp(36), font_size=sp(11))
+                b.bind(on_release=lambda _btn, row=r: select_row(row))
+                inner.add_widget(b)
+
+            if len(rows) > max_rows:
+                inner.add_widget(Label(text=f"… showing first {max_rows} of {len(rows)}",
+                                       size_hint_y=None, height=dp(22), font_size=sp(11)))
+
+        def do_push(*_):
+            if not state["selected_row"]:
+                self.log("No student selected; nothing to push")
+                return
+            payload = self._build_student_payload(state["selected_row"])
+            self.manual_payload = payload
+            self._maybe_commit_author(payload, source='student')
+
+        push_btn.bind(on_release=do_push)
+        close_btn.bind(on_release=lambda *_: popup.dismiss())
+
+        update_filter_visibility()
+        rebuild_list()
+        popup.open()
 
     # ---------- contents + download (ver120, thumbnails only) ----------
 
