@@ -572,8 +572,12 @@ class CanonLiveViewApp(App):
         root.add_widget(self.log_holder)
 
         # Menu
-        self.dropdown = self._build_dropdown(reset_callback=fit_preview_to_holder)
-        self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
+        self.dropdown = self.builddropdown(fitpreviewtoholder)
+
+        def _open_menu(*_):
+            Clock.schedule_once(lambda dt: self.dropdown.open(self.menubtn), 0)
+
+        self.menubtn.bind(on_release=_open_menu)
 
         # Bindings
         self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
