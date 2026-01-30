@@ -654,7 +654,6 @@ class CanonLiveViewApp(App):
         Clock.schedule_once(_finish, 0)
 
     # ---------- liveview + QR ----------
-    # (rest of your original code is unchanged below except for the CSV bits)
 
     def _set_qr_enabled(self, enabled: bool):
         self.qr_enabled = bool(enabled)
@@ -886,6 +885,7 @@ class CanonLiveViewApp(App):
 
     # ---------- CSV / headers ----------
 
+
     # ---------- Android SAF CSV picker ----------
 
     def _bind_android_activity_once(self):
@@ -900,7 +900,7 @@ class CanonLiveViewApp(App):
 
     def _open_csv_saf(self):
         # Android Storage Access Framework picker (returns content:// URI).
-        # EXTRA_MIME_TYPES is optional; we avoid it to keep compatibility with older pyjnius builds. [web:328]
+        # We intentionally avoid jnius.j*array for compatibility.
         self._bind_android_activity_once()
         self._csv_req_code = getattr(self, "_csv_req_code", 4242)
 
@@ -912,8 +912,6 @@ class CanonLiveViewApp(App):
 
             intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
             intent.addCategory(Intent.CATEGORY_OPENABLE)
-
-            # Most devices recognize CSV as text/csv; '*/*' is safer if a device mislabels CSV. [web:328]
             intent.setType("*/*")
 
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -985,7 +983,6 @@ class CanonLiveViewApp(App):
         if platform == 'android':
             return self._open_csv_saf()
 
-        # Desktop: use Kivy FileChooserListView.
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         chooser = FileChooserListView(filters=["*.csv"], size_hint=(1, 1))
         content.add_widget(chooser)
@@ -1099,10 +1096,227 @@ class CanonLiveViewApp(App):
         self._headers_popup = popup
 
     # ---------- contents + download (ver120, thumbnails only) ----------
-    # (unchanged from your original; kept as-is in paste.txt)
 
-    # ... (rest of your original functions continue here) ...
+    def list_all_images(self):
+        images = []
+        status, root = self._json_call("GET", "/ccapi/ver120/contents", None, timeout=8.0)
+        self.log(f"/ccapi/ver120/contents -> {status}")
+        if not status.startswith("200") or not root or "path" not in root:
+            return images
+
+        for path in root["path"]:
+            st_dir, dirs = self._json_call("GET", path, None, timeout=8.0)
+            if not st_dir.startswith("200") or not dirs or "path" not in dirs:
+                continue
+            for d in dirs["path"]:
+                st_num, num = self._json_call("GET", d + "?kind=number", None, timeout=8.0)
+                if not st_num.startswith("200") or not num or "pagenumber" not in num:
+                    continue
+                pages = int(num["pagenumber"])
+                for page in range(1, pages + 1):
+                    st_files, f_data = self._json_call("GET", d + f"?page={page}", None, timeout=8.0)
+                    if not st_files.startswith("200") or not f_data or "path" not in f_data:
+                        continue
+                    for f in f_data["path"]:
+                        images.append(f)
+        return images
+
+    def _download_thumb_for_path(self, ccapi_path: str):
+        thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
+        self.log(f"Downloading thumbnail: {thumb_url}")
+        try:
+            resp = self._session.get(thumb_url, stream=True, timeout=10.0)
+            self.log(f"thumb status={resp.status_code} {resp.reason}")
+            if resp.status_code != 200:
+                return
+            thumb_bytes = resp.content
+        except Exception as e:
+            self.log(f"Thumbnail download error: {e}")
+            return
+
+        # Save thumbnail JPEG to disk so you can inspect quality
+        try:
+            os.makedirs(self.thumb_dir, exist_ok=True)
+            name = os.path.basename(ccapi_path) or "image"
+            if not name.lower().endswith((".jpg", ".jpeg")):
+                name = name + ".jpg"
+            out_path = os.path.join(self.thumb_dir, name)
+            with open(out_path, "wb") as f:
+                f.write(thumb_bytes)
+            self.log(f"Saved thumbnail {out_path}")
+        except Exception as e:
+            self.log(f"Saving thumbnail err: {e}")
+
+        # Decode into texture for Kivy preview
+        try:
+            pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
+            pil.thumbnail((200, 200))
+            w, h = pil.size
+            tex = Texture.create(size=(w, h), colorfmt="rgb")
+            tex.flip_vertical()
+            tex.blit_buffer(pil.tobytes(), colorfmt="rgb", bufferfmt="ubyte")
+        except Exception as e:
+            self.log(f"Thumbnail decode err: {e}")
+            return
+
+        self._thumb_textures.insert(0, tex)
+        self._thumb_paths.insert(0, ccapi_path)
+        self._thumb_textures = self._thumb_textures[:5]
+        self._thumb_paths = self._thumb_paths[:5]
+
+        def _update(_dt):
+            for idx, img in enumerate(self._thumb_images):
+                if idx < len(self._thumb_textures):
+                    img.texture = self._thumb_textures[idx]
+                else:
+                    img.texture = None
+
+        Clock.schedule_once(_update, 0)
+
+    def download_and_thumbnail_latest(self):
+        if not self.connected:
+            self.log("Not connected; cannot fetch contents.")
+            return
+
+        images = self.list_all_images()
+        self.log(f"contents: {len(images)} total entries")
+        if not images:
+            self.log("No images found on camera.")
+            return
+
+        jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
+        if not jpgs:
+            self.log("No JPG files found.")
+            return
+
+        latest = jpgs[-1]
+        self._download_thumb_for_path(latest)
+        self._last_seen_image = latest
+
+    def start_polling_new_images(self):
+        if self._poll_event is not None:
+            return
+        self.log(f"Starting image poller every {self.poll_interval_s}s")
+        self._poll_event = Clock.schedule_interval(self._poll_new_images, self.poll_interval_s)
+
+    def stop_polling_new_images(self):
+        if self._poll_event is not None:
+            self._poll_event.cancel()
+            self._poll_event = None
+            self.log("Image poller stopped")
+
+    def _poll_new_images(self, dt):
+        if not self.connected:
+            return
+
+        images = self.list_all_images()
+        if not images:
+            return
+
+        jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
+        if not jpgs:
+            return
+
+        if self._last_seen_image is None:
+            self._last_seen_image = jpgs[-1]
+            self.log(f"Poll: baseline set to {self._last_seen_image}")
+            return
+
+        new_start_idx = None
+        for idx, path in enumerate(jpgs):
+            if path == self._last_seen_image:
+                new_start_idx = idx + 1
+                break
+
+        if new_start_idx is None:
+            self.log("Poll: last_seen not found, resetting baseline")
+            self._last_seen_image = jpgs[-1]
+            return
+
+        new_items = jpgs[new_start_idx:]
+        if not new_items:
+            return
+
+        for path in new_items:
+            self.log(f"New image detected: {path}")
+            self._download_thumb_for_path(path)
+            self._last_seen_image = path
+
+    def dump_ccapi(self):
+        status, data = self._json_call("GET", "/ccapi", None, timeout=10.0)
+        self.log(f"/ccapi status={status}")
+        try:
+            j = json.dumps(data, indent=2)
+        except Exception:
+            j = str(data)
+        self.log("=== ccapi JSON START ===")
+        for line in j.splitlines():
+            self.log(line)
+        self.log("=== ccapi JSON END ===")
+
+    # ---------- thumbnail tap → viewer ----------
+
+    def _on_thumb_touch(self, image_widget, touch):
+        if not image_widget.collide_point(*touch.pos):
+            return False
+        idx = getattr(image_widget, "thumb_index", None)
+        if idx is None:
+            return False
+        if idx >= len(self._thumb_paths):
+            return False
+
+        ccapi_path = self._thumb_paths[idx]
+        tex = self._thumb_textures[idx]
+        self._open_thumb_viewer(ccapi_path, tex)
+        return True
+
+    def _open_thumb_viewer(self, ccapi_path: str, texture: Texture):
+        was_live = self.live_running
+        if was_live:
+            self.stop_liveview()
+
+        scatter = Scatter(do_rotation=False, do_translation=True, do_scale=True)
+        scatter.size_hint = (1, 1)
+
+        img = Image(texture=texture, allow_stretch=True, keep_ratio=True)
+        img.size_hint = (1, 1)
+        scatter.add_widget(img)
+
+        root = BoxLayout(orientation="vertical")
+        root.add_widget(scatter)
+
+        btn_bar = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6), padding=[dp(6)] * 4)
+        label = Label(text=os.path.basename(ccapi_path) or "Image", size_hint=(1, 1), font_size=sp(12))
+        close_btn = Button(text="Close viewer", size_hint=(None, 1), width=dp(120))
+        btn_bar.add_widget(label)
+        btn_bar.add_widget(close_btn)
+        root.add_widget(btn_bar)
+
+        popup = Popup(title="Image review (thumbnail)",
+                      content=root,
+                      size_hint=(0.95, 0.95))
+
+        def _close(*_):
+            popup.dismiss()
+            if was_live:
+                self.start_liveview()
+
+        close_btn.bind(on_release=_close)
+        popup.bind(on_dismiss=lambda *_: (was_live and self.start_liveview()))
+        popup.open()
+
+    # ---------- lifecycle ----------
+
+    def on_stop(self):
+        try:
+            self.stop_liveview()
+        except Exception:
+            pass
+        try:
+            self.stop_polling_new_images()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    CanonLiveViewApp().run()
+    DesktopCanonApp().run()
