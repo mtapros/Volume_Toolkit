@@ -42,6 +42,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.uix.filechooser import FileChooserListView
+from kivy.utils import platform
 
 from PIL import Image as PILImage
 
@@ -254,7 +255,7 @@ class CaptureType:
     BOTH = "Both"
 
 
-class DesktopCanonApp(App):
+class CanonLiveViewApp(App):
     capture_type = StringProperty(CaptureType.JPG)
 
     def __init__(self, **kwargs):
@@ -884,7 +885,112 @@ class DesktopCanonApp(App):
 
     # ---------- CSV / headers ----------
 
+    # ---------- Android SAF CSV picker ----------
+
+    def _bind_android_activity_once(self):
+        if getattr(self, "_android_activity_bound", False):
+            return
+        try:
+            from android import activity
+            activity.bind(on_activity_result=self._on_android_activity_result)
+            self._android_activity_bound = True
+        except Exception as e:
+            self.log(f"Android activity bind failed: {e}")
+
+    def _open_csv_saf(self):
+        # Android Storage Access Framework picker (returns content:// URI).
+        self._bind_android_activity_once()
+        self._csv_req_code = getattr(self, "_csv_req_code", 4242)
+
+        try:
+            from android import mActivity
+            from jnius import autoclass, jarray
+
+            Intent = autoclass("android.content.Intent")
+
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+
+            mime_types = [
+                "text/csv",
+                "text/comma-separated-values",
+                "application/csv",
+                "application/vnd.ms-excel",
+                "text/plain",
+            ]
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, jarray("Ljava/lang/String;")(mime_types))
+
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
+            self.log("Opening Android file picker…")
+            mActivity.startActivityForResult(intent, self._csv_req_code)
+
+        except Exception as e:
+            self.log(f"Failed to open Android picker: {e}")
+
+    def _on_android_activity_result(self, request_code, result_code, intent):
+        if request_code != getattr(self, "_csv_req_code", 4242):
+            return
+
+        # RESULT_OK == -1
+        if result_code != -1 or intent is None:
+            self.log("CSV picker canceled")
+            return
+
+        try:
+            from android import mActivity
+            from jnius import cast, autoclass
+
+            Intent = autoclass("android.content.Intent")
+            uri = cast("android.net.Uri", intent.getData())
+            if uri is None:
+                self.log("CSV picker returned no URI")
+                return
+
+            # Attempt to persist permission for future reads.
+            try:
+                flags = intent.getFlags()
+                take_flags = flags & (
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                )
+                mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
+            except Exception:
+                pass
+
+            data = self._read_android_uri_bytes(uri)
+            self._parse_csv_bytes(data)
+            self.log(f"CSV loaded from picker: {len(self.csv_rows)} rows")
+
+        except Exception as e:
+            self.log(f"CSV load failed (Android): {e}")
+
+    def _read_android_uri_bytes(self, uri):
+        # Read bytes from content:// URI using ContentResolver.openInputStream().
+        from android import mActivity
+
+        cr = mActivity.getContentResolver()
+        stream = cr.openInputStream(uri)
+        if stream is None:
+            raise Exception("openInputStream() returned null")
+
+        out = bytearray()
+        buf = bytearray(64 * 1024)
+        while True:
+            n = stream.read(buf)
+            if n == -1 or n == 0:
+                break
+            out.extend(buf[:n])
+        stream.close()
+        return bytes(out)
+
     def _open_csv_filechooser(self):
+        # Android: use system picker (SAF).
+        if platform == 'android':
+            return self._open_csv_saf()
+
+        # Desktop: use Kivy FileChooserListView.
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         chooser = FileChooserListView(filters=["*.csv"], size_hint=(1, 1))
         content.add_widget(chooser)
@@ -938,10 +1044,8 @@ class DesktopCanonApp(App):
         self.log(f"CSV headers: {headers}")
         self.log(f"CSV rows: {len(rows)}")
 
-        preferred = ["LAST_NAME", "FIRST_NAME", "GRADE", "TEACHER", "STUDENT_ID"]
-        self.selected_headers = [h for h in preferred if h in headers]
-        if not self.selected_headers and headers:
-            self.selected_headers = headers[:3]
+        # Start with nothing selected; user chooses headers in 'Select headers…'.
+        self.selected_headers = []
 
     def _open_headers_popup(self):
         if not self.csv_headers:
@@ -1065,51 +1169,51 @@ class DesktopCanonApp(App):
 
         self._thumb_textures.insert(0, tex)
         self._thumb_paths.insert(0, ccapi_path)
+
+        # clamp to last 5
         self._thumb_textures = self._thumb_textures[:5]
         self._thumb_paths = self._thumb_paths[:5]
 
-        def _update(_dt):
-            for idx, img in enumerate(self._thumb_images):
-                if idx < len(self._thumb_textures):
-                    img.texture = self._thumb_textures[idx]
-                else:
-                    img.texture = None
+        def _ui_update(_dt):
+            for i, img in enumerate(self._thumb_images):
+                img.texture = self._thumb_textures[i] if i < len(self._thumb_textures) else None
 
-        Clock.schedule_once(_update, 0)
+        Clock.schedule_once(_ui_update, 0)
 
     def download_and_thumbnail_latest(self):
         if not self.connected:
-            self.log("Not connected; cannot fetch contents.")
+            self.log("Not connected; can't fetch latest image.")
             return
 
         images = self.list_all_images()
-        self.log(f"contents: {len(images)} total entries")
         if not images:
-            self.log("No images found on camera.")
+            self.log("No images found.")
             return
 
+        # Basic: choose last JPG/JPEG found
         jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
         if not jpgs:
-            self.log("No JPG files found.")
+            self.log("No JPG/JPEG paths found.")
             return
 
         latest = jpgs[-1]
         self._download_thumb_for_path(latest)
-        self._last_seen_image = latest
 
     def start_polling_new_images(self):
         if self._poll_event is not None:
+            self.log("Polling already running.")
             return
-        self.log(f"Starting image poller every {self.poll_interval_s}s")
-        self._poll_event = Clock.schedule_interval(self._poll_new_images, self.poll_interval_s)
+        self._poll_event = Clock.schedule_interval(lambda dt: self._poll_new_images(), self.poll_interval_s)
+        self.log("Auto-fetch started.")
 
     def stop_polling_new_images(self):
-        if self._poll_event is not None:
-            self._poll_event.cancel()
-            self._poll_event = None
-            self.log("Image poller stopped")
+        if self._poll_event is None:
+            return
+        self._poll_event.cancel()
+        self._poll_event = None
+        self.log("Auto-fetch stopped.")
 
-    def _poll_new_images(self, dt):
+    def _poll_new_images(self):
         if not self.connected:
             return
 
@@ -1121,106 +1225,54 @@ class DesktopCanonApp(App):
         if not jpgs:
             return
 
-        if self._last_seen_image is None:
-            self._last_seen_image = jpgs[-1]
-            self.log(f"Poll: baseline set to {self._last_seen_image}")
+        latest = jpgs[-1]
+        if self._last_seen_image == latest:
             return
 
-        new_start_idx = None
-        for idx, path in enumerate(jpgs):
-            if path == self._last_seen_image:
-                new_start_idx = idx + 1
-                break
-
-        if new_start_idx is None:
-            self.log("Poll: last_seen not found, resetting baseline")
-            self._last_seen_image = jpgs[-1]
-            return
-
-        new_items = jpgs[new_start_idx:]
-        if not new_items:
-            return
-
-        for path in new_items:
-            self.log(f"New image detected: {path}")
-            self._download_thumb_for_path(path)
-            self._last_seen_image = path
+        self._last_seen_image = latest
+        self._download_thumb_for_path(latest)
 
     def dump_ccapi(self):
-        status, data = self._json_call("GET", "/ccapi", None, timeout=10.0)
-        self.log(f"/ccapi status={status}")
+        status, data = self._json_call("GET", "/ccapi", None, timeout=8.0)
+        self.log(f"/ccapi -> {status}")
         try:
-            j = json.dumps(data, indent=2)
+            s = json.dumps(data, indent=2)
         except Exception:
-            j = str(data)
-        self.log("=== ccapi JSON START ===")
-        for line in j.splitlines():
+            s = str(data)
+        for line in s.splitlines():
             self.log(line)
-        self.log("=== ccapi JSON END ===")
 
-    # ---------- thumbnail tap → viewer ----------
+    # ---------- thumbnail tap ----------
 
-    def _on_thumb_touch(self, image_widget, touch):
-        if not image_widget.collide_point(*touch.pos):
+    def _on_thumb_touch(self, widget, touch):
+        if not widget.collide_point(*touch.pos):
             return False
-        idx = getattr(image_widget, "thumb_index", None)
+        idx = getattr(widget, "thumb_index", None)
         if idx is None:
             return False
-        if idx >= len(self._thumb_paths):
+        if idx >= len(self._thumb_textures):
             return False
 
-        ccapi_path = self._thumb_paths[idx]
         tex = self._thumb_textures[idx]
-        self._open_thumb_viewer(ccapi_path, tex)
-        return True
+        if tex is None:
+            return False
 
-    def _open_thumb_viewer(self, ccapi_path: str, texture: Texture):
-        was_live = self.live_running
-        if was_live:
-            self.stop_liveview()
+        popup = Popup(title="Thumbnail", size_hint=(0.92, 0.92))
+        root = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+        popup.content = root
 
-        scatter = Scatter(do_rotation=False, do_translation=True, do_scale=True)
-        scatter.size_hint = (1, 1)
+        sc = Scatter(do_translation=True, do_scale=True, do_rotation=False, scale_min=0.5, scale_max=5.0)
+        img = Image(texture=tex, allow_stretch=True, keep_ratio=True)
+        sc.add_widget(img)
+        root.add_widget(sc)
 
-        img = Image(texture=texture, allow_stretch=True, keep_ratio=True)
-        img.size_hint = (1, 1)
-        scatter.add_widget(img)
+        btn = Button(text="Close", size_hint=(1, None), height=dp(44))
+        btn.bind(on_release=lambda *_: popup.dismiss())
+        root.add_widget(btn)
 
-        root = BoxLayout(orientation="vertical")
-        root.add_widget(scatter)
-
-        btn_bar = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6), padding=[dp(6)] * 4)
-        label = Label(text=os.path.basename(ccapi_path) or "Image", size_hint=(1, 1), font_size=sp(12))
-        close_btn = Button(text="Close viewer", size_hint=(None, 1), width=dp(120))
-        btn_bar.add_widget(label)
-        btn_bar.add_widget(close_btn)
-        root.add_widget(btn_bar)
-
-        popup = Popup(title="Image review (thumbnail)",
-                      content=root,
-                      size_hint=(0.95, 0.95))
-
-        def _close(*_):
-            popup.dismiss()
-            if was_live:
-                self.start_liveview()
-
-        close_btn.bind(on_release=_close)
-        popup.bind(on_dismiss=lambda *_: (was_live and self.start_liveview()))
         popup.open()
-
-    # ---------- lifecycle ----------
-
-    def on_stop(self):
-        try:
-            self.stop_liveview()
-        except Exception:
-            pass
-        try:
-            self.stop_polling_new_images()
-        except Exception:
-            pass
+        return True
 
 
 if __name__ == "__main__":
-    DesktopCanonApp().run()
+    CanonLiveViewApp().run()
