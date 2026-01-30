@@ -55,7 +55,10 @@ from kivy.uix.filechooser import FileChooserListView
 from kivy.utils import platform
 
 from PIL import Image as PILImage
-import cv2
+try:
+    import cv2
+except Exception:
+    cv2 = None
 import numpy as np
 
 
@@ -330,8 +333,7 @@ class CanonLiveViewApp(App):
         self.qr_enabled = True
         self.qr_interval_s = 0.40
         self.qr_new_gate_s = 0.70
-        self._qr_detector = cv2.QRCodeDetector()
-        self._latest_qr_text = None
+        self._qr_detector = cv2.QRCodeDetector() if cv2 is not None else Noneself._latest_qr_text = None
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
@@ -1079,6 +1081,11 @@ class CanonLiveViewApp(App):
     # ---------- QR ----------
 
     def _set_qr_enabled(self, enabled: bool):
+        if cv2 is None or getattr(self, '_qr_detector', None) is None:
+            self.qr_enabled = False
+            self.qr_status.text = 'QR: OpenCV not available'
+            return
+
         self.qr_enabled = bool(enabled)
         if not self.qr_enabled:
             self._set_qr_ui(None, None, note="QR: off")
