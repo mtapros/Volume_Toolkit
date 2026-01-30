@@ -7,40 +7,53 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install system deps
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             openjdk-17-jdk \
-            unzip zip \
-            cmake git patch \
+            unzip zip wget \
+            git patch \
+            cmake \
+            autoconf automake libtool m4 pkg-config \
             libffi-dev libssl-dev
 
       - name: Install python-for-android
         run: |
-          pip install --upgrade pip
-          pip install Cython==0.29.36 python-for-android
+          python -m pip install --upgrade pip
+          python -m pip install Cython==0.29.36
+          python -m pip install python-for-android
 
-      - name: Setup Android SDK / NDK
+      - name: Setup Android SDK and NDK
         run: |
+          set -e
+
           ANDROID_SDK_ROOT=$HOME/android-sdk
-          mkdir -p $ANDROID_SDK_ROOT
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          mkdir -p $HOME/.android
+          touch $HOME/.android/repositories.cfg
+
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
-          unzip -q commandlinetools-linux-9477386_latest.zip
+          unzip -q commandlinetools-linux-9477386_latest.zip -d cmdline-tools-temp
+
           mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/latest
-          mv cmdline-tools/* $ANDROID_SDK_ROOT/cmdline-tools/latest/
+          mv cmdline-tools-temp/cmdline-tools/* $ANDROID_SDK_ROOT/cmdline-tools/latest/
 
           yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses
+
           $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
             "platforms;android-33" \
             "build-tools;33.0.2" \
             "ndk;25.2.9519653"
@@ -49,7 +62,7 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
 
-      - name: Build APK
+      - name: Build APK with python-for-android
         run: |
           p4a apk \
             --private . \
@@ -64,8 +77,14 @@ jobs:
             --android-api 33 \
             --ndk-api 21
 
-      - name: Upload APK
+      - name: Collect APK
+        run: |
+          mkdir -p output
+          find . -name "*.apk" -exec cp {} output/ \;
+          ls -lh output
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: canonliveview-apk
-          path: ./*.apk
+          path: output/*.apk
