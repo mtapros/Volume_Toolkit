@@ -1,44 +1,43 @@
-# test.py  – Desktop Kivy CCAPI GUI (R6 II) with:
-#   - HTTPS CCAPI
-#   - Live view + QR → Author
-#   - Auto thumbnail polling (every shot)
-#   - Thumbnails saved to disk (thumbs/)
-#   - Tap thumbnail → zoom/pan viewer (thumbnail only)
+# Volume Toolkit V1.0.1
 #
-# Requirements:
-#   pip install kivy pillow opencv-python requests
+# Android Kivy Canon CCAPI tool.
+#
+# V1.0.1 highlights:
+# - Preview starts rotated 90° CCW.
+# - Collapsible metrics drawer (collapsed by default).
+# - Start button toggles Start/Stop (Stop button removed).
+# - Thumbnails reflow:
+#     Portrait  -> right rail (20% width), vertical scroll
+#     Landscape -> bottom strip (20% height), horizontal scroll
+# - Grid overlay diagonal bug fixed (draw independent segments); grid fixed 3x3.
+# - Connection setup popup + persistent nickname profiles (JsonStore), IP only (assume https://:443).
+# - Reduced QR load: slower interval + skip duplicate frames by JPEG timestamp.
+# - CSV headers popup includes Sort/Filter options; Student picker shows same options.
 
 import os
-
-# Android: keep Kivy writable files out of the extracted app directory.
-# This avoids permission errors when Kivy tries to create .kivy/icon, logs, config, etc.
-if os.environ.get('ANDROID_ARGUMENT'):
-    private_dir = os.environ.get('ANDROID_PRIVATE')
-    if private_dir:
-        kivy_home = os.path.join(private_dir, '.kivy')
-        os.makedirs(kivy_home, exist_ok=True)
-        os.environ['KIVY_HOME'] = kivy_home
-
+import csv
 import json
 import threading
 import time
 from datetime import datetime
 from io import BytesIO
-import os
-import os.path
-import csv
-import requests
+
 import urllib3
+import requests
 
 import kivy
 kivy.require("2.0.0")
 
+from kivy.animation import Animation
 from kivy.app import App
 from kivy.clock import Clock
-from kivy.graphics import Color, Line, Rectangle
+from kivy.core.window import Window
+from kivy.graphics import Color, InstructionGroup, Line, Rectangle
 from kivy.graphics.texture import Texture
+from kivy.graphics.transformation import Matrix
 from kivy.metrics import dp, sp
-from kivy.properties import NumericProperty, BooleanProperty, StringProperty
+from kivy.properties import BooleanProperty, NumericProperty, StringProperty
+from kivy.storage.jsonstore import JsonStore
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -56,11 +55,19 @@ from kivy.uix.filechooser import FileChooserListView
 from kivy.utils import platform
 
 from PIL import Image as PILImage
-
 import cv2
 import numpy as np
 
-# Suppress self-signed HTTPS warning from camera
+
+# Android: keep Kivy writable files out of the extracted app directory (avoid permission errors).
+if os.environ.get("ANDROID_ARGUMENT"):
+    private_dir = os.environ.get("ANDROID_PRIVATE")
+    if private_dir:
+        kivy_home = os.path.join(private_dir, ".kivy")
+        os.makedirs(kivy_home, exist_ok=True)
+        os.environ["KIVY_HOME"] = kivy_home
+
+# Suppress self-signed HTTPS warning from camera.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -78,6 +85,7 @@ def pil_rotate_90s(img, ang):
             return img.transpose(T.ROTATE_270)
         return img
     except Exception:
+        # Fallback for older Pillow
         if ang == 90:
             return img.transpose(PILImage.ROTATE_90)
         if ang == 180:
@@ -95,14 +103,16 @@ class PreviewOverlay(FloatLayout):
     show_oval = BooleanProperty(True)
     show_qr = BooleanProperty(True)
 
-    grid_n = NumericProperty(3)
+    grid_n = NumericProperty(3)  # fixed 3x3 for now
 
+    # Purple oval defaults: w/h=1/3, centered horizontally, vertical center at 2/3.
     oval_cx = NumericProperty(0.5)
-    oval_cy = NumericProperty(0.5)
-    oval_w = NumericProperty(0.55)
-    oval_h = NumericProperty(0.75)
+    oval_cy = NumericProperty(2.0 / 3.0)
+    oval_w = NumericProperty(1.0 / 3.0)
+    oval_h = NumericProperty(1.0 / 3.0)
 
-    preview_rotation = NumericProperty(0)
+    # Start rotated 90° CCW
+    preview_rotation = NumericProperty(90)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -114,38 +124,49 @@ class PreviewOverlay(FloatLayout):
             pass
         self.add_widget(self.img)
 
-        lw = 2
-        lw_qr = 6
+        self._lw = 2
+        self._lw_qr = 6
 
         with self.img.canvas.after:
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
-            self._ln_border = Line(width=lw)
+            self._ln_border = Line(width=self._lw)
 
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
-            self._ln_grid = Line(width=lw)
 
+        self._grid_group = InstructionGroup()
+        self.img.canvas.after.add(self._grid_group)
+
+        with self.img.canvas.after:
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
-            self._ln_57 = Line(width=lw)
+            self._ln_57 = Line(width=self._lw)
 
             self._c_810 = Color(1.0, 0.9, 0.2, 0.95)
-            self._ln_810 = Line(width=lw)
+            self._ln_810 = Line(width=self._lw)
 
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
-            self._ln_oval = Line(width=lw)
+            self._ln_oval = Line(width=self._lw)
 
             self._c_qr = Color(0.2, 1.0, 0.2, 0.95)
-            self._ln_qr = Line(width=lw_qr, close=True)
+            self._ln_qr = Line(width=self._lw_qr, close=True)
+
+        self._qr_points_px = None
 
         self.bind(pos=self._redraw, size=self._redraw)
         self.bind(
-            show_border=self._redraw, show_grid=self._redraw, show_57=self._redraw,
-            show_810=self._redraw, show_oval=self._redraw, show_qr=self._redraw,
+            show_border=self._redraw,
+            show_grid=self._redraw,
+            show_57=self._redraw,
+            show_810=self._redraw,
+            show_oval=self._redraw,
+            show_qr=self._redraw,
             grid_n=self._redraw,
-            oval_cx=self._redraw, oval_cy=self._redraw, oval_w=self._redraw, oval_h=self._redraw
+            oval_cx=self._redraw,
+            oval_cy=self._redraw,
+            oval_w=self._redraw,
+            oval_h=self._redraw,
         )
         self.img.bind(pos=self._redraw, size=self._redraw, texture=self._redraw, texture_size=self._redraw)
 
-        self._qr_points_px = None
         self._redraw()
 
     def set_texture(self, texture):
@@ -185,7 +206,8 @@ class PreviewOverlay(FloatLayout):
             return float(a_h) / float(a_w)
         return float(a_w) / float(a_h)
 
-    def _clear_line_modes(self, ln: Line):
+    @staticmethod
+    def _clear_line_modes(ln: Line):
         try:
             ln.points = []
         except Exception:
@@ -195,7 +217,7 @@ class PreviewOverlay(FloatLayout):
         except Exception:
             pass
 
-    def _redraw(self, *args):
+    def _redraw(self, *_args):
         fx, fy, fw, fh = self._drawn_rect()
 
         self._ln_border.rectangle = (fx, fy, fw, fh) if self.show_border else (0, 0, 0, 0)
@@ -212,18 +234,16 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
+        # Grid: independent segments (fix diagonal artifacts)
+        self._grid_group.clear()
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
-            pts = []
             for i in range(1, n):
                 x = fx + fw * (i / n)
-                pts += [x, fy, x, fy + fh]
+                self._grid_group.add(Line(points=[x, fy, x, fy + fh], width=self._lw))
             for i in range(1, n):
                 y = fy + fh * (i / n)
-                pts += [fx, y, fx + fw, y]
-            self._ln_grid.points = pts
-        else:
-            self._ln_grid.points = []
+                self._grid_group.add(Line(points=[fx, y, fx + fw, y], width=self._lw))
 
         if self.show_oval:
             cx = fx + fw * float(self.oval_cx)
@@ -254,7 +274,6 @@ class PreviewOverlay(FloatLayout):
                 sx = dx + u * dw
                 sy = dy + v * dh
                 line_pts += [sx, sy]
-
             self._ln_qr.points = line_pts
         else:
             self._ln_qr.points = []
@@ -272,44 +291,51 @@ class CanonLiveViewApp(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+        # Connection
         self.connected = False
-        self.camera_ip = "192.168.34.29"  # adjust as needed
+        self.camera_ip = "192.168.34.29"
+        self.active_profile = ""
 
+        # Live view
         self.live_running = False
         self.session_started = False
-
         self._lock = threading.Lock()
         self._latest_jpeg = None
         self._latest_jpeg_ts = 0.0
         self._last_decoded_ts = 0.0
 
         self._fetch_thread = None
+        self._qr_thread = None
         self._display_event = None
 
+        # Stats
         self._fetch_count = 0
         self._decode_count = 0
         self._display_count = 0
         self._stat_t0 = time.time()
 
+        # Log
         self._log_lines = []
         self._max_log_lines = 300
+        self.show_log = True
 
+        # Rendering
         self._frame_texture = None
         self._frame_size = None
 
-        self.dropdown = None
-        self.show_log = True
+        # Drawer
+        self.drawer_open = False
 
         # QR
         self.qr_enabled = True
-        self.qr_interval_s = 0.15
+        self.qr_interval_s = 0.40
         self.qr_new_gate_s = 0.70
         self._qr_detector = cv2.QRCodeDetector()
-        self._qr_thread = None
         self._latest_qr_text = None
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
+        self._last_qr_processed_ts = 0.0
 
         # Author
         self.author_max_chars = 60
@@ -317,119 +343,225 @@ class CanonLiveViewApp(App):
         self._author_update_in_flight = False
         self.manual_payload = ""
 
-        # CSV / headers
+        # CSV
         self.csv_headers = []
         self.csv_rows = []
         self.selected_headers = []
-        self._headers_popup = None
 
-        # Student picker (CSV sort/filter)
-        self.student_list_mode = "sort"  # "sort" or "filter"
-        self.student_list_key = None     # header name
+        # Student list sort/filter
+        self.student_list_mode = "sort"   # "sort" or "filter"
+        self.student_list_key = ""
         self.student_filter_text = ""
-        self._student_picker_popup = None
 
         # Thumbnails
         self._thumb_textures = []
         self._thumb_images = []
-        self._thumb_paths = []  # CCAPI paths matching _thumb_textures
+        self._thumb_paths = []
 
-        # Storage
-        self.download_dir = "downloads"  # not used now, but kept
+        # Storage / polling
         self.thumb_dir = "thumbs"
-
         self._last_seen_image = None
         self._poll_event = None
-        self.poll_interval_s = 2.0  # seconds
-
-        # thumbs only; no full-size auto-downloads
-        self.save_full_size = False
+        self.poll_interval_s = 2.0
 
         # HTTPS session
         self._session = requests.Session()
         self._session.verify = False
 
-        # Android SAF picker
+        # Android SAF
         self._android_activity_bound = False
         self._csv_req_code = 4242
 
+        # Persistent settings
+        self._store = None
+
+    # ---------------- Settings (profiles) ----------------
+
+    def _settings_path(self):
+        os.makedirs(self.user_data_dir, exist_ok=True)
+        return os.path.join(self.user_data_dir, "settings.json")
+
+    def _ensure_store(self):
+        if self._store is not None:
+            return
+        try:
+            self._store = JsonStore(self._settings_path())
+        except Exception as e:
+            self._store = None
+            self.log(f"Settings init failed: {e}")
+
+    def _get_profiles(self):
+        self._ensure_store()
+        if not self._store:
+            return {}
+        if self._store.exists("profiles"):
+            try:
+                return dict(self._store.get("profiles").get("items") or {})
+            except Exception:
+                return {}
+        return {}
+
+    def _set_profiles(self, profiles: dict):
+        self._ensure_store()
+        if self._store:
+            self._store.put("profiles", items=profiles)
+
+    def _get_active_profile_name(self):
+        self._ensure_store()
+        if not self._store:
+            return ""
+        if self._store.exists("active_profile"):
+            try:
+                return str(self._store.get("active_profile").get("name") or "")
+            except Exception:
+                return ""
+        return ""
+
+    def _set_active_profile_name(self, name: str):
+        self._ensure_store()
+        if self._store:
+            self._store.put("active_profile", name=name)
+
+    def _bootstrap_profiles(self):
+        profiles = self._get_profiles()
+        active = self._get_active_profile_name()
+
+        if not profiles:
+            profiles = {"Default": {"ip": self.camera_ip}}
+            active = "Default"
+            self._set_profiles(profiles)
+            self._set_active_profile_name(active)
+
+        if active and active in profiles:
+            self.active_profile = active
+            self.camera_ip = (profiles[active].get("ip") or self.camera_ip).strip()
+        else:
+            name = sorted(profiles.keys())[0]
+            self.active_profile = name
+            self.camera_ip = (profiles[name].get("ip") or self.camera_ip).strip()
+            self._set_active_profile_name(name)
+
+    # ---------------- UI ----------------
+
     def build(self):
+        self._bootstrap_profiles()
+
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
-        header.add_widget(Label(text="Desktop Canon CCAPI Tool (R6 II)", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         root.add_widget(header)
 
-        row1 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
-        self.ip_input = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16), padding=[dp(10)] * 4)
-        row1.add_widget(self.ip_input)
-        root.add_widget(row1)
+        # Metrics drawer (collapsed by default)
+        self.metrics_drawer = BoxLayout(orientation="vertical", size_hint=(1, None), height=0, spacing=dp(6))
+        self.metrics_drawer.opacity = 0
+        self.metrics_drawer.disabled = True
 
+        self.metrics_inner = BoxLayout(orientation="vertical", size_hint=(1, None), spacing=dp(6))
+        self.metrics_inner.bind(minimum_height=self.metrics_inner.setter("height"))
+        self.metrics_drawer.add_widget(self.metrics_inner)
+
+        # Connection row
+        conn_row = BoxLayout(size_hint=(1, None), height=dp(38), spacing=dp(6))
+        self.conn_label = Label(text="", font_size=sp(12), halign="left", valign="middle")
+        self.conn_label.bind(size=self.conn_label.setter("text_size"))
+        self.conn_setup_btn = Button(text="Setup…", size_hint=(None, 1), width=dp(110), font_size=sp(14))
+        conn_row.add_widget(self.conn_label)
+        conn_row.add_widget(self.conn_setup_btn)
+        self.metrics_inner.add_widget(conn_row)
+
+        # IP input in drawer
+        self.ip_input = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16), padding=[dp(10)] * 4)
+        self.ip_input.size_hint = (1, None)
+        self.ip_input.height = dp(44)
+        self.metrics_inner.add_widget(self.ip_input)
+
+        # Connect + Start toggle
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=sp(16))
         self.start_btn = Button(text="Start", disabled=True, font_size=sp(16))
-        self.stop_btn = Button(text="Stop", disabled=True, font_size=sp(16))
         row2.add_widget(self.connect_btn)
         row2.add_widget(self.start_btn)
-        row2.add_widget(self.stop_btn)
-        root.add_widget(row2)
+        self.metrics_inner.add_widget(row2)
 
+        # FPS
         row3 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(40))
         row3.add_widget(Label(text="Display FPS", size_hint=(None, 1), width=dp(110), font_size=sp(14)))
         self.fps_slider = Slider(min=5, max=30, value=12, step=1)
         self.fps_label = Label(text="12", size_hint=(None, 1), width=dp(50), font_size=sp(14))
         row3.add_widget(self.fps_slider)
         row3.add_widget(self.fps_label)
-        root.add_widget(row3)
+        self.metrics_inner.add_widget(row3)
 
+        # Status / metrics / QR
         self.status = Label(text="Status: not connected", size_hint=(1, None), height=dp(22), font_size=sp(13))
-        self.metrics = Label(text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0",
-                             size_hint=(1, None), height=dp(22), font_size=sp(13))
-        root.add_widget(self.status)
-        root.add_widget(self.metrics)
-
+        self.metrics = Label(
+            text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0",
+            size_hint=(1, None),
+            height=dp(22),
+            font_size=sp(13),
+        )
         self.qr_status = Label(text="QR: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
-        root.add_widget(self.qr_status)
+        self.metrics_inner.add_widget(self.status)
+        self.metrics_inner.add_widget(self.metrics)
+        self.metrics_inner.add_widget(self.qr_status)
 
-        main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
+        root.add_widget(self.metrics_drawer)
 
-        preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.75, 1))
-        self.preview_scatter = Scatter(do_translation=True, do_scale=True, do_rotation=False,
-                                       scale_min=0.5, scale_max=2.5)
+        # Main area
+        self.main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.68))
+
+        self.preview_holder = AnchorLayout(anchor_x="center", anchor_y="center")
+        self.preview_holder.size_hint = (0.80, 1)
+
+        self.preview_scatter = Scatter(do_translation=True, do_scale=True, do_rotation=False, scale_min=0.5, scale_max=2.5)
         self.preview_scatter.size_hint = (None, None)
 
         self.preview = PreviewOverlay(size_hint=(None, None))
         self.preview_scatter.add_widget(self.preview)
-        preview_holder.add_widget(self.preview_scatter)
-        main_area.add_widget(preview_holder)
+        self.preview_holder.add_widget(self.preview_scatter)
+        self.main_area.add_widget(self.preview_holder)
 
-        sidebar = BoxLayout(orientation="vertical", size_hint=(0.25, 1), spacing=dp(4))
-        sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
+        # Thumbs area: ScrollView + strip
+        self.sidebar = BoxLayout(orientation="vertical", spacing=dp(4))
+        self.sidebar.size_hint = (0.20, 1)
+
+        self.thumb_scroll = ScrollView(size_hint=(1, 1))
+        self.thumb_strip = BoxLayout(orientation="vertical", spacing=dp(4), size_hint=(1, None))
+        self.thumb_strip.bind(minimum_height=self.thumb_strip.setter("height"))
+        self.thumb_strip.bind(minimum_width=self.thumb_strip.setter("width"))
+        self.thumb_scroll.add_widget(self.thumb_strip)
+
         for idx in range(5):
-            img = Image(size_hint=(1, 0.18), allow_stretch=True, keep_ratio=True)
+            img = Image(allow_stretch=True, keep_ratio=True)
             img.thumb_index = idx
             img.bind(on_touch_down=self._on_thumb_touch)
-            sidebar.add_widget(img)
+            self.thumb_strip.add_widget(img)
             self._thumb_images.append(img)
-        main_area.add_widget(sidebar)
 
-        root.add_widget(main_area)
+        self.sidebar.add_widget(self.thumb_scroll)
+        self.main_area.add_widget(self.sidebar)
+        root.add_widget(self.main_area)
 
+        # Fit preview to holder + reset scatter transform
         def fit_preview_to_holder(*_):
-            w = max(dp(220), preview_holder.width * 0.98)
-            h = max(dp(220), preview_holder.height * 0.98)
+            w = max(dp(220), self.preview_holder.width * 0.98)
+            h = max(dp(220), self.preview_holder.height * 0.98)
             self.preview_scatter.size = (w, h)
             self.preview.size = (w, h)
+
+            self.preview_scatter.transform = Matrix().identity()
             self.preview_scatter.scale = 1.0
             self.preview_scatter.pos = (
-                preview_holder.x + (preview_holder.width - w) / 2.0,
-                preview_holder.y + (preview_holder.height - h) / 2.0
+                self.preview_holder.x + (self.preview_holder.width - w) / 2.0,
+                self.preview_holder.y + (self.preview_holder.height - h) / 2.0,
             )
 
-        preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
+        self.preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
+        # Log panel
         self.log_holder = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(150))
         log_sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         self.log_label = Label(text="", size_hint_y=None, halign="left", valign="top", font_size=sp(11))
@@ -439,20 +571,110 @@ class CanonLiveViewApp(App):
         self.log_holder.add_widget(log_sv)
         root.add_widget(self.log_holder)
 
-        self.dropdown = self._build_dropdown(fit_preview_to_holder)
+        # Menu
+        self.dropdown = self._build_dropdown(reset_callback=fit_preview_to_holder)
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
+        # Bindings
+        self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
-        self.start_btn.bind(on_press=lambda *_: self.start_liveview())
-        self.stop_btn.bind(on_press=lambda *_: self.stop_liveview())
+        self.start_btn.bind(on_press=lambda *_: self._toggle_live())
         self.fps_slider.bind(value=self._on_fps_change)
-
         self._reschedule_display_loop(int(self.fps_slider.value))
+
+        # Responsive reflow
+        Window.bind(on_resize=self._on_window_resize)
+        Clock.schedule_once(lambda *_: self._apply_ui_orientation(Window.width, Window.height), 0)
+
+        # Drawer collapsed by default
+        Clock.schedule_once(lambda *_: self._set_drawer_open(False, instant=True), 0)
+
         self._set_controls_idle()
-        self.log("Desktop CCAPI GUI ready")
+        self._update_conn_label()
+        self.log("Volume Toolkit V1.0.1 ready")
         return root
 
-    # ---------- logging / HTTPS ----------
+    # ---------- Responsive layout ----------
+
+    def _on_window_resize(self, _win, w, h):
+        self._apply_ui_orientation(w, h)
+
+    def _apply_ui_orientation(self, w, h):
+        landscape = w > h
+
+        if landscape:
+            # Preview top, thumbs bottom (20% height)
+            self.main_area.orientation = "vertical"
+            self.preview_holder.size_hint = (1, 0.80)
+            self.sidebar.size_hint = (1, 0.20)
+
+            self.thumb_scroll.do_scroll_x = True
+            self.thumb_scroll.do_scroll_y = False
+
+            self.thumb_strip.orientation = "horizontal"
+            self.thumb_strip.size_hint = (None, 1)
+
+            thumb_w = max(dp(96), w * 0.20)
+            for img in self._thumb_images:
+                img.size_hint = (None, 1)
+                img.width = thumb_w
+        else:
+            # Preview left, thumbs right (20% width)
+            self.main_area.orientation = "horizontal"
+            self.preview_holder.size_hint = (0.80, 1)
+            self.sidebar.size_hint = (0.20, 1)
+
+            self.thumb_scroll.do_scroll_x = False
+            self.thumb_scroll.do_scroll_y = True
+
+            self.thumb_strip.orientation = "vertical"
+            self.thumb_strip.size_hint = (1, None)
+
+            thumb_h = max(dp(80), h * 0.12)
+            for img in self._thumb_images:
+                img.size_hint = (1, None)
+                img.height = thumb_h
+
+    # ---------- Drawer ----------
+
+    def _drawer_target_height(self):
+        # metrics_inner.height tracks minimum_height due to binding
+        return self.metrics_inner.height + dp(8)
+
+    def _set_drawer_open(self, open_: bool, instant: bool = False):
+        open_ = bool(open_)
+        self.drawer_open = open_
+
+        if open_:
+            self.metrics_drawer.disabled = False
+            self.metrics_drawer.opacity = 1
+            target = self._drawer_target_height()
+            if instant:
+                self.metrics_drawer.height = target
+                return
+            Animation.cancel_all(self.metrics_drawer, "height")
+            Animation(height=target, d=0.18).start(self.metrics_drawer)
+        else:
+            if instant:
+                self.metrics_drawer.height = 0
+                self.metrics_drawer.opacity = 0
+                self.metrics_drawer.disabled = True
+                return
+
+            Animation.cancel_all(self.metrics_drawer, "height")
+
+            def _finish(*_):
+                self.metrics_drawer.opacity = 0
+                self.metrics_drawer.disabled = True
+
+            anim = Animation(height=0, d=0.18)
+            anim.bind(on_complete=lambda *_: _finish())
+            anim.start(self.metrics_drawer)
+
+    def _toggle_drawer(self):
+        self._set_drawer_open(not self.drawer_open, instant=False)
+
+    # ---------- Logging / HTTPS ----------
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -460,7 +682,7 @@ class CanonLiveViewApp(App):
         print(line)
         self._log_lines.append(line)
         if len(self._log_lines) > self._max_log_lines:
-            self._log_lines = self._log_lines[-self._max_log_lines:]
+            self._log_lines = self._log_lines[-self._max_log_lines :]
         if hasattr(self, "log_label"):
             self.log_label.text = "\n".join(self._log_lines)
 
@@ -489,7 +711,7 @@ class CanonLiveViewApp(App):
         except Exception as e:
             return f"ERR {e}", None
 
-    # ---------- menu / UI ----------
+    # ---------- Menu UI ----------
 
     def _set_log_visible(self, visible: bool):
         self.show_log = bool(visible)
@@ -497,7 +719,7 @@ class CanonLiveViewApp(App):
         self.log_holder.opacity = 1 if self.show_log else 0
         self.log_holder.disabled = not self.show_log
 
-    def _style_menu_button(self, b):
+    def _style_menu_button(self, b: Button):
         b.background_normal = ""
         b.background_down = ""
         b.background_color = (0.10, 0.10, 0.10, 0.80)
@@ -507,7 +729,7 @@ class CanonLiveViewApp(App):
     def _build_dropdown(self, reset_callback):
         dd = DropDown(auto_dismiss=True)
         dd.auto_width = False
-        dd.width = dp(380)
+        dd.width = min(dp(380), Window.width * 0.92)
         dd.max_height = dp(600)
 
         with dd.canvas.before:
@@ -528,14 +750,13 @@ class CanonLiveViewApp(App):
             row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(6), 0, dp(6), 0])
             row.add_widget(Label(text=text, font_size=sp(13), color=(1, 1, 1, 1)))
             cb = CheckBox(active=initial, size_hint=(None, 1), width=dp(44))
-            cb.bind(active=lambda inst, val: on_change(val))
+            cb.bind(active=lambda _inst, val: on_change(val))
             row.add_widget(cb)
             dd.add_widget(row)
 
         def add_capture_type_buttons():
             row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4), padding=[dp(4), 0, dp(4), 0])
-            row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70),
-                                 font_size=sp(13), color=(1, 1, 1, 1)))
+            row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70), font_size=sp(13), color=(1, 1, 1, 1)))
 
             def make_btn(label, ctype):
                 b = Button(text=label, size_hint=(1, 1), font_size=sp(12))
@@ -553,6 +774,10 @@ class CanonLiveViewApp(App):
             row.add_widget(make_btn("Both", CaptureType.BOTH))
             dd.add_widget(row)
 
+        add_header("Metrics")
+        add_button("Toggle metrics drawer", self._toggle_drawer)
+        add_button("Connection setup…", self._open_connection_setup)
+
         add_header("Framing")
         add_button("Reset framing", reset_callback)
 
@@ -566,121 +791,166 @@ class CanonLiveViewApp(App):
 
         add_header("QR & Author")
         add_toggle("QR detect (OpenCV)", True, lambda v: self._set_qr_enabled(v))
-        add_button("Load CSV…", lambda: self._open_csv_filechooser())
-        add_button("Select headers…", lambda: self._open_headers_popup())
-        add_button("Select student…", lambda: self._open_student_picker_popup())
+        add_button("Load CSV…", self._open_csv_filechooser)
+        add_button("Select headers…", self._open_headers_popup)
+        add_button("Student picker…", self._open_student_picker)
         add_button("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
 
         add_header("Capture")
         add_capture_type_buttons()
-        add_button("Fetch latest image", lambda: self.download_and_thumbnail_latest())
-        add_button("Start auto-fetch", lambda: self.start_polling_new_images())
-        add_button("Stop auto-fetch", lambda: self.stop_polling_new_images())
-
-        add_header("Debug")
-        add_button("Dump /ccapi", lambda: self.dump_ccapi())
+        add_button("Fetch latest image", self.download_and_thumbnail_latest)
+        add_button("Start auto-fetch", self.start_polling_new_images)
+        add_button("Stop auto-fetch", self.stop_polling_new_images)
 
         add_header("UI")
         add_toggle("Show log", True, lambda v: self._set_log_visible(v))
 
         return dd
 
-    # ---------- connect / author ----------
+    # ---------- Connection setup popup ----------
 
-    def connect_camera(self):
-        if self.live_running:
-            self.log("Connect disabled while live view is running. Stop first.")
+    def _update_conn_label(self):
+        if not hasattr(self, "conn_label"):
             return
+        nick = self.active_profile.strip() if self.active_profile else "No profile"
+        ip = self.camera_ip.strip() if self.camera_ip else "No IP"
+        self.conn_label.text = f"Camera: {nick}  |  {ip}:443"
 
-        self.camera_ip = self.ip_input.text.strip()
-        if not self.camera_ip:
-            self.status.text = "Status: enter an IP"
-            return
+    def _open_connection_setup(self):
+        profiles = self._get_profiles()
 
-        self.status.text = f"Status: connecting to {self.camera_ip}:443..."
-        self.log(f"Connecting to {self.camera_ip}:443")
+        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        root.add_widget(Label(text="Connection setup (HTTPS :443 assumed)", size_hint=(1, None), height=dp(24), font_size=sp(13)))
 
-        status, data = self._json_call("GET", "/ccapi/ver100/deviceinformation", None, timeout=8.0)
-        if status.startswith("200") and data:
-            self.connected = True
-            self.status.text = f"Status: connected ({data.get('productname', 'camera')})"
-            self.log("Connected OK")
-        else:
-            self.connected = False
-            self.status.text = f"Status: connect failed ({status})"
-            self.log(f"Connect failed: {status}")
+        nick_row = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
+        nick_row.add_widget(Label(text="Nickname", size_hint=(None, 1), width=dp(90), font_size=sp(12)))
+        nick_input = TextInput(text=self.active_profile or "", multiline=False, font_size=sp(14))
+        pick_btn = Button(text="Pick…", size_hint=(None, 1), width=dp(90), font_size=sp(12))
+        nick_row.add_widget(nick_input)
+        nick_row.add_widget(pick_btn)
+        root.add_widget(nick_row)
 
-        self._set_controls_idle()
+        ip_row = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
+        ip_row.add_widget(Label(text="Camera IP", size_hint=(None, 1), width=dp(90), font_size=sp(12)))
+        ip_input = TextInput(text=self.camera_ip or "", multiline=False, font_size=sp(14))
+        ip_row.add_widget(ip_input)
+        root.add_widget(ip_row)
 
-    def _author_value(self, payload: str) -> str:
-        s = (payload or "").strip()
-        if not s:
-            return ""
-        return s[: int(self.author_max_chars)]
+        msg = Label(text="", size_hint=(1, None), height=dp(24), font_size=sp(12))
+        root.add_widget(msg)
 
-    def _maybe_commit_author(self, payload: str, source="qr"):
-        value = self._author_value(payload)
-        if not value:
-            return
-        if not self.connected:
-            self.log(f"Author update skipped ({source}): not connected")
-            return
-        if self._last_committed_author == value:
-            return
-        if self._author_update_in_flight:
-            return
+        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
+        btn_use = Button(text="Use", font_size=sp(14))
+        btn_save = Button(text="Save", font_size=sp(14))
+        btn_cancel = Button(text="Cancel", font_size=sp(14))
+        btns.add_widget(btn_use)
+        btns.add_widget(btn_save)
+        btns.add_widget(btn_cancel)
+        root.add_widget(btns)
 
-        self._author_update_in_flight = True
-        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author updating… ({source})"), 0)
-        threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
+        dd = DropDown(auto_dismiss=True)
+        dd.auto_width = False
+        dd.width = min(dp(320), Window.width * 0.88)
 
-    def _commit_author_worker(self, value: str, source: str):
-        ok = False
-        got = None
-        err = None
-        try:
-            st_put, _ = self._json_call(
-                "PUT",
-                "/ccapi/ver100/functions/registeredname/author",
-                {"author": value},
-                timeout=8.0
-            )
-            if not st_put.startswith("200"):
-                raise Exception(f"PUT failed: {st_put}")
+        def rebuild_picklist():
+            dd.clear_widgets()
+            keys = sorted((profiles or {}).keys())
+            if not keys:
+                b = Button(text="(no saved profiles)", size_hint_y=None, height=dp(36), font_size=sp(12))
+                self._style_menu_button(b)
+                dd.add_widget(b)
+                return
+            for name in keys:
+                b = Button(text=name, size_hint_y=None, height=dp(40), font_size=sp(13))
+                self._style_menu_button(b)
 
-            st_get, data = self._json_call(
-                "GET",
-                "/ccapi/ver100/functions/registeredname/author",
-                None,
-                timeout=8.0
-            )
-            if not st_get.startswith("200") or not isinstance(data, dict):
-                raise Exception(f"GET failed: {st_get}")
+                def _select(n=name):
+                    nick_input.text = n
+                    ip_input.text = (profiles.get(n, {}).get("ip") or "").strip()
+                    dd.dismiss()
 
-            got = (data.get("author") or "").strip()
-            ok = (got == value)
+                b.bind(on_release=lambda *_i, n=name: _select(n))
+                dd.add_widget(b)
 
-        except Exception as e:
-            err = str(e)
+        rebuild_picklist()
+        pick_btn.bind(on_release=lambda *_: dd.open(pick_btn))
 
-        def _finish(_dt):
-            self._author_update_in_flight = False
+        popup = Popup(title="Connection setup", content=root, size_hint=(0.92, 0.62))
+
+        def apply_use(save_active: bool):
+            nick = (nick_input.text or "").strip()
+            ip = (ip_input.text or "").strip()
+            if not ip:
+                msg.text = "IP is required."
+                return False
+
+            self.camera_ip = ip
+            self.ip_input.text = ip
+
+            if save_active and nick and nick in profiles:
+                self.active_profile = nick
+                self._set_active_profile_name(nick)
+
+            self._update_conn_label()
+            return True
+
+        def do_use(*_):
+            nick = (nick_input.text or "").strip()
+            ok = apply_use(save_active=bool(nick and nick in profiles))
             if ok:
-                self._last_committed_author = value
-                self.log(f"Author updated+verified ({source}): '{value}'")
-                self.qr_status.text = "Author updated ✓"
-            else:
-                self.log(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
-                self.qr_status.text = "Author verify failed ✗"
+                popup.dismiss()
 
-        Clock.schedule_once(_finish, 0)
+        def do_save(*_):
+            nick = (nick_input.text or "").strip()
+            ip = (ip_input.text or "").strip()
+            if not nick:
+                msg.text = "Nickname is required to Save."
+                return
+            if not ip:
+                msg.text = "IP is required."
+                return
 
-    # ---------- liveview + QR ----------
+            profiles2 = self._get_profiles()
+            profiles2[nick] = {"ip": ip}
+            self._set_profiles(profiles2)
 
-    def _set_qr_enabled(self, enabled: bool):
-        self.qr_enabled = bool(enabled)
-        if not self.qr_enabled:
-            self._set_qr_ui(None, None, note="QR: off")
+            self.active_profile = nick
+            self._set_active_profile_name(nick)
+
+            # Apply the saved values too
+            self.camera_ip = ip
+            self.ip_input.text = ip
+            self._update_conn_label()
+
+            msg.text = f"Saved profile '{nick}'."
+            popup.dismiss()
+
+        btn_use.bind(on_release=do_use)
+        btn_save.bind(on_release=do_save)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    # ---------- Controls ----------
+
+    def _set_controls_idle(self):
+        self.ip_input.disabled = False
+        self.connect_btn.disabled = False
+        self.start_btn.disabled = not self.connected
+        self.start_btn.text = "Start"
+        self.conn_setup_btn.disabled = False
+
+    def _set_controls_running(self):
+        self.ip_input.disabled = True
+        self.connect_btn.disabled = True
+        self.start_btn.disabled = False
+        self.start_btn.text = "Stop"
+        self.conn_setup_btn.disabled = True
+
+    def _toggle_live(self):
+        if self.live_running:
+            self.stop_live_view()
+        else:
+            self.start_live_view()
 
     def _on_fps_change(self, *_):
         fps = int(self.fps_slider.value)
@@ -693,25 +963,43 @@ class CanonLiveViewApp(App):
         fps = max(1, int(fps))
         self._display_event = Clock.schedule_interval(self._ui_decode_and_display, 1.0 / fps)
 
-    def _set_controls_idle(self):
-        self.ip_input.disabled = False
-        self.connect_btn.disabled = False
-        self.start_btn.disabled = not self.connected
-        self.stop_btn.disabled = True
+    # ---------- Connect ----------
 
-    def _set_controls_running(self):
-        self.ip_input.disabled = True
-        self.connect_btn.disabled = True
-        self.start_btn.disabled = True
-        self.stop_btn.disabled = False
+    def connect_camera(self):
+        if self.live_running:
+            self.log("Connect disabled while live view is running. Stop first.")
+            return
 
-    def start_liveview(self):
+        self.camera_ip = (self.ip_input.text or "").strip()
+        if not self.camera_ip:
+            self.status.text = "Status: enter an IP"
+            return
+
+        self._update_conn_label()
+        self.status.text = f"Status: connecting to {self.camera_ip}:443…"
+        self.log(f"Connecting to {self.camera_ip}:443")
+
+        status, data = self._json_call("GET", "/ccapi/ver100/deviceinformation", None, timeout=8.0)
+        if status.startswith("200") and isinstance(data, dict):
+            self.connected = True
+            prod = (data.get("productname") or "camera").strip()
+            self.status.text = f"Status: connected ({prod})"
+            self.log("Connected OK")
+        else:
+            self.connected = False
+            self.status.text = f"Status: connect failed ({status})"
+            self.log(f"Connect failed: {status}")
+
+        self._set_controls_idle()
+
+    # ---------- Live view ----------
+
+    def start_live_view(self):
         if not self.connected or self.live_running:
             return
 
         payload = {"liveviewsize": "small", "cameradisplay": "on"}
-        self.log("Starting live view size=small, cameradisplay=on")
-
+        self.log("Starting live view (size=small, cameradisplay=on)")
         status, _ = self._json_call("POST", "/ccapi/ver100/shooting/liveview", payload, timeout=10.0)
         if not status.startswith("200"):
             self.status.text = f"Status: live view start failed ({status})"
@@ -726,28 +1014,31 @@ class CanonLiveViewApp(App):
         with self._lock:
             self._latest_jpeg = None
             self._latest_jpeg_ts = 0.0
-        self._last_decoded_ts = 0.0
-        self._frame_texture = None
-        self._frame_size = None
+            self._last_decoded_ts = 0.0
+            self._frame_texture = None
+            self._frame_size = None
 
+        # QR state
         self._latest_qr_text = None
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
+        self._last_qr_processed_ts = 0.0
         self._set_qr_ui(None, None, note="QR: none")
 
+        # stats
         self._fetch_count = 0
         self._decode_count = 0
         self._display_count = 0
         self._stat_t0 = time.time()
 
-        self._fetch_thread = threading.Thread(target=self._liveview_fetch_loop, daemon=True)
+        self._fetch_thread = threading.Thread(target=self._live_view_fetch_loop, daemon=True)
         self._fetch_thread.start()
 
         self._qr_thread = threading.Thread(target=self._qr_loop, daemon=True)
         self._qr_thread.start()
 
-    def stop_liveview(self):
+    def stop_live_view(self):
         if not self.live_running:
             self._set_controls_idle()
             return
@@ -765,7 +1056,7 @@ class CanonLiveViewApp(App):
         self.log("Live view stopped")
         self._set_controls_idle()
 
-    def _liveview_fetch_loop(self):
+    def _live_view_fetch_loop(self):
         url = f"https://{self.camera_ip}/ccapi/ver100/shooting/liveview/flip"
         while self.live_running:
             try:
@@ -778,44 +1069,53 @@ class CanonLiveViewApp(App):
                 else:
                     time.sleep(0.03)
             except Exception as e:
-                self.log(f"liveview fetch error: {e}")
+                self.log(f"Liveview fetch error: {e}")
                 time.sleep(0.10)
+
+    # ---------- QR ----------
+
+    def _set_qr_enabled(self, enabled: bool):
+        self.qr_enabled = bool(enabled)
+        if not self.qr_enabled:
+            self._set_qr_ui(None, None, note="QR: off")
 
     def _qr_loop(self):
         while self.live_running:
             if not self.qr_enabled:
-                time.sleep(0.10)
+                time.sleep(0.15)
                 continue
 
             with self._lock:
                 jpeg = self._latest_jpeg
+                jpeg_ts = self._latest_jpeg_ts
 
-            if not jpeg:
+            # Skip if no frame or already processed this frame timestamp
+            if not jpeg or jpeg_ts <= self._last_qr_processed_ts:
                 time.sleep(0.05)
                 continue
+
+            self._last_qr_processed_ts = jpeg_ts
 
             try:
                 pil = PILImage.open(BytesIO(jpeg)).convert("RGB")
                 pil = pil_rotate_90s(pil, self.preview.preview_rotation)
-
                 rgb = np.array(pil)
                 bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
                 decoded, points, _ = self._qr_detector.detectAndDecode(bgr)
+                text = decoded.strip() if isinstance(decoded, str) else ""
+                qrpoints = None
 
-                qr_text = decoded.strip() if isinstance(decoded, str) else ""
-                qr_points = None
                 if points is not None:
                     try:
                         pts = points.astype(int).reshape(-1, 2)
-                        if len(pts) >= 4:
-                            qr_points = [(int(pts[i][0]), int(pts[i][1])) for i in range(4)]
+                        if len(pts) == 4:
+                            qrpoints = [(int(pts[i][0]), int(pts[i][1])) for i in range(4)]
                     except Exception:
-                        qr_points = None
+                        qrpoints = None
 
-                if qr_text or qr_points:
-                    self._publish_qr(qr_text if qr_text else None, qr_points)
-
+                if text or qrpoints:
+                    self._publish_qr(text if text else None, qrpoints)
             except Exception:
                 pass
 
@@ -825,20 +1125,20 @@ class CanonLiveViewApp(App):
         now = time.time()
 
         if text:
-            if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
+            if text not in self._qr_seen and (now - self._qr_last_add_time) >= self.qr_new_gate_s:
                 self._qr_seen.add(text)
                 self._qr_last_add_time = now
                 self.log(f"QR: {text}")
-            self._maybe_commit_author(text, source="qr")
+                self._maybe_commit_author(text, source="qr")
 
         if not self.qr_enabled:
             note = "QR: off"
         elif text:
             note = f"QR: {text[:80]}"
         elif points:
-            note = self.qr_status.text if self.qr_status.text and self.qr_status.text != "QR: none" else "QR: detected (undecoded)"
+            note = "QR: detected (undecoded)"
         else:
-            note = self.qr_status.text if self.qr_status.text else "QR: none"
+            note = "QR: none"
 
         Clock.schedule_once(lambda *_: self._set_qr_ui(text, points, note=note), 0)
 
@@ -847,10 +1147,12 @@ class CanonLiveViewApp(App):
             self._latest_qr_text = text
         if points:
             self._latest_qr_points = points
-            self.preview.set_qr(points)
+        self.preview.set_qr(points)
         self.qr_status.text = note
 
-    def _ui_decode_and_display(self, dt):
+    # ---------- UI decode/display loop ----------
+
+    def _ui_decode_and_display(self, _dt):
         if not self.live_running:
             return
 
@@ -859,7 +1161,8 @@ class CanonLiveViewApp(App):
             jpeg_ts = self._latest_jpeg_ts
 
         self._display_count += 1
-        if not jpeg or jpeg_ts <= self._last_decoded_ts:
+
+        if (not jpeg) or (jpeg_ts <= self._last_decoded_ts):
             self._update_metrics(jpeg_ts)
             return
 
@@ -868,47 +1171,104 @@ class CanonLiveViewApp(App):
             pil = pil_rotate_90s(pil, self.preview.preview_rotation)
 
             w, h = pil.size
-            rgb = pil.tobytes()
+            rgb_bytes = pil.tobytes()
 
             if self._frame_texture is None or self._frame_size != (w, h):
                 tex = Texture.create(size=(w, h), colorfmt="rgb")
                 tex.flip_vertical()
                 self._frame_texture = tex
                 self._frame_size = (w, h)
-                self.log(f"texture init size={w}x{h}")
+                self.log(f"Texture init: {w}x{h}")
 
-            self._frame_texture.blit_buffer(rgb, colorfmt="rgb", bufferfmt="ubyte")
+            self._frame_texture.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
             self.preview.set_texture(self._frame_texture)
 
             self._decode_count += 1
             self._last_decoded_ts = jpeg_ts
-
         except Exception as e:
-            self.log(f"ui decode err: {e}")
+            self.log(f"UI decode error: {e}")
 
         self._update_metrics(jpeg_ts)
 
     def _update_metrics(self, frame_ts):
         now = time.time()
         if now - self._stat_t0 >= 1.0:
-            dt_s = now - self._stat_t0
-            fetch_fps = self._fetch_count / dt_s
-            dec_fps = self._decode_count / dt_s
-            disp_fps = self._display_count / dt_s
-            delay_ms = int((now - frame_ts) * 1000) if frame_ts else -1
-            self.metrics.text = (
-                f"Delay: {delay_ms if delay_ms >= 0 else '--'} ms | "
-                f"Fetch: {fetch_fps:.1f} | Decode: {dec_fps:.1f} | Display: {disp_fps:.1f}"
-            )
+            dts = now - self._stat_t0
+            fetchfps = self._fetch_count / dts
+            decfps = self._decode_count / dts
+            dispfps = self._display_count / dts
+            delayms = int((now - frame_ts) * 1000) if frame_ts else -1
+
+            delay_str = f"{delayms} ms" if delayms >= 0 else "-- ms"
+            self.metrics.text = f"Delay: {delay_str} | Fetch: {fetchfps:.1f} | Decode: {decfps:.1f} | Display: {dispfps:.1f}"
+
             self._fetch_count = 0
             self._decode_count = 0
             self._display_count = 0
             self._stat_t0 = now
 
-    # ---------- CSV / headers ----------
+    # ---------- Author push ----------
 
+    def _author_value(self, payload: str) -> str:
+        s = (payload or "").strip()
+        if not s:
+            return ""
+        return s[: int(self.author_max_chars)]
 
-    # ---------- Android SAF CSV picker ----------
+    def _maybe_commit_author(self, payload: str, source: str):
+        value = self._author_value(payload)
+        if not value:
+            return
+        if not self.connected:
+            self.log(f"Author update skipped ({source}): not connected")
+            return
+        if self._last_committed_author == value:
+            return
+        if self._author_update_in_flight:
+            return
+
+        self._author_update_in_flight = True
+        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author: updating ({source})"), 0)
+
+        threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
+
+    def _commit_author_worker(self, value: str, source: str):
+        ok = False
+        got = None
+        err = None
+
+        try:
+            st_put, _ = self._json_call(
+                "PUT",
+                "/ccapi/ver100/functions/registeredname/author",
+                {"author": value},
+                timeout=8.0,
+            )
+            if not st_put.startswith("200"):
+                raise Exception(f"PUT failed {st_put}")
+
+            st_get, data = self._json_call("GET", "/ccapi/ver100/functions/registeredname/author", None, timeout=8.0)
+            if (not st_get.startswith("200")) or (not isinstance(data, dict)):
+                raise Exception(f"GET failed {st_get}")
+
+            got = (data.get("author") or "").strip()
+            ok = (got == value)
+        except Exception as e:
+            err = str(e)
+
+        def finish(_dt):
+            self._author_update_in_flight = False
+            if ok:
+                self._last_committed_author = value
+                self.log(f"Author updated/verified ({source}): {value}")
+                self.qr_status.text = "Author: updated"
+            else:
+                self.log(f"Author verify failed ({source}). wrote={value} read={got} err={err}")
+                self.qr_status.text = "Author: verify failed"
+
+        Clock.schedule_once(finish, 0)
+
+    # ---------- CSV (load + headers + student picker) ----------
 
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
@@ -921,39 +1281,30 @@ class CanonLiveViewApp(App):
             self.log(f"Android activity bind failed: {e}")
 
     def _open_csv_saf(self):
-        # Android Storage Access Framework picker (returns content:// URI).
-        # We avoid jnius.j*array to prevent build/runtime issues.
         self._bind_android_activity_once()
         self._csv_req_code = getattr(self, "_csv_req_code", 4242)
-
         try:
             from android import mActivity
             from jnius import autoclass
 
             Intent = autoclass("android.content.Intent")
-
             intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
             intent.addCategory(Intent.CATEGORY_OPENABLE)
             intent.setType("*/*")
-
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
 
-            self.log("Opening Android file picker…")
+            self.log("Opening Android file picker (SAF)")
             mActivity.startActivityForResult(intent, self._csv_req_code)
-
         except Exception as e:
             self.log(f"Failed to open Android picker: {e}")
 
-    def _on_android_activity_result(self, request_code, result_code, intent):
-        if request_code != getattr(self, "_csv_req_code", 4242):
+    def _on_android_activity_result(self, requestcode, resultcode, intent):
+        if requestcode != getattr(self, "_csv_req_code", 4242):
             return
-
-        # RESULT_OK == -1
-        if result_code != -1 or intent is None:
+        if resultcode != -1 or intent is None:
             self.log("CSV picker canceled")
             return
-
         try:
             from android import mActivity
             from jnius import cast, autoclass
@@ -964,31 +1315,25 @@ class CanonLiveViewApp(App):
                 self.log("CSV picker returned no URI")
                 return
 
-            # Attempt to persist permission for future reads.
             try:
                 flags = intent.getFlags()
-                take_flags = flags & (
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-                )
-                mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
+                takeflags = flags & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                mActivity.getContentResolver().takePersistableUriPermission(uri, takeflags)
             except Exception:
                 pass
 
             data = self._read_android_uri_bytes(uri)
             self._parse_csv_bytes(data)
-            self.log(f"CSV loaded from picker: {len(self.csv_rows)} rows")
-
+            self.log(f"CSV loaded (Android): {len(self.csv_rows)} rows")
         except Exception as e:
             self.log(f"CSV load failed (Android): {e}")
 
     def _read_android_uri_bytes(self, uri):
-        # Read bytes from content:// URI using ContentResolver.openInputStream().
         from android import mActivity
-
         cr = mActivity.getContentResolver()
         stream = cr.openInputStream(uri)
         if stream is None:
-            raise Exception("openInputStream() returned null")
+            raise Exception("openInputStream returned null")
 
         out = bytearray()
         buf = bytearray(64 * 1024)
@@ -1001,45 +1346,42 @@ class CanonLiveViewApp(App):
         return bytes(out)
 
     def _open_csv_filechooser(self):
-        # Android: use system picker (SAF).
-        if platform == 'android':
+        if platform == "android":
             return self._open_csv_saf()
 
-        # Desktop: use Kivy FileChooserListView.
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         chooser = FileChooserListView(filters=["*.csv"], size_hint=(1, 1))
         content.add_widget(chooser)
 
-        status_lbl = Label(text="Pick a CSV file", size_hint=(1, None), height=dp(24), font_size=sp(12))
-        content.add_widget(status_lbl)
+        statuslbl = Label(text="Pick a CSV file", size_hint=(1, None), height=dp(24), font_size=sp(12))
+        content.add_widget(statuslbl)
 
         btns = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
-        btn_ok = Button(text="Load")
-        btn_cancel = Button(text="Cancel")
-        btns.add_widget(btn_ok)
-        btns.add_widget(btn_cancel)
+        btnok = Button(text="Load")
+        btncancel = Button(text="Cancel")
+        btns.add_widget(btnok)
+        btns.add_widget(btncancel)
         content.add_widget(btns)
 
         popup = Popup(title="Load CSV", content=content, size_hint=(0.9, 0.9))
 
-        def do_load(*_):
+        def doload(*_):
             if not chooser.selection:
-                status_lbl.text = "No file selected"
+                statuslbl.text = "No file selected"
                 return
             path = chooser.selection[0]
             try:
                 with open(path, "rb") as f:
                     data = f.read()
                 self._parse_csv_bytes(data)
-                status_lbl.text = f"Loaded {len(self.csv_rows)} rows"
+                statuslbl.text = f"Loaded {len(self.csv_rows)} rows"
                 popup.dismiss()
             except Exception as e:
-                status_lbl.text = f"Error: {e}"
+                statuslbl.text = f"Error: {e}"
                 self.log(f"CSV load error: {e}")
 
-        btn_ok.bind(on_release=do_load)
-        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
-
+        btnok.bind(on_release=doload)
+        btncancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
     def _parse_csv_bytes(self, b: bytes):
@@ -1052,118 +1394,120 @@ class CanonLiveViewApp(App):
         reader = csv.DictReader(text.splitlines())
         headers = reader.fieldnames or []
         self.csv_headers = headers
+
         rows = []
         for r in reader:
             rows.append({k: (r.get(k) or "").strip() for k in headers})
         self.csv_rows = rows
+
         self.log(f"CSV headers: {headers}")
         self.log(f"CSV rows: {len(rows)}")
-        preferred = [
-            # Common variants
-            "LASTNAME", "FIRSTNAME", "GRADE", "TEACHER", "STUDENTID",
-            "LAST_NAME", "FIRST_NAME", "STUDENT_ID",
-        ]
-        self.selected_headers = [h for h in preferred if h in headers]
-        if not self.selected_headers and headers:
-            self.selected_headers = headers[:3]
 
-        # Default student list sort/filter settings (persist across imports unless key missing)
-        if getattr(self, 'student_list_mode', None) not in ('sort', 'filter'):
-            self.student_list_mode = 'sort'
-        if (getattr(self, 'student_list_key', None) is None) or (self.student_list_key not in headers):
-            self.student_list_key = None
-            for cand in ("LASTNAME", "LAST_NAME", "STUDENTID", "STUDENT_ID", "FIRSTNAME", "FIRST_NAME"):
-                if cand in headers:
-                    self.student_list_key = cand
-                    break
-            if (self.student_list_key is None) and headers:
-                self.student_list_key = headers[0]
+        preferred = ["LASTNAME", "FIRSTNAME", "GRADE", "TEACHER", "STUDENTID"]
+        if not self.selected_headers:
+            sel = [h for h in preferred if h in headers]
+            self.selected_headers = sel if sel else (headers[:3] if headers else [])
 
-    def _open_headers_popup(self):
-        if not self.csv_headers:
-            self.log("No CSV loaded; cannot pick headers")
-            return
+        # Default sort key if available
+        if not self.student_list_key:
+            self.student_list_key = "LASTNAME" if "LASTNAME" in headers else (headers[0] if headers else "")
 
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Select columns to include in Author (joined with _):",
-                              size_hint=(1, None), height=dp(40), font_size=sp(12)))
-
-        # Shared student list sort/filter settings (used by Student selection)
-        if (self.student_list_key is None) or (self.student_list_key not in self.csv_headers):
-            self.student_list_key = self.csv_headers[0]
-        if self.student_list_mode not in ('sort', 'filter'):
-            self.student_list_mode = 'sort'
-
-        mode_row = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
-        mode_row.add_widget(Label(text="Student list", size_hint=(None, 1), width=dp(92), font_size=sp(12)))
+    def _build_sort_filter_controls(self, parent, on_change_callback):
+        """
+        Adds shared Sort/Filter controls to a parent layout and wires changes to on_change_callback().
+        Returns (filter_row, key_button) so callers can show/hide filter_row and update key_button text.
+        """
+        controls = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
+        controls.add_widget(Label(text="Mode", size_hint=(None, 1), width=dp(50), font_size=sp(12)))
 
         updating = {"flag": False}
 
-        cb_sort = CheckBox(active=(self.student_list_mode != 'filter'), size_hint=(None, 1), width=dp(32))
-        mode_row.add_widget(cb_sort)
-        mode_row.add_widget(Label(text="Sort", size_hint=(None, 1), width=dp(40), font_size=sp(12)))
+        cb_sort = CheckBox(active=(self.student_list_mode != "filter"), size_hint=(None, 1), width=dp(32))
+        controls.add_widget(cb_sort)
+        controls.add_widget(Label(text="Sort", size_hint=(None, 1), width=dp(40), font_size=sp(12)))
 
-        cb_filter = CheckBox(active=(self.student_list_mode == 'filter'), size_hint=(None, 1), width=dp(32))
-        mode_row.add_widget(cb_filter)
-        mode_row.add_widget(Label(text="Filter", size_hint=(None, 1), width=dp(45), font_size=sp(12)))
+        cb_filter = CheckBox(active=(self.student_list_mode == "filter"), size_hint=(None, 1), width=dp(32))
+        controls.add_widget(cb_filter)
+        controls.add_widget(Label(text="Filter", size_hint=(None, 1), width=dp(45), font_size=sp(12)))
 
-        key_btn = Button(text=f"Key: {self.student_list_key}", size_hint=(1, 1), font_size=sp(12))
-        mode_row.add_widget(key_btn)
-        root.add_widget(mode_row)
+        key_btn = Button(text=f"Key: {self.student_list_key or '(none)'}", size_hint=(1, 1), font_size=sp(12))
+        controls.add_widget(key_btn)
+        parent.add_widget(controls)
 
         filter_row = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
         filter_row.add_widget(Label(text="Filter text", size_hint=(None, 1), width=dp(90), font_size=sp(12)))
         filter_input = TextInput(text=self.student_filter_text or "", multiline=False, font_size=sp(12))
         filter_row.add_widget(filter_input)
-        root.add_widget(filter_row)
+        parent.add_widget(filter_row)
 
         def update_filter_visibility():
-            show = (self.student_list_mode == 'filter')
+            show = (self.student_list_mode == "filter")
             filter_row.opacity = 1 if show else 0
-            filter_row.disabled = (not show)
+            filter_row.disabled = not show
 
-        def set_mode(mode):
-            updating['flag'] = True
+        def set_mode(mode: str):
+            updating["flag"] = True
             self.student_list_mode = mode
-            cb_sort.active = (mode == 'sort')
-            cb_filter.active = (mode == 'filter')
-            updating['flag'] = False
+            cb_sort.active = (mode != "filter")
+            cb_filter.active = (mode == "filter")
+            updating["flag"] = False
             update_filter_visibility()
+            on_change_callback()
 
         def on_sort_active(_inst, val):
-            if updating['flag']:
+            if updating["flag"]:
                 return
             if val:
-                set_mode('sort')
+                set_mode("sort")
 
         def on_filter_active(_inst, val):
-            if updating['flag']:
+            if updating["flag"]:
                 return
             if val:
-                set_mode('filter')
+                set_mode("filter")
 
         cb_sort.bind(active=on_sort_active)
         cb_filter.bind(active=on_filter_active)
 
+        def on_filter_text(_inst, val):
+            self.student_filter_text = filter_input.text
+            if self.student_list_mode == "filter":
+                on_change_callback()
+
+        filter_input.bind(text=on_filter_text)
+
+        # Key dropdown
         key_dd = DropDown(auto_dismiss=True)
-        for h in self.csv_headers:
+        for h in (self.csv_headers or []):
             b = Button(text=h, size_hint_y=None, height=dp(36), font_size=sp(12))
-            b.bind(on_release=lambda btn: key_dd.select(btn.text))
+            self._style_menu_button(b)
+            b.bind(on_release=lambda btn, header=h: key_dd.select(header))
             key_dd.add_widget(b)
 
         def on_key_select(_dd, header):
             self.student_list_key = header
             key_btn.text = f"Key: {header}"
+            on_change_callback()
 
         key_dd.bind(on_select=on_key_select)
         key_btn.bind(on_release=lambda *_: key_dd.open(key_btn))
 
-        def on_filter_text(_inst, _val):
-            self.student_filter_text = filter_input.text
-
-        filter_input.bind(text=on_filter_text)
-
         update_filter_visibility()
+        return filter_row, key_btn
+
+    def _open_headers_popup(self):
+        if not self.csv_headers:
+            self.log("No CSV loaded; cannot pick headers.")
+            return
+
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Select columns to include in Author (joined with ', ')", size_hint=(1, None), height=dp(36), font_size=sp(12)))
+
+        # Sort/filter controls live here too
+        def _changed():
+            pass
+
+        self._build_sort_filter_controls(root, on_change_callback=_changed)
 
         sv = ScrollView(size_hint=(1, 1))
         inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
@@ -1178,7 +1522,7 @@ class CanonLiveViewApp(App):
             lbl.bind(size=lbl.setter("text_size"))
             cb = CheckBox(active=(h in current_sel), size_hint=(0.3, 1))
 
-            def toggle_cb(inst, val, header=h):
+            def toggle(_cb, val, header=h):
                 if val:
                     if header not in self.selected_headers:
                         self.selected_headers.append(header)
@@ -1186,7 +1530,7 @@ class CanonLiveViewApp(App):
                     if header in self.selected_headers:
                         self.selected_headers.remove(header)
 
-            cb.bind(active=toggle_cb)
+            cb.bind(active=toggle)
             row.add_widget(lbl)
             row.add_widget(cb)
             inner.add_widget(row)
@@ -1194,129 +1538,104 @@ class CanonLiveViewApp(App):
         root.add_widget(sv)
 
         btns = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
-        btn_ok = Button(text="OK")
-        btn_cancel = Button(text="Cancel")
-        btns.add_widget(btn_ok)
-        btns.add_widget(btn_cancel)
+        btnok = Button(text="OK")
+        btncancel = Button(text="Cancel")
+        btns.add_widget(btnok)
+        btns.add_widget(btncancel)
         root.add_widget(btns)
 
-        popup = Popup(title="Select CSV columns", content=root, size_hint=(0.9, 0.9))
+        popup = Popup(title="Select CSV columns", content=root, size_hint=(0.92, 0.92))
 
-        def do_ok(*_):
+        def dook(*_):
             self.log(f"Selected headers: {self.selected_headers}")
             popup.dismiss()
 
-        btn_ok.bind(on_release=do_ok)
-        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
-
+        btnok.bind(on_release=dook)
+        btncancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
-        self._headers_popup = popup
-
 
     def _student_row_display(self, row: dict) -> str:
-        """Human-friendly single-line display for a CSV row."""
-        headers = self.csv_headers or []
+        # Prefer a readable line, fallback to first few selected headers.
+        keys = self.csv_headers or []
+        def get(k): return (row.get(k) or "").strip()
 
-        def v(k):
-            return (row.get(k) or "").strip()
+        if "LASTNAME" in keys and "FIRSTNAME" in keys:
+            base = f"{get('LASTNAME')}, {get('FIRSTNAME')}".strip(", ").strip()
+            extras = []
+            if "GRADE" in keys and get("GRADE"):
+                extras.append(f"G{get('GRADE')}")
+            if "TEACHER" in keys and get("TEACHER"):
+                extras.append(get("TEACHER"))
+            if "STUDENTID" in keys and get("STUDENTID"):
+                extras.append(get("STUDENTID"))
+            if extras:
+                return f"{base}  ({' | '.join(extras)})"
+            return base
 
-        ln = v("LASTNAME") or v("LAST_NAME")
-        fn = v("FIRSTNAME") or v("FIRST_NAME")
-        sid = v("STUDENTID") or v("STUDENT_ID")
-        grade = v("GRADE")
-        teacher = v("TEACHER")
-
-        parts = []
-        if ln or fn:
-            name = (ln + (", " + fn if fn else "")).strip(", ")
-            parts.append(name)
-        if grade:
-            parts.append(f"Grade {grade}")
-        if teacher:
-            parts.append(f"{teacher}")
-        if sid:
-            parts.append(f"ID {sid}")
-
-        if parts:
-            return " | ".join(parts)
-
-        for h in headers[:6]:
-            if v(h):
-                return v(h)
-        return "(empty row)"
-
-
-    def _build_student_payload(self, row: dict) -> str:
-        """Build Author payload from the selected headers and a row dict."""
-        vals = []
-        for h in (self.selected_headers or []):
-            s = (row.get(h) or "").strip()
-            if s:
-                vals.append(s)
-        return "_".join(vals)
-
+        show = self.selected_headers or keys[:3]
+        return " | ".join((get(k) for k in show if get(k))) or "(empty row)"
 
     def _apply_student_list_mode(self, rows):
-        """Apply current sort/filter settings to rows and return a new list."""
-        key = self.student_list_key
-        mode = self.student_list_mode
-        # lstrip(): ignore leading spaces in user input
-        ftxt = (self.student_filter_text or "").lstrip().lower()
-
-        def keyval(r):
-            if not key:
-                return ""
-            # lstrip(): ignore leading spaces in data
-            return (r.get(key) or "").lstrip()
-
+        key = (self.student_list_key or "").strip()
         out = list(rows or [])
-        if mode == 'filter' and key and ftxt:
-            out = [r for r in out if keyval(r).lower().startswith(ftxt)]
-        elif mode == 'sort' and key:
-            out.sort(key=lambda r: keyval(r).lower())
+
+        if self.student_list_mode == "filter":
+            needle = (self.student_filter_text or "").strip().lower()
+            if needle and key:
+                out = [r for r in out if needle in ((r.get(key) or "").lower())]
+            elif needle:
+                # if no key, filter across all fields
+                out = [r for r in out if needle in " ".join((str(v or "") for v in r.values())).lower()]
+
+        # Sort (always try a stable sort if key exists)
+        if key:
+            out.sort(key=lambda r: (r.get(key) or "").lower())
         return out
 
+    def _build_student_payload(self, row: dict) -> str:
+        parts = []
+        for h in (self.selected_headers or []):
+            v = (row.get(h) or "").strip()
+            if v:
+                parts.append(v)
+        return ", ".join(parts)
 
-    def _open_student_picker_popup(self):
-        if not self.csv_rows or not self.csv_headers:
-            self.log("No CSV loaded; cannot select student")
+    def _open_student_picker(self):
+        if not self.csv_rows:
+            self.log("No CSV loaded; cannot open student picker.")
             return
 
-        if (self.student_list_key is None) or (self.student_list_key not in self.csv_headers):
-            self.student_list_key = self.csv_headers[0]
-
-        if self.student_list_mode not in ('sort', 'filter'):
-            self.student_list_mode = 'sort'
-
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Select a student (tap a row)", size_hint=(1, None), height=dp(28), font_size=sp(13)))
 
-        # Controls
-        controls = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
-        controls.add_widget(Label(text="Mode", size_hint=(None, 1), width=dp(50), font_size=sp(12)))
-
-        updating = {"flag": False}
-
-        cb_sort = CheckBox(active=(self.student_list_mode != 'filter'), size_hint=(None, 1), width=dp(32))
-        controls.add_widget(cb_sort)
-        controls.add_widget(Label(text="Sort", size_hint=(None, 1), width=dp(40), font_size=sp(12)))
-
-        cb_filter = CheckBox(active=(self.student_list_mode == 'filter'), size_hint=(None, 1), width=dp(32))
-        controls.add_widget(cb_filter)
-        controls.add_widget(Label(text="Filter", size_hint=(None, 1), width=dp(45), font_size=sp(12)))
-
-        key_btn = Button(text=f"Key: {self.student_list_key}", size_hint=(1, 1), font_size=sp(12))
-        controls.add_widget(key_btn)
-        root.add_widget(controls)
-
-        filter_row = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
-        filter_row.add_widget(Label(text="Filter text", size_hint=(None, 1), width=dp(90), font_size=sp(12)))
-        filter_input = TextInput(text=self.student_filter_text or "", multiline=False, font_size=sp(12))
-        filter_row.add_widget(filter_input)
-        root.add_widget(filter_row)
-
-        selected_lbl = Label(text="Selected: (none)", size_hint=(1, None), height=dp(22), font_size=sp(12))
+        selected_lbl = Label(text="Selected: none", size_hint=(1, None), height=dp(22), font_size=sp(12))
         root.add_widget(selected_lbl)
+
+        state = {"selected_row": None}
+
+        def rebuild_list():
+            inner.clear_widgets()
+            rows = self._apply_student_list_mode(self.csv_rows)
+            max_rows = 400
+            shown = rows[:max_rows]
+            for r in shown:
+                line = self._student_row_display(r)
+                b = Button(text=line, size_hint_y=None, height=dp(36), font_size=sp(11))
+                b.halign = "left"
+
+                def select_row(_btn, row=r):
+                    state["selected_row"] = row
+                    payload = self._build_student_payload(row)
+                    self.manual_payload = payload
+                    selected_lbl.text = f"Selected: {self._student_row_display(row)}"
+
+                b.bind(on_release=select_row)
+                inner.add_widget(b)
+
+            if len(rows) > max_rows:
+                inner.add_widget(Label(text=f"(showing first {max_rows} of {len(rows)})", size_hint_y=None, height=dp(22), font_size=sp(11)))
+
+        # Sort/filter controls (same as headers popup)
+        self._build_sort_filter_controls(root, on_change_callback=rebuild_list)
 
         sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
@@ -1332,183 +1651,106 @@ class CanonLiveViewApp(App):
         root.add_widget(btns)
 
         popup = Popup(title="Students", content=root, size_hint=(0.95, 0.95))
-        self._student_picker_popup = popup
-
-        state = {"selected_row": None}
-
-        def update_filter_visibility():
-            show = (self.student_list_mode == 'filter')
-            filter_row.opacity = 1 if show else 0
-            filter_row.disabled = (not show)
-
-        def set_mode(mode):
-            updating["flag"] = True
-            self.student_list_mode = mode
-            cb_sort.active = (mode == 'sort')
-            cb_filter.active = (mode == 'filter')
-            updating["flag"] = False
-            update_filter_visibility()
-            rebuild_list()
-
-        def on_sort_active(_inst, val):
-            if updating["flag"]:
-                return
-            if val:
-                set_mode('sort')
-
-        def on_filter_active(_inst, val):
-            if updating["flag"]:
-                return
-            if val:
-                set_mode('filter')
-
-        cb_sort.bind(active=on_sort_active)
-        cb_filter.bind(active=on_filter_active)
-
-        key_dd = DropDown(auto_dismiss=True)
-        for h in self.csv_headers:
-            b = Button(text=h, size_hint_y=None, height=dp(36), font_size=sp(12))
-            b.bind(on_release=lambda btn: key_dd.select(btn.text))
-            key_dd.add_widget(b)
-
-        def on_key_select(_dd, header):
-            self.student_list_key = header
-            key_btn.text = f"Key: {header}"
-            rebuild_list()
-
-        key_dd.bind(on_select=on_key_select)
-        key_btn.bind(on_release=lambda *_: key_dd.open(key_btn))
-
-        def on_filter_text(_inst, _val):
-            self.student_filter_text = filter_input.text
-            if self.student_list_mode == 'filter':
-                rebuild_list()
-
-        filter_input.bind(text=on_filter_text)
-
-        def select_row(row):
-            state["selected_row"] = row
-            payload = self._build_student_payload(row)
-            self.manual_payload = payload
-            selected_lbl.text = f"Selected: {self._student_row_display(row)}"
-
-        def rebuild_list():
-            inner.clear_widgets()
-            rows = self._apply_student_list_mode(self.csv_rows)
-
-            max_rows = 400
-            shown = rows[:max_rows]
-
-            for r in shown:
-                line = self._student_row_display(r)
-                b = Button(text=line, size_hint_y=None, height=dp(36), font_size=sp(11))
-                b.bind(on_release=lambda _btn, row=r: select_row(row))
-                inner.add_widget(b)
-
-            if len(rows) > max_rows:
-                inner.add_widget(Label(text=f"… showing first {max_rows} of {len(rows)}",
-                                       size_hint_y=None, height=dp(22), font_size=sp(11)))
 
         def do_push(*_):
             if not state["selected_row"]:
-                self.log("No student selected; nothing to push")
+                self.log("No student selected; nothing to push.")
                 return
             payload = self._build_student_payload(state["selected_row"])
             self.manual_payload = payload
-            self._maybe_commit_author(payload, source='student')
+            self._maybe_commit_author(payload, source="student")
 
         push_btn.bind(on_release=do_push)
         close_btn.bind(on_release=lambda *_: popup.dismiss())
 
-        update_filter_visibility()
         rebuild_list()
         popup.open()
 
-    # ---------- contents + download (ver120, thumbnails only) ----------
+    # ---------- Thumbnails / contents ----------
 
-    def list_all_images(self):
+    def _list_all_images(self):
         images = []
         status, root = self._json_call("GET", "/ccapi/ver120/contents", None, timeout=8.0)
         self.log(f"/ccapi/ver120/contents -> {status}")
-        if not status.startswith("200") or not root or "path" not in root:
+        if (not status.startswith("200")) or (not isinstance(root, dict)) or ("path" not in root):
             return images
 
-        for path in root["path"]:
-            st_dir, dirs = self._json_call("GET", path, None, timeout=8.0)
-            if not st_dir.startswith("200") or not dirs or "path" not in dirs:
+        for p in root.get("path") or []:
+            st_dir, dirs = self._json_call("GET", p, None, timeout=8.0)
+            if (not st_dir.startswith("200")) or (not isinstance(dirs, dict)) or ("path" not in dirs):
                 continue
-            for d in dirs["path"]:
-                st_num, num = self._json_call("GET", d + "?kind=number", None, timeout=8.0)
-                if not st_num.startswith("200") or not num or "pagenumber" not in num:
+
+            for d in dirs.get("path") or []:
+                st_num, num = self._json_call("GET", f"{d}?kind=number", None, timeout=8.0)
+                if (not st_num.startswith("200")) or (not isinstance(num, dict)) or ("pagenumber" not in num):
                     continue
-                pages = int(num["pagenumber"])
+
+                pages = int(num.get("pagenumber") or 0)
                 for page in range(1, pages + 1):
-                    st_files, f_data = self._json_call("GET", d + f"?page={page}", None, timeout=8.0)
-                    if not st_files.startswith("200") or not f_data or "path" not in f_data:
+                    st_files, fdata = self._json_call("GET", f"{d}?page={page}", None, timeout=8.0)
+                    if (not st_files.startswith("200")) or (not isinstance(fdata, dict)) or ("path" not in fdata):
                         continue
-                    for f in f_data["path"]:
+                    for f in fdata.get("path") or []:
                         images.append(f)
+
         return images
 
-    def _download_thumb_for_path(self, ccapi_path: str):
-        thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
-        self.log(f"Downloading thumbnail: {thumb_url}")
+    def _download_thumb_for_path(self, ccapipath: str):
+        thumburl = f"https://{self.camera_ip}{ccapipath}?kind=thumbnail"
+        self.log(f"Downloading thumbnail: {thumburl}")
+
         try:
-            resp = self._session.get(thumb_url, stream=True, timeout=10.0)
-            self.log(f"thumb status={resp.status_code} {resp.reason}")
+            resp = self._session.get(thumburl, stream=True, timeout=10.0)
+            self.log(f"Thumb status: {resp.status_code} {resp.reason}")
             if resp.status_code != 200:
                 return
-            thumb_bytes = resp.content
+            thumbbytes = resp.content
         except Exception as e:
             self.log(f"Thumbnail download error: {e}")
             return
 
-        # Save thumbnail JPEG to disk so you can inspect quality
+        # Save thumbnail to disk for inspection
         try:
             os.makedirs(self.thumb_dir, exist_ok=True)
-            name = os.path.basename(ccapi_path) or "image"
+            name = os.path.basename(ccapipath) or "image"
             if not name.lower().endswith((".jpg", ".jpeg")):
                 name = name + ".jpg"
-            out_path = os.path.join(self.thumb_dir, name)
-            with open(out_path, "wb") as f:
-                f.write(thumb_bytes)
-            self.log(f"Saved thumbnail {out_path}")
+            outpath = os.path.join(self.thumb_dir, name)
+            with open(outpath, "wb") as f:
+                f.write(thumbbytes)
+            self.log(f"Saved thumbnail: {outpath}")
         except Exception as e:
-            self.log(f"Saving thumbnail err: {e}")
+            self.log(f"Saving thumbnail error: {e}")
 
-        # Decode into texture for Kivy preview
+        # Decode to texture
         try:
-            pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
+            pil = PILImage.open(BytesIO(thumbbytes)).convert("RGB")
             pil.thumbnail((200, 200))
             w, h = pil.size
             tex = Texture.create(size=(w, h), colorfmt="rgb")
             tex.flip_vertical()
             tex.blit_buffer(pil.tobytes(), colorfmt="rgb", bufferfmt="ubyte")
         except Exception as e:
-            self.log(f"Thumbnail decode err: {e}")
+            self.log(f"Thumbnail decode error: {e}")
             return
 
         self._thumb_textures.insert(0, tex)
-        self._thumb_paths.insert(0, ccapi_path)
+        self._thumb_paths.insert(0, ccapipath)
         self._thumb_textures = self._thumb_textures[:5]
         self._thumb_paths = self._thumb_paths[:5]
 
-        def _update(_dt):
+        def update(_dt):
             for idx, img in enumerate(self._thumb_images):
-                if idx < len(self._thumb_textures):
-                    img.texture = self._thumb_textures[idx]
-                else:
-                    img.texture = None
+                img.texture = self._thumb_textures[idx] if idx < len(self._thumb_textures) else None
 
-        Clock.schedule_once(_update, 0)
+        Clock.schedule_once(update, 0)
 
     def download_and_thumbnail_latest(self):
         if not self.connected:
             self.log("Not connected; cannot fetch contents.")
             return
-
-        images = self.list_all_images()
-        self.log(f"contents: {len(images)} total entries")
+        images = self._list_all_images()
+        self.log(f"Contents: {len(images)} total entries")
         if not images:
             self.log("No images found on camera.")
             return
@@ -1532,13 +1774,13 @@ class CanonLiveViewApp(App):
         if self._poll_event is not None:
             self._poll_event.cancel()
             self._poll_event = None
-            self.log("Image poller stopped")
+        self.log("Image poller stopped")
 
-    def _poll_new_images(self, dt):
+    def _poll_new_images(self, _dt):
         if not self.connected:
             return
 
-        images = self.list_all_images()
+        images = self._list_all_images()
         if not images:
             return
 
@@ -1548,21 +1790,17 @@ class CanonLiveViewApp(App):
 
         if self._last_seen_image is None:
             self._last_seen_image = jpgs[-1]
-            self.log(f"Poll: baseline set to {self._last_seen_image}")
+            self.log(f"Poll baseline set to {self._last_seen_image}")
             return
 
-        new_start_idx = None
-        for idx, path in enumerate(jpgs):
-            if path == self._last_seen_image:
-                new_start_idx = idx + 1
-                break
-
-        if new_start_idx is None:
-            self.log("Poll: last_seen not found, resetting baseline")
+        try:
+            idx = jpgs.index(self._last_seen_image)
+            new_items = jpgs[idx + 1 :]
+        except ValueError:
+            self.log("Poll: lastseen not found; resetting baseline")
             self._last_seen_image = jpgs[-1]
             return
 
-        new_items = jpgs[new_start_idx:]
         if not new_items:
             return
 
@@ -1571,42 +1809,26 @@ class CanonLiveViewApp(App):
             self._download_thumb_for_path(path)
             self._last_seen_image = path
 
-    def dump_ccapi(self):
-        status, data = self._json_call("GET", "/ccapi", None, timeout=10.0)
-        self.log(f"/ccapi status={status}")
-        try:
-            j = json.dumps(data, indent=2)
-        except Exception:
-            j = str(data)
-        self.log("=== ccapi JSON START ===")
-        for line in j.splitlines():
-            self.log(line)
-        self.log("=== ccapi JSON END ===")
+    # ---------- Thumb tap viewer ----------
 
-    # ---------- thumbnail tap → viewer ----------
-
-    def _on_thumb_touch(self, image_widget, touch):
-        if not image_widget.collide_point(*touch.pos):
+    def _on_thumb_touch(self, imagewidget, touch):
+        if not imagewidget.collide_point(*touch.pos):
             return False
-        idx = getattr(image_widget, "thumb_index", None)
-        if idx is None:
+        idx = getattr(imagewidget, "thumb_index", None)
+        if idx is None or idx >= len(self._thumb_paths):
             return False
-        if idx >= len(self._thumb_paths):
-            return False
-
-        ccapi_path = self._thumb_paths[idx]
+        ccapipath = self._thumb_paths[idx]
         tex = self._thumb_textures[idx]
-        self._open_thumb_viewer(ccapi_path, tex)
+        self._open_thumb_viewer(ccapipath, tex)
         return True
 
-    def _open_thumb_viewer(self, ccapi_path: str, texture: Texture):
+    def _open_thumb_viewer(self, ccapipath: str, texture: Texture):
         was_live = self.live_running
         if was_live:
-            self.stop_liveview()
+            self.stop_live_view()
 
         scatter = Scatter(do_rotation=False, do_translation=True, do_scale=True)
         scatter.size_hint = (1, 1)
-
         img = Image(texture=texture, allow_stretch=True, keep_ratio=True)
         img.size_hint = (1, 1)
         scatter.add_widget(img)
@@ -1614,31 +1836,29 @@ class CanonLiveViewApp(App):
         root = BoxLayout(orientation="vertical")
         root.add_widget(scatter)
 
-        btn_bar = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6), padding=[dp(6)] * 4)
-        label = Label(text=os.path.basename(ccapi_path) or "Image", size_hint=(1, 1), font_size=sp(12))
-        close_btn = Button(text="Close viewer", size_hint=(None, 1), width=dp(120))
-        btn_bar.add_widget(label)
-        btn_bar.add_widget(close_btn)
-        root.add_widget(btn_bar)
+        btnbar = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6), padding=[dp(6), dp(4), dp(6), dp(4)])
+        label = Label(text=os.path.basename(ccapipath) or "Image", size_hint=(1, 1), font_size=sp(12))
+        closebtn = Button(text="Close viewer", size_hint=(None, 1), width=dp(140))
+        btnbar.add_widget(label)
+        btnbar.add_widget(closebtn)
+        root.add_widget(btnbar)
 
-        popup = Popup(title="Image review (thumbnail)",
-                      content=root,
-                      size_hint=(0.95, 0.95))
+        popup = Popup(title="Image review (thumbnail)", content=root, size_hint=(0.95, 0.95))
 
-        def _close(*_):
+        def close(*_):
             popup.dismiss()
             if was_live:
-                self.start_liveview()
+                self.start_live_view()
 
-        close_btn.bind(on_release=_close)
-        popup.bind(on_dismiss=lambda *_: (was_live and self.start_liveview()))
+        closebtn.bind(on_release=close)
+        popup.bind(on_dismiss=lambda *_: close())
         popup.open()
 
-    # ---------- lifecycle ----------
+    # ---------- Lifecycle ----------
 
     def on_stop(self):
         try:
-            self.stop_liveview()
+            self.stop_live_view()
         except Exception:
             pass
         try:
