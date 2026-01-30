@@ -332,10 +332,7 @@ class DesktopCanonApp(App):
         self._session.verify = False
 
     def build(self):
-        # Scrollable UI for Android
-        scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8), size_hint_y=None)
-        root.bind(minimum_height=root.setter('height'))
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         header.add_widget(Label(text="Desktop Canon CCAPI Tool (R6 II)", font_size=sp(18)))
