@@ -8,6 +8,17 @@
 # Requirements:
 #   pip install kivy pillow opencv-python requests
 
+import os
+
+# Android: keep Kivy writable files out of the extracted app directory.
+# This avoids permission errors when Kivy tries to create .kivy/icon, logs, config, etc.
+if os.environ.get('ANDROID_ARGUMENT'):
+    private_dir = os.environ.get('ANDROID_PRIVATE')
+    if private_dir:
+        kivy_home = os.path.join(private_dir, '.kivy')
+        os.makedirs(kivy_home, exist_ok=True)
+        os.environ['KIVY_HOME'] = kivy_home
+
 import json
 import threading
 import time
@@ -331,6 +342,10 @@ class CanonLiveViewApp(App):
         # HTTPS session
         self._session = requests.Session()
         self._session.verify = False
+
+        # Android SAF picker
+        self._android_activity_bound = False
+        self._csv_req_code = 4242
 
     def build(self):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
@@ -900,7 +915,7 @@ class CanonLiveViewApp(App):
 
     def _open_csv_saf(self):
         # Android Storage Access Framework picker (returns content:// URI).
-        # We intentionally avoid jnius.j*array for compatibility.
+        # We avoid jnius.j*array to prevent build/runtime issues.
         self._bind_android_activity_once()
         self._csv_req_code = getattr(self, "_csv_req_code", 4242)
 
@@ -983,6 +998,7 @@ class CanonLiveViewApp(App):
         if platform == 'android':
             return self._open_csv_saf()
 
+        # Desktop: use Kivy FileChooserListView.
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         chooser = FileChooserListView(filters=["*.csv"], size_hint=(1, 1))
         content.add_widget(chooser)
@@ -1036,8 +1052,10 @@ class CanonLiveViewApp(App):
         self.log(f"CSV headers: {headers}")
         self.log(f"CSV rows: {len(rows)}")
 
-        # Start with nothing selected; user chooses headers in 'Select headers…'.
-        self.selected_headers = []
+        preferred = ["LAST_NAME", "FIRST_NAME", "GRADE", "TEACHER", "STUDENT_ID"]
+        self.selected_headers = [h for h in preferred if h in headers]
+        if not self.selected_headers and headers:
+            self.selected_headers = headers[:3]
 
     def _open_headers_popup(self):
         if not self.csv_headers:
@@ -1319,4 +1337,4 @@ class CanonLiveViewApp(App):
 
 
 if __name__ == "__main__":
-    DesktopCanonApp().run()
+    CanonLiveViewApp().run()
