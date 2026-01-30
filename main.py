@@ -333,7 +333,8 @@ class CanonLiveViewApp(App):
         self.qr_enabled = True
         self.qr_interval_s = 0.40
         self.qr_new_gate_s = 0.70
-        self._qr_detector = cv2.QRCodeDetector() if cv2 is not None else Noneself._latest_qr_text = None
+        self._qr_detector = cv2.QRCodeDetector() if cv2 is not None else None
+        self._latest_qr_text = None
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
