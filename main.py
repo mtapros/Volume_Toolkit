@@ -1,8 +1,18 @@
-# Volume Toolkit V1.0.7
+# Volume Toolkit V1.0.5
 #
 # Android Kivy Canon CCAPI tool.
 #
-
+# V1.0.1 highlights:
+# - Preview starts rotated 90° CCW.
+# - Collapsible metrics drawer (collapsed by default).
+# - Start button toggles Start/Stop (Stop button removed).
+# - Thumbnails reflow:
+#     Portrait  -> right rail (20% width), vertical scroll
+#     Landscape -> bottom strip (20% height), horizontal scroll
+# - Grid overlay diagonal bug fixed (draw independent segments); grid fixed 3x3.
+# - Connection setup popup + persistent nickname profiles (JsonStore), IP only (assume https://:443).
+# - Reduced QR load: slower interval + skip duplicate frames by JPEG timestamp.
+# - CSV headers popup includes Sort/Filter options; Student picker shows same options.
 
 import os
 import csv
@@ -50,7 +60,7 @@ import numpy as np
 
 
 
-APP_VERSION = '1.0.7'
+APP_VERSION = '1.0.8'
 
 # Android: keep Kivy writable files out of the extracted app directory (avoid permission errors).
 if os.environ.get("ANDROID_ARGUMENT"):
@@ -564,9 +574,22 @@ class VolumeToolkitApp(App):
         self.log_holder.add_widget(log_sv)
         root.add_widget(self.log_holder)
 
-        # Menu
+        # Menu - POPUP ALTERNATIVE (DropDown has Android issues)
         self.dropdown = self._build_dropdown(fit_preview_to_holder)
-        self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
+
+        def open_menu_popup(*args):
+            self.log('[MENU] Button tapped - opening as Popup')
+            # Wrap dropdown in a popup for Android compatibility
+            popup = Popup(
+                title='Menu',
+                content=self.dropdown,
+                size_hint=(0.9, 0.9),
+                auto_dismiss=True
+            )
+            popup.open()
+            self.log('[MENU] Popup opened')
+
+        self.menu_btn.bind(on_release=open_menu_popup)
 
         # Bindings
         self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
@@ -799,6 +822,11 @@ class VolumeToolkitApp(App):
         add_toggle("Show log", True, lambda v: self._set_log_visible(v))
 
         return dd
+
+    def _open_menu(self, instance):
+        """Open the dropdown menu attached to the menu button."""
+        self.log('Menu tapped')
+        Clock.schedule_once(lambda dt: self.dropdown.open(instance), 0)
 
     # ---------- Connection setup popup ----------
 
