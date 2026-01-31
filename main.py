@@ -60,7 +60,7 @@ import numpy as np
 
 
 
-APP_VERSION = '1.0.5'
+APP_VERSION = '1.0.6'
 
 # Android: keep Kivy writable files out of the extracted app directory (avoid permission errors).
 if os.environ.get("ANDROID_ARGUMENT"):
@@ -576,12 +576,7 @@ class VolumeToolkitApp(App):
 
         # Menu
         self.dropdown = self._build_dropdown(fit_preview_to_holder)
-
-        def _open_menu(btn, *_args):
-            self.log('Menu tapped')
-            Clock.schedule_once(lambda dt: self.dropdown.open(btn), 0)
-
-        self.menu_btn.bind(on_release=_open_menu)
+        self.menu_btn.bind(on_release=self._open_menu)
 
         # Bindings
         self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
@@ -814,6 +809,11 @@ class VolumeToolkitApp(App):
         add_toggle("Show log", True, lambda v: self._set_log_visible(v))
 
         return dd
+
+    def _open_menu(self, instance):
+        """Open the dropdown menu attached to the menu button."""
+        self.log('Menu tapped')
+        Clock.schedule_once(lambda dt: self.dropdown.open(instance), 0)
 
     # ---------- Connection setup popup ----------
 
