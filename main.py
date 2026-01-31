@@ -60,7 +60,7 @@ import numpy as np
 
 
 
-APP_VERSION = '1.0.8'
+APP_VERSION = '1.0.9'
 
 # Android: keep Kivy writable files out of the extracted app directory (avoid permission errors).
 if os.environ.get("ANDROID_ARGUMENT"):
@@ -451,11 +451,21 @@ class VolumeToolkitApp(App):
 
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
+        # Title header (no button - button gets its own row below)
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         header.add_widget(Label(text=f"Volume Toolkit {APP_VERSION}", font_size=sp(18)))
-        self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
-        header.add_widget(self.menu_btn)
         root.add_widget(header)
+
+        # Menu button in its own row for better touch detection
+        menu_row = BoxLayout(size_hint=(1, None), height=dp(50), spacing=dp(6), padding=dp(4))
+        self.menu_btn = Button(
+            text="OPEN MENU", 
+            size_hint=(1, 1), 
+            font_size=sp(18),
+            background_color=(0.2, 0.6, 0.9, 1.0)
+        )
+        menu_row.add_widget(self.menu_btn)
+        root.add_widget(menu_row)
 
         # Metrics drawer (collapsed by default)
         self.metrics_drawer = BoxLayout(orientation="vertical", size_hint=(1, None), height=0, spacing=dp(6))
@@ -574,22 +584,18 @@ class VolumeToolkitApp(App):
         self.log_holder.add_widget(log_sv)
         root.add_widget(self.log_holder)
 
-        # Menu - POPUP ALTERNATIVE (DropDown has Android issues)
+        # Menu - With debug logging
         self.dropdown = self._build_dropdown(fit_preview_to_holder)
 
-        def open_menu_popup(*args):
-            self.log('[MENU] Button tapped - opening as Popup')
-            # Wrap dropdown in a popup for Android compatibility
-            popup = Popup(
-                title='Menu',
-                content=self.dropdown,
-                size_hint=(0.9, 0.9),
-                auto_dismiss=True
-            )
-            popup.open()
-            self.log('[MENU] Popup opened')
+        def menu_tapped(*args):
+            self.log('[MENU BUTTON] Tapped! Opening dropdown...')
+            try:
+                self.dropdown.open(self.menu_btn)
+                self.log('[MENU BUTTON] Dropdown opened successfully')
+            except Exception as e:
+                self.log(f'[MENU BUTTON] ERROR: {e}')
 
-        self.menu_btn.bind(on_release=open_menu_popup)
+        self.menu_btn.bind(on_release=menu_tapped)
 
         # Bindings
         self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
