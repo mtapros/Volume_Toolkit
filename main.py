@@ -1,4 +1,4 @@
-# Volume Toolkit V1.0.3
+# Volume Toolkit V1.0.4
 #
 # Android Kivy Canon CCAPI tool.
 #
@@ -60,7 +60,7 @@ import numpy as np
 
 
 
-APP_VERSION = '1.0.3'
+APP_VERSION = '1.0.4'
 
 # Android: keep Kivy writable files out of the extracted app directory (avoid permission errors).
 if os.environ.get("ANDROID_ARGUMENT"):
@@ -288,7 +288,7 @@ class CaptureType:
     BOTH = "Both"
 
 
-class CanonLiveViewApp(App):
+class VolumeToolkitApp(App):
     capture_type = StringProperty(CaptureType.JPG)
 
     def __init__(self, **kwargs):
@@ -575,10 +575,10 @@ class CanonLiveViewApp(App):
         root.add_widget(self.log_holder)
 
         # Menu
-        self.dropdown = self.builddropdown(fitpreviewtoholder)
+        self.dropdown = self._build_dropdown(fitpreviewtoholder)
 
         def _open_menu(btn, *_args):
-            self.log('Menu tapped')
+            self.logf('Menu tapped')
             Clock.schedule_once(lambda dt: self.dropdown.open(btn), 0)
 
         self.menubtn.bind(on_release=_open_menu)
@@ -599,7 +599,7 @@ class CanonLiveViewApp(App):
 
         self._set_controls_idle()
         self._update_conn_label()
-        self.log(f"Volume Toolkit V{APP_VERSION} ready")
+        self.log("Volume Toolkit V1.0.1 ready")
         return root
 
     # ---------- Responsive layout ----------
@@ -738,7 +738,7 @@ class CanonLiveViewApp(App):
         dd = DropDown(auto_dismiss=True)
         dd.auto_width = False
         dd.width = min(dp(380), Window.width * 0.92)
-        dd.max_height = min(dp(600), Window.height * 0.92)
+        dd.max_height = dp(600)
 
         with dd.canvas.before:
             Color(0.0, 0.0, 0.0, 0.80)
@@ -751,13 +751,7 @@ class CanonLiveViewApp(App):
         def add_button(text, on_press):
             b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
             self._style_menu_button(b)
-            def _do(*_):
-                try:
-                    on_press()
-                finally:
-                    dd.dismiss()
-
-            b.bind(on_release=_do)
+            b.bind(on_release=lambda *_: on_press())
             dd.add_widget(b)
 
         def add_toggle(text, initial, on_change):
@@ -1882,4 +1876,4 @@ class CanonLiveViewApp(App):
 
 
 if __name__ == "__main__":
-    CanonLiveViewApp().run()
+    VolumeToolkitApp().run()
