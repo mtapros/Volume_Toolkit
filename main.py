@@ -55,10 +55,7 @@ from kivy.uix.filechooser import FileChooserListView
 from kivy.utils import platform
 
 from PIL import Image as PILImage
-try:
-    import cv2
-except Exception:
-    cv2 = None
+import cv2
 import numpy as np
 
 
@@ -333,7 +330,7 @@ class CanonLiveViewApp(App):
         self.qr_enabled = True
         self.qr_interval_s = 0.40
         self.qr_new_gate_s = 0.70
-        self._qr_detector = cv2.QRCodeDetector() if cv2 is not None else None
+        self._qr_detector = cv2.QRCodeDetector()
         self._latest_qr_text = None
         self._latest_qr_points = None
         self._qr_seen = set()
@@ -575,12 +572,12 @@ class CanonLiveViewApp(App):
         root.add_widget(self.log_holder)
 
         # Menu
-        self.dropdown = self.builddropdown(fitpreviewtoholder)
+        self.dropdown = self._build_dropdown(fit_preview_to_holder)
 
         def _open_menu(*_):
-            Clock.schedule_once(lambda dt: self.dropdown.open(self.menubtn), 0)
+            Clock.schedule_once(lambda dt: self.dropdown.open(self.menu_btn), 0)
 
-        self.menubtn.bind(on_release=_open_menu)
+        self.menu_btn.bind(on_release=_open_menu)
 
         # Bindings
         self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
@@ -1082,11 +1079,6 @@ class CanonLiveViewApp(App):
     # ---------- QR ----------
 
     def _set_qr_enabled(self, enabled: bool):
-        if cv2 is None or getattr(self, '_qr_detector', None) is None:
-            self.qr_enabled = False
-            self.qr_status.text = 'QR: OpenCV not available'
-            return
-
         self.qr_enabled = bool(enabled)
         if not self.qr_enabled:
             self._set_qr_ui(None, None, note="QR: off")
