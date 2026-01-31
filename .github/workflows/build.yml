@@ -73,7 +73,7 @@ jobs:
             --private . \
             --package com.hanleyai.volumetoolkit \
             --name "Volume Toolkit" \
-            --version 1.0.1 \
+            --version 1.0.6 \
             --bootstrap sdl2 \
             --requirements python3,kivy==2.3.0,pillow,numpy,opencv,pyjnius,requests,urllib3 \
             --permission android.permission.INTERNET \
