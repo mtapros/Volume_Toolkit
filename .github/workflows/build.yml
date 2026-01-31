@@ -71,7 +71,7 @@ jobs:
           set -euo pipefail
           p4a apk \
             --private . \
-            --package org.example.canonliveview \
+            --package com.hanleyai.volumetoolkit \
             --name "Volume Toolkit" \
             --version 1.0.1 \
             --bootstrap sdl2 \
