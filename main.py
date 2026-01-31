@@ -1,18 +1,8 @@
-# Volume Toolkit V1.0.5
+# Volume Toolkit V1.0.7
 #
 # Android Kivy Canon CCAPI tool.
 #
-# V1.0.1 highlights:
-# - Preview starts rotated 90° CCW.
-# - Collapsible metrics drawer (collapsed by default).
-# - Start button toggles Start/Stop (Stop button removed).
-# - Thumbnails reflow:
-#     Portrait  -> right rail (20% width), vertical scroll
-#     Landscape -> bottom strip (20% height), horizontal scroll
-# - Grid overlay diagonal bug fixed (draw independent segments); grid fixed 3x3.
-# - Connection setup popup + persistent nickname profiles (JsonStore), IP only (assume https://:443).
-# - Reduced QR load: slower interval + skip duplicate frames by JPEG timestamp.
-# - CSV headers popup includes Sort/Filter options; Student picker shows same options.
+
 
 import os
 import csv
@@ -60,7 +50,7 @@ import numpy as np
 
 
 
-APP_VERSION = '1.0.6'
+APP_VERSION = '1.0.7'
 
 # Android: keep Kivy writable files out of the extracted app directory (avoid permission errors).
 if os.environ.get("ANDROID_ARGUMENT"):
@@ -576,7 +566,7 @@ class VolumeToolkitApp(App):
 
         # Menu
         self.dropdown = self._build_dropdown(fit_preview_to_holder)
-        self.menu_btn.bind(on_release=self._open_menu)
+        self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
         # Bindings
         self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
@@ -809,11 +799,6 @@ class VolumeToolkitApp(App):
         add_toggle("Show log", True, lambda v: self._set_log_visible(v))
 
         return dd
-
-    def _open_menu(self, instance):
-        """Open the dropdown menu attached to the menu button."""
-        self.log('Menu tapped')
-        Clock.schedule_once(lambda dt: self.dropdown.open(instance), 0)
 
     # ---------- Connection setup popup ----------
 
