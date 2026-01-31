@@ -1,4 +1,4 @@
-# Volume Toolkit V1.0.5
+# Volume Toolkit V1.0.3
 #
 # Android Kivy Canon CCAPI tool.
 #
@@ -43,11 +43,11 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
 from kivy.uix.dropdown import DropDown
-from kivy.uix.modalview import ModalView
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
+from kivy.uix.modalview import ModalView
 from kivy.uix.scatter import Scatter
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
@@ -61,7 +61,7 @@ import numpy as np
 
 
 
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.0.3'
 
 # Android: keep Kivy writable files out of the extracted app directory (avoid permission errors).
 if os.environ.get("ANDROID_ARGUMENT"):
@@ -289,7 +289,7 @@ class CaptureType:
     BOTH = "Both"
 
 
-class VolumeToolkitApp(App):
+class CanonLiveViewApp(App):
     capture_type = StringProperty(CaptureType.JPG)
 
     def __init__(self, **kwargs):
@@ -456,16 +456,15 @@ class VolumeToolkitApp(App):
         header.add_widget(Label(text=f"Volume Toolkit {APP_VERSION}", font_size=sp(18)))
         root.add_widget(header)
 
-        # Menu button in its own row (better touch detection on Android)
+        # Menu button in its own row (Android-friendly)
         self.menu_btn = Button(
-            text="OPEN MENU",
+            text="Menu",
             size_hint=(1, None),
             height=dp(50),
             font_size=sp(18),
-            background_color=(0.2, 0.6, 0.9, 1)
+            background_color=(0.2, 0.6, 0.9, 1),
         )
         root.add_widget(self.menu_btn)
-
         # Metrics drawer (collapsed by default)
         self.metrics_drawer = BoxLayout(orientation="vertical", size_hint=(1, None), height=0, spacing=dp(6))
         self.metrics_drawer.opacity = 0
@@ -584,13 +583,12 @@ class VolumeToolkitApp(App):
         root.add_widget(self.log_holder)
 
         # Menu
-        self.menu_modal = self._build_menu_modal(fit_preview_to_holder)
+        self.dropdown = self.builddropdown(fitpreviewtoholder)
 
-        def open_menu(*_):
-            self.log("[MENU] Button pressed")
+        def _open_menu(*_args):
+            self.log('Menu tapped')
             self.menu_modal.open()
-
-        self.menu_btn.bind(on_press=open_menu)
+        self.menubtn.bind(on_release=_open_menu)
 
         # Bindings
         self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
@@ -608,7 +606,7 @@ class VolumeToolkitApp(App):
 
         self._set_controls_idle()
         self._update_conn_label()
-        self.log(f"Volume Toolkit v{APP_VERSION} ready")
+        self.log(f"Volume Toolkit V{APP_VERSION} ready")
         return root
 
     # ---------- Responsive layout ----------
@@ -742,13 +740,30 @@ class VolumeToolkitApp(App):
         b.background_color = (0.10, 0.10, 0.10, 0.80)
         b.color = (1, 1, 1, 1)
         return b
+    def build_menu_modal(self, reset_callback):
+        """Build the menu as a ModalView overlay for reliable taps on Android."""
+        modal = ModalView(size_hint=(0.95, 0.95), autodismiss=True)
+        dd = self._build_dropdown(reset_callback) if hasattr(self, '_build_dropdown') else self.build_dropdown(reset_callback)
 
-    def _build_menu_modal(self, reset_callback):
-        # Create the menu content using DropDown structure
+        def _dismiss(*_a, **_k):
+            try:
+                modal.dismiss()
+            except Exception:
+                pass
+        try:
+            dd.dismiss = _dismiss
+        except Exception:
+            pass
+
+        modal.add_widget(dd)
+        return modal
+
+
+    def _build_dropdown(self, reset_callback):
         dd = DropDown(auto_dismiss=True)
         dd.auto_width = False
         dd.width = min(dp(380), Window.width * 0.92)
-        dd.max_height = dp(600)
+        dd.max_height = min(dp(600), Window.height * 0.92)
 
         with dd.canvas.before:
             Color(0.0, 0.0, 0.0, 0.80)
@@ -761,7 +776,13 @@ class VolumeToolkitApp(App):
         def add_button(text, on_press):
             b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
             self._style_menu_button(b)
-            b.bind(on_release=lambda *_: on_press())
+            def _do(*_):
+                try:
+                    on_press()
+                finally:
+                    dd.dismiss()
+
+            b.bind(on_release=_do)
             dd.add_widget(b)
 
         def add_toggle(text, initial, on_change):
@@ -779,9 +800,11 @@ class VolumeToolkitApp(App):
             def make_btn(label, ctype):
                 b = Button(text=label, size_hint=(1, 1), font_size=sp(12))
                 self._style_menu_button(b)
+
                 def set_type():
                     self.capture_type = ctype
                     self.log(f"Capture type set to {ctype}")
+
                 b.bind(on_release=lambda *_: set_type())
                 return b
 
@@ -821,11 +844,9 @@ class VolumeToolkitApp(App):
         add_header("UI")
         add_toggle("Show log", True, lambda v: self._set_log_visible(v))
 
-        # Wrap dropdown in ModalView (this is the fix!)
-        modal = ModalView(size_hint=(0.95, 0.95), auto_dismiss=True)
-        modal.add_widget(dd)
-        return modal
+        return dd
 
+    # ---------- Connection setup popup ----------
 
     def _update_conn_label(self):
         if not hasattr(self, "conn_label"):
@@ -1886,4 +1907,4 @@ class VolumeToolkitApp(App):
 
 
 if __name__ == "__main__":
-    VolumeToolkitApp().run()
+    CanonLiveViewApp().run()
