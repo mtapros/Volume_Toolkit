@@ -1,4 +1,4 @@
-name: Build APK (Canon Live View)
+name: Build APK (Volume Toolkit)
 
 on:
   push:
@@ -75,9 +75,9 @@ jobs:
 
           p4a apk \
             --private . \
-            --package org.example.canonliveview \
-            --name CanonLiveView \
-            --version 0.1.0 \
+            --package com.hanleyai.volumetoolkit \
+            --name VolumeToolkit \
+            --version 1.0.3 \
             --bootstrap sdl2 \
             --requirements python3,kivy==2.3.0,pillow,numpy,opencv,pyjnius,requests,urllib3 \
             --permission android.permission.INTERNET \
