@@ -1,4 +1,4 @@
-# Volume Toolkit V1.0.3
+# Volume Toolkit V1.0.5
 #
 # Android Kivy Canon CCAPI tool.
 #
@@ -47,7 +47,6 @@ from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
-from kivy.uix.modalview import ModalView
 from kivy.uix.scatter import Scatter
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
@@ -61,7 +60,7 @@ import numpy as np
 
 
 
-APP_VERSION = '1.0.3'
+APP_VERSION = '1.0.9'
 
 # Android: keep Kivy writable files out of the extracted app directory (avoid permission errors).
 if os.environ.get("ANDROID_ARGUMENT"):
@@ -289,7 +288,7 @@ class CaptureType:
     BOTH = "Both"
 
 
-class CanonLiveViewApp(App):
+class VolumeToolkitApp(App):
     capture_type = StringProperty(CaptureType.JPG)
 
     def __init__(self, **kwargs):
@@ -452,19 +451,22 @@ class CanonLiveViewApp(App):
 
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
+        # Title header (no button - button gets its own row below)
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         header.add_widget(Label(text=f"Volume Toolkit {APP_VERSION}", font_size=sp(18)))
         root.add_widget(header)
 
-        # Menu button in its own row (Android-friendly)
+        # Menu button in its own row for better touch detection
+        menu_row = BoxLayout(size_hint=(1, None), height=dp(50), spacing=dp(6), padding=dp(4))
         self.menu_btn = Button(
-            text="Menu",
-            size_hint=(1, None),
-            height=dp(50),
+            text="OPEN MENU", 
+            size_hint=(1, 1), 
             font_size=sp(18),
-            background_color=(0.2, 0.6, 0.9, 1),
+            background_color=(0.2, 0.6, 0.9, 1.0)
         )
-        root.add_widget(self.menu_btn)
+        menu_row.add_widget(self.menu_btn)
+        root.add_widget(menu_row)
+
         # Metrics drawer (collapsed by default)
         self.metrics_drawer = BoxLayout(orientation="vertical", size_hint=(1, None), height=0, spacing=dp(6))
         self.metrics_drawer.opacity = 0
@@ -582,13 +584,18 @@ class CanonLiveViewApp(App):
         self.log_holder.add_widget(log_sv)
         root.add_widget(self.log_holder)
 
-        # Menu
-        self.dropdown = self.builddropdown(fitpreviewtoholder)
+        # Menu - With debug logging
+        self.dropdown = self._build_dropdown(fit_preview_to_holder)
 
-        def _open_menu(*_args):
-            self.log('Menu tapped')
-            self.menu_modal.open()
-        self.menubtn.bind(on_release=_open_menu)
+        def menu_tapped(*args):
+            self.log('[MENU BUTTON] Tapped! Opening dropdown...')
+            try:
+                self.dropdown.open(self.menu_btn)
+                self.log('[MENU BUTTON] Dropdown opened successfully')
+            except Exception as e:
+                self.log(f'[MENU BUTTON] ERROR: {e}')
+
+        self.menu_btn.bind(on_release=menu_tapped)
 
         # Bindings
         self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
@@ -606,7 +613,7 @@ class CanonLiveViewApp(App):
 
         self._set_controls_idle()
         self._update_conn_label()
-        self.log(f"Volume Toolkit V{APP_VERSION} ready")
+        self.log(f"Volume Toolkit v{APP_VERSION} ready")
         return root
 
     # ---------- Responsive layout ----------
@@ -740,30 +747,12 @@ class CanonLiveViewApp(App):
         b.background_color = (0.10, 0.10, 0.10, 0.80)
         b.color = (1, 1, 1, 1)
         return b
-    def build_menu_modal(self, reset_callback):
-        """Build the menu as a ModalView overlay for reliable taps on Android."""
-        modal = ModalView(size_hint=(0.95, 0.95), autodismiss=True)
-        dd = self._build_dropdown(reset_callback) if hasattr(self, '_build_dropdown') else self.build_dropdown(reset_callback)
-
-        def _dismiss(*_a, **_k):
-            try:
-                modal.dismiss()
-            except Exception:
-                pass
-        try:
-            dd.dismiss = _dismiss
-        except Exception:
-            pass
-
-        modal.add_widget(dd)
-        return modal
-
 
     def _build_dropdown(self, reset_callback):
         dd = DropDown(auto_dismiss=True)
         dd.auto_width = False
         dd.width = min(dp(380), Window.width * 0.92)
-        dd.max_height = min(dp(600), Window.height * 0.92)
+        dd.max_height = dp(600)
 
         with dd.canvas.before:
             Color(0.0, 0.0, 0.0, 0.80)
@@ -776,13 +765,7 @@ class CanonLiveViewApp(App):
         def add_button(text, on_press):
             b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
             self._style_menu_button(b)
-            def _do(*_):
-                try:
-                    on_press()
-                finally:
-                    dd.dismiss()
-
-            b.bind(on_release=_do)
+            b.bind(on_release=lambda *_: on_press())
             dd.add_widget(b)
 
         def add_toggle(text, initial, on_change):
@@ -845,6 +828,11 @@ class CanonLiveViewApp(App):
         add_toggle("Show log", True, lambda v: self._set_log_visible(v))
 
         return dd
+
+    def _open_menu(self, instance):
+        """Open the dropdown menu attached to the menu button."""
+        self.log('Menu tapped')
+        Clock.schedule_once(lambda dt: self.dropdown.open(instance), 0)
 
     # ---------- Connection setup popup ----------
 
@@ -1907,4 +1895,4 @@ class CanonLiveViewApp(App):
 
 
 if __name__ == "__main__":
-    CanonLiveViewApp().run()
+    VolumeToolkitApp().run()
