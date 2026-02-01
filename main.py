@@ -595,10 +595,10 @@ class VolumeToolkitApp(App):
             except Exception as e:
                 self.log(f'[MENU BUTTON] ERROR: {e}')
 
-        self.menu_btn.bind(on_release=menu_tapped)
+        self.menu_btn.bind(on_press=menu_tapped)
 
         # Bindings
-        self.conn_setup_btn.bind(on_release=lambda *_: self._open_connection_setup())
+        self.conn_setup_btn.bind(on_press=lambda *_: self._open_connection_setup())
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self._toggle_live())
         self.fps_slider.bind(value=self._on_fps_change)
@@ -765,7 +765,7 @@ class VolumeToolkitApp(App):
         def add_button(text, on_press):
             b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
             self._style_menu_button(b)
-            b.bind(on_release=lambda *_: on_press())
+            b.bind(on_press=lambda *_: on_press())
             dd.add_widget(b)
 
         def add_toggle(text, initial, on_change):
@@ -788,7 +788,7 @@ class VolumeToolkitApp(App):
                     self.capture_type = ctype
                     self.log(f"Capture type set to {ctype}")
 
-                b.bind(on_release=lambda *_: set_type())
+                b.bind(on_press=lambda *_: set_type())
                 return b
 
             row.add_widget(make_btn("JPG", CaptureType.JPG))
@@ -896,11 +896,11 @@ class VolumeToolkitApp(App):
                     ip_input.text = (profiles.get(n, {}).get("ip") or "").strip()
                     dd.dismiss()
 
-                b.bind(on_release=lambda *_i, n=name: _select(n))
+                b.bind(on_press=lambda *_i, n=name: _select(n))
                 dd.add_widget(b)
 
         rebuild_picklist()
-        pick_btn.bind(on_release=lambda *_: dd.open(pick_btn))
+        pick_btn.bind(on_press=lambda *_: dd.open(pick_btn))
 
         popup = Popup(title="Connection setup", content=root, size_hint=(0.92, 0.62))
 
@@ -952,9 +952,9 @@ class VolumeToolkitApp(App):
             msg.text = f"Saved profile '{nick}'."
             popup.dismiss()
 
-        btn_use.bind(on_release=do_use)
-        btn_save.bind(on_release=do_save)
-        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+        btn_use.bind(on_press=do_use)
+        btn_save.bind(on_press=do_save)
+        btn_cancel.bind(on_press=lambda *_: popup.dismiss())
         popup.open()
 
     # ---------- Controls ----------
@@ -1407,8 +1407,8 @@ class VolumeToolkitApp(App):
                 statuslbl.text = f"Error: {e}"
                 self.log(f"CSV load error: {e}")
 
-        btnok.bind(on_release=doload)
-        btncancel.bind(on_release=lambda *_: popup.dismiss())
+        btnok.bind(on_press=doload)
+        btncancel.bind(on_press=lambda *_: popup.dismiss())
         popup.open()
 
     def _parse_csv_bytes(self, b: bytes):
@@ -1508,7 +1508,7 @@ class VolumeToolkitApp(App):
         for h in (self.csv_headers or []):
             b = Button(text=h, size_hint_y=None, height=dp(36), font_size=sp(12))
             self._style_menu_button(b)
-            b.bind(on_release=lambda btn, header=h: key_dd.select(header))
+            b.bind(on_press=lambda btn, header=h: key_dd.select(header))
             key_dd.add_widget(b)
 
         def on_key_select(_dd, header):
@@ -1517,7 +1517,7 @@ class VolumeToolkitApp(App):
             on_change_callback()
 
         key_dd.bind(on_select=on_key_select)
-        key_btn.bind(on_release=lambda *_: key_dd.open(key_btn))
+        key_btn.bind(on_press=lambda *_: key_dd.open(key_btn))
 
         update_filter_visibility()
         return filter_row, key_btn
@@ -1577,8 +1577,8 @@ class VolumeToolkitApp(App):
             self.log(f"Selected headers: {self.selected_headers}")
             popup.dismiss()
 
-        btnok.bind(on_release=dook)
-        btncancel.bind(on_release=lambda *_: popup.dismiss())
+        btnok.bind(on_press=dook)
+        btncancel.bind(on_press=lambda *_: popup.dismiss())
         popup.open()
 
     def _student_row_display(self, row: dict) -> str:
@@ -1655,7 +1655,7 @@ class VolumeToolkitApp(App):
                     self.manual_payload = payload
                     selected_lbl.text = f"Selected: {self._student_row_display(row)}"
 
-                b.bind(on_release=select_row)
+                b.bind(on_press=select_row)
                 inner.add_widget(b)
 
             if len(rows) > max_rows:
@@ -1687,8 +1687,8 @@ class VolumeToolkitApp(App):
             self.manual_payload = payload
             self._maybe_commit_author(payload, source="student")
 
-        push_btn.bind(on_release=do_push)
-        close_btn.bind(on_release=lambda *_: popup.dismiss())
+        push_btn.bind(on_press=do_push)
+        close_btn.bind(on_press=lambda *_: popup.dismiss())
 
         rebuild_list()
         popup.open()
@@ -1877,7 +1877,7 @@ class VolumeToolkitApp(App):
             if was_live:
                 self.start_live_view()
 
-        closebtn.bind(on_release=close)
+        closebtn.bind(on_press=close)
         popup.bind(on_dismiss=lambda *_: close())
         popup.open()
 
