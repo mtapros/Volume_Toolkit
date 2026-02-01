@@ -1,9 +1,3 @@
-# test.py  â€“ Desktop Kivy CCAPI GUI (R6 II) with:
-#   - HTTPS CCAPI
-#   - Live view + QR â†’ Author
-#   - Auto thumbnail polling (every shot)
-#   - Thumbnails saved to disk (thumbs/)
-#   - Tap thumbnail â†’ zoom/pan viewer (thumbnail only)
 #
 # Requirements:
 #   pip install kivy pillow opencv-python requests
@@ -98,11 +92,11 @@ class PreviewOverlay(FloatLayout):
     grid_n = NumericProperty(3)
 
     oval_cx = NumericProperty(0.5)
-    oval_cy = NumericProperty(0.5)
-    oval_w = NumericProperty(0.55)
-    oval_h = NumericProperty(0.75)
+    oval_cy = NumericProperty(0.6)
+    oval_w = NumericProperty(0.333)
+    oval_h = NumericProperty(0.333)
 
-    preview_rotation = NumericProperty(0)
+    preview_rotation = NumericProperty(90)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -215,9 +209,11 @@ class PreviewOverlay(FloatLayout):
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
             pts = []
+            # Draw vertical lines (each as separate segment)
             for i in range(1, n):
                 x = fx + fw * (i / n)
                 pts += [x, fy, x, fy + fh]
+            # Draw horizontal lines (each as separate segment)
             for i in range(1, n):
                 y = fy + fh * (i / n)
                 pts += [fx, y, fx + fw, y]
@@ -266,7 +262,7 @@ class CaptureType:
     BOTH = "Both"
 
 
-class CanonLiveViewApp(App):
+class VolumeToolkitApp(App):
     capture_type = StringProperty(CaptureType.JPG)
 
     def __init__(self, **kwargs):
@@ -351,7 +347,7 @@ class CanonLiveViewApp(App):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
-        header.add_widget(Label(text="Desktop Canon CCAPI Tool (R6 II)", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v1.0.3", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         root.add_widget(header)
@@ -1337,4 +1333,4 @@ class CanonLiveViewApp(App):
 
 
 if __name__ == "__main__":
-    CanonLiveViewApp().run()
+    VolumeToolkitApp().run()
