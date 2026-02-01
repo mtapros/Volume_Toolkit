@@ -1,14 +1,6 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Updated per user request:
-# - Log hidden by default and available from Menu
-# - Preview rotated 180° from prior default (preview_rotation default changed)
-# - Thumbnails left as-is (no rotation)
-# - QR highlight displayed for up to 3s (green box), removed earlier if tapped/pulse ends
-# - Last QR string shown in the place previously used by the metrics label
-# - Display stats moved into the log view (when visible)
-# - Display FPS slider moved to the Menu (popup)
-# - Title/menu layout adapts on device rotation (Window resize)
-# - Other previous improvements retained (background decoder + poller)
+# Fix: perform Connect network call off the UI thread to avoid ANR/crash on Android.
+# The rest of the file is unchanged except for connect-related updates.
 #
 import os
 import json
@@ -698,6 +690,10 @@ class VolumeToolkitApp(App):
 
     # ---------- connect / author ----------
     def connect_camera(self):
+        """
+        Start connect flow on background thread to avoid blocking the UI/main thread.
+        """
+
         if self.live_running:
             self._log_internal("Connect disabled while live view is running. Stop first.")
             return
@@ -706,24 +702,52 @@ class VolumeToolkitApp(App):
             self.status.text = "Status: enter an IP (use Settings->IP)"
             return
 
+        # Disable connect button while attempting to connect to prevent repeated presses
+        self.connect_btn.disabled = True
         self.status.text = f"Status: connecting to {self.camera_ip}:443..."
         self._log_internal(f"Connecting to {self.camera_ip}:443")
 
-        status, data = self._json_call("GET", '/ccapi/ver100/deviceinformation', None, timeout=8.0)
-        if status.startswith("200") and data:
-            self.connected = True
-            self.status.text = f"Status: connected ({data.get('productname', 'camera')})"
-            self._log_internal("Connected OK")
-            # Update Connect button text color to yellow to indicate connected
-            self.connect_btn.color = (1, 1, 0, 1)
-            # Enable Start button
-            self.start_btn.disabled = False
-        else:
-            self.connected = False
-            self.status.text = f"Status: connect failed ({status})"
-            self._log_internal(f"Connect failed: {status}")
-            self.connect_btn.color = (1, 1, 1, 1)
-            self.start_btn.disabled = True
+        # Run the network call on a background thread
+        threading.Thread(target=self._connect_worker, daemon=True).start()
+
+    def _connect_worker(self):
+        """
+        Background worker that calls CCAPI and updates UI on the main thread.
+        """
+        try:
+            status, data = self._json_call("GET", '/ccapi/ver100/deviceinformation', None, timeout=8.0)
+        except Exception as e:
+            status, data = f"ERR {e}", None
+
+        def _finish(dt):
+            try:
+                if status and str(status).startswith("200") and data:
+                    self.connected = True
+                    self.status.text = f"Status: connected ({data.get('productname', 'camera')})"
+                    self._log_internal("Connected OK")
+                    # Update Connect button color to yellow text to show connected
+                    try:
+                        self.connect_btn.color = (1, 1, 0, 1)
+                    except Exception:
+                        pass
+                    self.start_btn.disabled = False
+                else:
+                    self.connected = False
+                    self.status.text = f"Status: connect failed ({status})"
+                    self._log_internal(f"Connect failed: {status}")
+                    try:
+                        self.connect_btn.color = (1, 1, 1, 1)
+                    except Exception:
+                        pass
+                    self.start_btn.disabled = True
+            finally:
+                # Re-enable the connect button so user can retry
+                try:
+                    self.connect_btn.disabled = False
+                except Exception:
+                    pass
+
+        Clock.schedule_once(_finish, 0)
 
     def _author_value(self, payload: str) -> str:
         s = (payload or "").strip()
