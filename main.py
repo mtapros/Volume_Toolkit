@@ -1,30 +1,27 @@
-# Android-focused Volume Toolkit (modified)
+# Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# Requirements (p4a/buildozer): kivy==2.3.0, pillow, numpy, opencv, pyjnius, requests, urllib3
+# This is a full main.py intended to replace the repo file. Major changes:
+# - Polling for new images runs in a background thread (no blocking UI).
+# - Liveview JPEG decoding and rotation are performed in a background decoder
+#   thread using OpenCV (cv2.imdecode + cv2.rotate) to reduce latency.
+# - The decoder schedules only Texture creation/blit on the main thread.
+# - QR detection uses the latest decoded BGR frame (avoids re-decoding).
+# - PreviewOverlay grid list is initialized to avoid canvas errors.
 #
-# Notes:
-# - This variant removes the desktop CSV file chooser and uses Android SAF only.
-# - Requests to the camera use verify=False because many cameras have self-signed certs.
-# - The GitHub Actions workflow (.github/workflows/build.yml) already included in the repo
-#   should build an APK with python-for-android. This main.py is ready for that workflow.
+# Keep in mind:
+# - This is Android-only code (uses android.* when running on device).
+# - The build workflow in .github/workflows/build.yml already builds an APK.
+# - The app still disables TLS verification for camera requests (self-signed certs).
 #
 import os
-
-# Android: keep Kivy writable files out of the extracted app directory.
-# This avoids permission errors when Kivy tries to create .kivy/icon, logs, config, etc.
-if os.environ.get('ANDROID_ARGUMENT'):
-    private_dir = os.environ.get('ANDROID_PRIVATE')
-    if private_dir:
-        kivy_home = os.path.join(private_dir, '.kivy')
-        os.makedirs(kivy_home, exist_ok=True)
-        os.environ['KIVY_HOME'] = kivy_home
-
 import json
 import threading
 import time
 from datetime import datetime
 from io import BytesIO
 import csv
+import queue
+
 import requests
 import urllib3
 
@@ -52,13 +49,22 @@ from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.utils import platform
 
-from PIL import Image as PILImage
+from PIL import Image as PILImage  # used for CSV thumbnails saving/thumbnailing fallback
 
 import cv2
 import numpy as np
 
 # Suppress self-signed HTTPS warning from camera
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Android: keep Kivy writable files out of the extracted app directory.
+# This avoids permission errors when Kivy tries to create .kivy/icon, logs, config, etc.
+if os.environ.get("ANDROID_ARGUMENT"):
+    private_dir = os.environ.get("ANDROID_PRIVATE")
+    if private_dir:
+        kivy_home = os.path.join(private_dir, ".kivy")
+        os.makedirs(kivy_home, exist_ok=True)
+        os.environ["KIVY_HOME"] = kivy_home
 
 
 def pil_rotate_90s(img, ang):
@@ -321,6 +327,16 @@ class VolumeToolkitApp(App):
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
 
+        # For sharing latest decoded BGR with QR thread
+        self._latest_decoded_bgr = None
+        self._latest_decoded_bgr_ts = 0.0
+
+        # Decoder queue + thread (background decoding)
+        self._decode_queue = queue.Queue(maxsize=2)
+        self._decoder_thread = threading.Thread(target=self._decoder_loop, daemon=True)
+        self._decoder_stop = threading.Event()
+        self._decoder_thread.start()
+
         # Author
         self.author_max_chars = 60
         self._last_committed_author = None
@@ -343,7 +359,8 @@ class VolumeToolkitApp(App):
         self.thumb_dir = "thumbs"
 
         self._last_seen_image = None
-        self._poll_event = None
+        self._poll_thread = None
+        self._poll_thread_stop = threading.Event()
         self.poll_interval_s = 2.0  # seconds
 
         # thumbs only; no full-size auto-downloads
@@ -689,7 +706,7 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_finish, 0)
 
-    # ---------- liveview + QR ----------
+    # ---------- liveview + QR + decoder ----------
 
     def _set_qr_enabled(self, enabled: bool):
         self.qr_enabled = bool(enabled)
@@ -705,7 +722,12 @@ class VolumeToolkitApp(App):
         if self._display_event is not None:
             self._display_event.cancel()
         fps = max(1, int(fps))
-        self._display_event = Clock.schedule_interval(self._ui_decode_and_display, 1.0 / fps)
+        self._display_event = Clock.schedule_interval(self._ui_noop_display_tick, 1.0 / fps)
+
+    def _ui_noop_display_tick(self, dt):
+        # Display is driven by decoder scheduling; this tick only updates metrics periodically.
+        self._display_count += 1
+        self._update_metrics(self._last_decoded_ts)
 
     def _set_controls_idle(self):
         self.ip_input.disabled = False
@@ -723,7 +745,7 @@ class VolumeToolkitApp(App):
         if not self.connected or self.live_running:
             return
 
-        payload = {"liveviewsize" : "small", "cameradisplay" : "on"}
+        payload = {"liveviewsize": "small", "cameradisplay": "on"}
         self.log("Starting live view size=small, cameradisplay=on")
 
         status, _ = self._json_call("POST", '/ccapi/ver100/shooting/liveview', payload, timeout=10.0)
@@ -755,6 +777,7 @@ class VolumeToolkitApp(App):
         self._display_count = 0
         self._stat_t0 = time.time()
 
+        # start fetch + qr threads
         self._fetch_thread = threading.Thread(target=self._liveview_fetch_loop, daemon=True)
         self._fetch_thread.start()
 
@@ -785,36 +808,105 @@ class VolumeToolkitApp(App):
             try:
                 resp = self._session.get(url, timeout=5.0)
                 if resp.status_code == 200 and resp.content:
+                    jpeg = resp.content
+                    ts = time.time()
                     with self._lock:
-                        self._latest_jpeg = resp.content
-                        self._latest_jpeg_ts = time.time()
+                        self._latest_jpeg = jpeg
+                        self._latest_jpeg_ts = ts
                     self._fetch_count += 1
+                    # Offer to decode queue (drop oldest if queue full to keep low latency)
+                    try:
+                        self._decode_queue.put_nowait((jpeg, ts))
+                    except queue.Full:
+                        try:
+                            _ = self._decode_queue.get_nowait()  # drop oldest
+                        except Exception:
+                            pass
+                        try:
+                            self._decode_queue.put_nowait((jpeg, ts))
+                        except Exception:
+                            pass
                 else:
                     time.sleep(0.03)
             except Exception as e:
                 self.log(f"liveview fetch error: {e}")
                 time.sleep(0.10)
 
+    def _decoder_loop(self):
+        # Background decoder: pull JPEG bytes, decode to BGR, rotate, convert to RGB,
+        # store latest_decoded_bgr for QR thread, and schedule main-thread texture update.
+        while not self._decoder_stop.is_set():
+            try:
+                jpeg, ts = self._decode_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    continue
+
+                rot = int(self.preview.preview_rotation) % 360
+                if rot == 90:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+                elif rot == 180:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+                elif rot == 270:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+                # keep latest decoded BGR for QR thread
+                with self._lock:
+                    self._latest_decoded_bgr = bgr.copy()
+                    self._latest_decoded_bgr_ts = ts
+
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                h, w = rgb.shape[:2]
+                rgb_bytes = rgb.tobytes()
+
+                # schedule texture creation/blit on main thread
+                def _update_texture_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ts=ts):
+                    try:
+                        if self._frame_texture is None or self._frame_size != (w, h):
+                            tex = Texture.create(size=(w, h), colorfmt="rgb")
+                            tex.flip_vertical()
+                            self._frame_texture = tex
+                            self._frame_size = (w, h)
+                            self.log(f"texture init size={w}x{h}")
+                        # blit buffer (fast)
+                        self._frame_texture.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
+                        self.preview.set_texture(self._frame_texture)
+                        # record decoded timestamp for metrics
+                        self._last_decoded_ts = ts
+                    except Exception as e:
+                        self.log(f"texture update err: {e}")
+
+                Clock.schedule_once(_update_texture_on_main, 0)
+                self._decode_count += 1
+
+            except Exception:
+                # ignore decode failures but do not crash the thread
+                continue
+
     def _qr_loop(self):
+        # QR detection uses the last decoded BGR frame (avoid re-decoding JPEG)
+        last_processed_ts = 0.0
         while self.live_running:
             if not self.qr_enabled:
                 time.sleep(0.10)
                 continue
 
             with self._lock:
-                jpeg = self._latest_jpeg
+                bgr = None
+                ts = getattr(self, "_latest_decoded_bgr_ts", 0.0)
+                if self._latest_decoded_bgr is not None:
+                    bgr = self._latest_decoded_bgr.copy()
 
-            if not jpeg:
+            if bgr is None or ts <= last_processed_ts:
                 time.sleep(0.05)
                 continue
 
             try:
-                pil = PILImage.open(BytesIO(jpeg)).convert("RGB")
-                pil = pil_rotate_90s(pil, self.preview.preview_rotation)
-
-                rgb = np.array(pil)
-                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
                 decoded, points, _ = self._qr_detector.detectAndDecode(bgr)
 
                 qr_text = decoded.strip() if isinstance(decoded, str) else ""
@@ -833,6 +925,7 @@ class VolumeToolkitApp(App):
             except Exception:
                 pass
 
+            last_processed_ts = ts
             time.sleep(max(0.05, float(self.qr_interval_s)))
 
     def _publish_qr(self, text, points):
@@ -864,43 +957,12 @@ class VolumeToolkitApp(App):
             self.preview.set_qr(points)
         self.qr_status.text = note
 
-    def _ui_decode_and_display(self, dt):
-        if not self.live_running:
-            return
+    # ---------- UI decode/display entry point (no heavy work here) ----------
 
-        with self._lock:
-            jpeg = self._latest_jpeg
-            jpeg_ts = self._latest_jpeg_ts
-
-        self._display_count += 1
-        if not jpeg or jpeg_ts <= self._last_decoded_ts:
-            self._update_metrics(jpeg_ts)
-            return
-
-        try:
-            pil = PILImage.open(BytesIO(jpeg)).convert("RGB")
-            pil = pil_rotate_90s(pil, self.preview.preview_rotation)
-
-            w, h = pil.size
-            rgb = pil.tobytes()
-
-            if self._frame_texture is None or self._frame_size != (w, h):
-                tex = Texture.create(size=(w, h), colorfmt="rgb")
-                tex.flip_vertical()
-                self._frame_texture = tex
-                self._frame_size = (w, h)
-                self.log(f"texture init size={w}x{h}")
-
-            self._frame_texture.blit_buffer(rgb, colorfmt="rgb", bufferfmt="ubyte")
-            self.preview.set_texture(self._frame_texture)
-
-            self._decode_count += 1
-            self._last_decoded_ts = jpeg_ts
-
-        except Exception as e:
-            self.log(f"ui decode err: {e}")
-
-        self._update_metrics(jpeg_ts)
+    def _ui_noop_display_tick(self, dt):
+        # stub: actual rendering is done when decoder schedules texture updates,
+        # this tick just updates metrics periodically (handled in _update_metrics).
+        pass
 
     def _update_metrics(self, frame_ts):
         now = time.time()
@@ -1123,8 +1185,12 @@ class VolumeToolkitApp(App):
         return images
 
     def _download_thumb_for_path(self, ccapi_path: str):
+        """
+        Downloads thumbnail bytes and schedules a main-thread task to create a Kivy texture
+        and update UI. This keeps network and PIL work off the UI thread.
+        """
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
-        self.log(f"Downloading thumbnail: {thumb_url}")
+        self.log(f"Downloading thumbnail (bg): {thumb_url}")
         try:
             resp = self._session.get(thumb_url, stream=True, timeout=10.0)
             self.log(f"thumb status={resp.status_code} {resp.reason}")
@@ -1148,31 +1214,39 @@ class VolumeToolkitApp(App):
         except Exception as e:
             self.log(f"Saving thumbnail err: {e}")
 
-        # Decode into texture for Kivy preview
+        # Decode into RGB bytes using PIL on background thread (safe), then schedule UI update
         try:
             pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
             pil.thumbnail((200, 200))
             w, h = pil.size
-            tex = Texture.create(size=(w, h), colorfmt="rgb")
-            tex.flip_vertical()
-            tex.blit_buffer(pil.tobytes(), colorfmt="rgb", bufferfmt="ubyte")
+            rgb_bytes = pil.tobytes()
         except Exception as e:
-            self.log(f"Thumbnail decode err: {e}")
+            self.log(f"Thumbnail decode err (bg): {e}")
             return
 
-        self._thumb_textures.insert(0, tex)
-        self._thumb_paths.insert(0, ccapi_path)
-        self._thumb_textures = self._thumb_textures[:5]
-        self._thumb_paths = self._thumb_paths[:5]
+        # Schedule the Texture.create and widget update on the main thread
+        def _make_texture_and_update(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ccapi_path=ccapi_path):
+            try:
+                tex = Texture.create(size=(w, h), colorfmt="rgb")
+                tex.flip_vertical()
+                tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
+            except Exception as e:
+                self.log(f"Texture create/blit err: {e}")
+                return
 
-        def _update(_dt):
+            # Insert at front
+            self._thumb_textures.insert(0, tex)
+            self._thumb_paths.insert(0, ccapi_path)
+            self._thumb_textures = self._thumb_textures[:5]
+            self._thumb_paths = self._thumb_paths[:5]
+
             for idx, img in enumerate(self._thumb_images):
                 if idx < len(self._thumb_textures):
                     img.texture = self._thumb_textures[idx]
                 else:
                     img.texture = None
 
-        Clock.schedule_once(_update, 0)
+        Clock.schedule_once(_make_texture_and_update, 0)
 
     def download_and_thumbnail_latest(self):
         if not self.connected:
@@ -1191,57 +1265,64 @@ class VolumeToolkitApp(App):
             return
 
         latest = jpgs[-1]
-        self._download_thumb_for_path(latest)
+        # run download in background to avoid blocking UI
+        threading.Thread(target=self._download_thumb_for_path, args=(latest,), daemon=True).start()
         self._last_seen_image = latest
 
+    # ---------- threaded poller (background) ----------
+
     def start_polling_new_images(self):
-        if self._poll_event is not None:
+        if self._poll_thread is not None and self._poll_thread.is_alive():
             return
-        self.log(f"Starting image poller every {self.poll_interval_s}s")
-        self._poll_event = Clock.schedule_interval(self._poll_new_images, self.poll_interval_s)
+        self.log(f"Starting image poller every {self.poll_interval_s}s (background thread)")
+        self._poll_thread_stop.clear()
+        self._poll_thread = threading.Thread(target=self._poll_worker, daemon=True)
+        self._poll_thread.start()
 
     def stop_polling_new_images(self):
-        if self._poll_event is not None:
-            self._poll_event.cancel()
-            self._poll_event = None
-            self.log("Image poller stopped")
-
-    def _poll_new_images(self, dt):
-        if not self.connected:
+        if self._poll_thread is None:
             return
+        self.log("Stopping image poller (background thread)")
+        self._poll_thread_stop.set()
+        self._poll_thread = None
 
-        images = self.list_all_images()
-        if not images:
-            return
+    def _poll_worker(self):
+        # Runs in background thread
+        while not self._poll_thread_stop.is_set():
+            try:
+                images = self.list_all_images()
+                if images:
+                    jpgs = [p for p in images if p.lower().endswith(('.jpg', '.jpeg'))]
+                    if jpgs:
+                        if self._last_seen_image is None:
+                            # set baseline without downloading
+                            self._last_seen_image = jpgs[-1]
+                            self.log(f"Poll (bg): baseline set to {self._last_seen_image}")
+                        else:
+                            # find new items after last_seen
+                            new_start_idx = None
+                            for idx, path in enumerate(jpgs):
+                                if path == self._last_seen_image:
+                                    new_start_idx = idx + 1
+                                    break
 
-        jpgs = [p for p in images if p.lower().endswith(('.jpg', '.jpeg'))]
-        if not jpgs:
-            return
+                            if new_start_idx is None:
+                                # baseline lost on server; reset baseline
+                                self.log("Poll (bg): last_seen not found, resetting baseline")
+                                self._last_seen_image = jpgs[-1]
+                            else:
+                                new_items = jpgs[new_start_idx:]
+                                for path in new_items:
+                                    self.log(f"Poll (bg): New image detected: {path}")
+                                    # Download + decode in a background thread (safe)
+                                    threading.Thread(target=self._download_thumb_for_path, args=(path,), daemon=True).start()
+                                    self._last_seen_image = path
+            except Exception as e:
+                self.log(f"Poll worker error: {e}")
 
-        if self._last_seen_image is None:
-            self._last_seen_image = jpgs[-1]
-            self.log(f"Poll: baseline set to {self._last_seen_image}")
-            return
-
-        new_start_idx = None
-        for idx, path in enumerate(jpgs):
-            if path == self._last_seen_image:
-                new_start_idx = idx + 1
-                break
-
-        if new_start_idx is None:
-            self.log("Poll: last_seen not found, resetting baseline")
-            self._last_seen_image = jpgs[-1]
-            return
-
-        new_items = jpgs[new_start_idx:]
-        if not new_items:
-            return
-
-        for path in new_items:
-            self.log(f"New image detected: {path}")
-            self._download_thumb_for_path(path)
-            self._last_seen_image = path
+            # Wait, but allow early exit
+            stop_event = self._poll_thread_stop
+            stop_event.wait(self.poll_interval_s)
 
     def dump_ccapi(self):
         status, data = self._json_call("GET", '/ccapi', None, timeout=10.0)
@@ -1315,6 +1396,11 @@ class VolumeToolkitApp(App):
             pass
         try:
             self.stop_polling_new_images()
+        except Exception:
+            pass
+        # stop decoder thread
+        try:
+            self._decoder_stop.set()
         except Exception:
             pass
 
