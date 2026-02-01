@@ -1,7 +1,13 @@
+# Android-focused Volume Toolkit (modified)
 #
-# Requirements:
-#   pip install kivy pillow opencv-python requests
-
+# Requirements (p4a/buildozer): kivy==2.3.0, pillow, numpy, opencv, pyjnius, requests, urllib3
+#
+# Notes:
+# - This variant removes the desktop CSV file chooser and uses Android SAF only.
+# - Requests to the camera use verify=False because many cameras have self-signed certs.
+# - The GitHub Actions workflow (.github/workflows/build.yml) already included in the repo
+#   should build an APK with python-for-android. This main.py is ready for that workflow.
+#
 import os
 
 # Android: keep Kivy writable files out of the extracted app directory.
@@ -18,8 +24,6 @@ import threading
 import time
 from datetime import datetime
 from io import BytesIO
-import os
-import os.path
 import csv
 import requests
 import urllib3
@@ -46,7 +50,6 @@ from kivy.uix.scatter import Scatter
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
-from kivy.uix.filechooser import FileChooserListView
 from kivy.utils import platform
 
 from PIL import Image as PILImage
@@ -110,14 +113,13 @@ class PreviewOverlay(FloatLayout):
 
         lw = 2
         lw_qr = 6
-        lw_qr = 6
 
         with self.img.canvas.after:
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
 
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
-            # Grid uses _ln_grid_list (initialized above)
+            # Grid uses _ln_grid_list (initialized below)
 
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
             self._ln_57 = Line(width=lw)
@@ -130,6 +132,9 @@ class PreviewOverlay(FloatLayout):
 
             self._c_qr = Color(0.2, 1.0, 0.2, 0.95)
             self._ln_qr = Line(width=lw_qr, close=True)
+
+        # Ensure the grid lines list is initialized before any redraw uses it.
+        self._ln_grid_list = []
 
         self.bind(pos=self._redraw, size=self._redraw)
         self.bind(
@@ -210,8 +215,11 @@ class PreviewOverlay(FloatLayout):
         # v1.0.6: Grid lines drawn separately to avoid diagonal connections
         n = int(self.grid_n)
         # Clear old grid lines
-        for line in self._ln_grid_list:
-            self.img.canvas.after.remove(line)
+        for line in list(self._ln_grid_list):
+            try:
+                self.img.canvas.after.remove(line)
+            except Exception:
+                pass
         self._ln_grid_list = []
 
         if self.show_grid and n >= 2:
@@ -445,8 +453,19 @@ class VolumeToolkitApp(App):
 
         self._reschedule_display_loop(int(self.fps_slider.value))
         self._set_controls_idle()
-        self.log("Desktop CCAPI GUI ready")
+        self.log("Android CCAPI GUI ready")
         return root
+
+    # ---------- lifecycle permission hook ----------
+    def on_start(self):
+        # Request runtime permissions on Android (storage for SAF reads/persist).
+        if platform == "android":
+            try:
+                from android.permissions import request_permissions, Permission
+                request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
+                self.log("Requested storage permissions (Android).")
+            except Exception as e:
+                self.log(f"Permission request failed: {e}")
 
     # ---------- logging / HTTPS ----------
 
@@ -562,8 +581,8 @@ class VolumeToolkitApp(App):
 
         add_header("QR & Author")
         add_toggle("QR detect (OpenCV)", True, lambda v: self._set_qr_enabled(v))
-        add_button("Load CSVâ€¦", lambda: self._open_csv_filechooser())
-        add_button("Select headersâ€¦", lambda: self._open_headers_popup())
+        add_button("Load CSV…", lambda: self._open_csv_filechooser())
+        add_button("Select headers…", lambda: self._open_headers_popup())
         add_button("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
 
         add_header("Capture")
@@ -595,7 +614,7 @@ class VolumeToolkitApp(App):
         self.status.text = f"Status: connecting to {self.camera_ip}:443..."
         self.log(f"Connecting to {self.camera_ip}:443")
 
-        status, data = self._json_call("GET", "/ccapi/ver100/deviceinformation", None, timeout=8.0)
+        status, data = self._json_call("GET", '/ccapi/ver100/deviceinformation', None, timeout=8.0)
         if status.startswith("200") and data:
             self.connected = True
             self.status.text = f"Status: connected ({data.get('productname', 'camera')})"
@@ -626,7 +645,7 @@ class VolumeToolkitApp(App):
             return
 
         self._author_update_in_flight = True
-        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author updatingâ€¦ ({source})"), 0)
+        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author updating… ({source})"), 0)
         threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
 
     def _commit_author_worker(self, value: str, source: str):
@@ -636,7 +655,7 @@ class VolumeToolkitApp(App):
         try:
             st_put, _ = self._json_call(
                 "PUT",
-                "/ccapi/ver100/functions/registeredname/author",
+                '/ccapi/ver100/functions/registeredname/author',
                 {"author": value},
                 timeout=8.0
             )
@@ -645,7 +664,7 @@ class VolumeToolkitApp(App):
 
             st_get, data = self._json_call(
                 "GET",
-                "/ccapi/ver100/functions/registeredname/author",
+                '/ccapi/ver100/functions/registeredname/author',
                 None,
                 timeout=8.0
             )
@@ -663,10 +682,10 @@ class VolumeToolkitApp(App):
             if ok:
                 self._last_committed_author = value
                 self.log(f"Author updated+verified ({source}): '{value}'")
-                self.qr_status.text = "Author updated âœ“"
+                self.qr_status.text = "Author updated ✓"
             else:
                 self.log(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
-                self.qr_status.text = "Author verify failed âœ—"
+                self.qr_status.text = "Author verify failed ✗"
 
         Clock.schedule_once(_finish, 0)
 
@@ -704,10 +723,10 @@ class VolumeToolkitApp(App):
         if not self.connected or self.live_running:
             return
 
-        payload = {"liveviewsize": "small", "cameradisplay": "on"}
+        payload = {"liveviewsize" : "small", "cameradisplay" : "on"}
         self.log("Starting live view size=small, cameradisplay=on")
 
-        status, _ = self._json_call("POST", "/ccapi/ver100/shooting/liveview", payload, timeout=10.0)
+        status, _ = self._json_call("POST", '/ccapi/ver100/shooting/liveview', payload, timeout=10.0)
         if not status.startswith("200"):
             self.status.text = f"Status: live view start failed ({status})"
             self.log(f"Live view start failed: {status}")
@@ -751,7 +770,7 @@ class VolumeToolkitApp(App):
 
         if self.session_started:
             try:
-                self._json_call("DELETE", "/ccapi/ver100/shooting/liveview", None, timeout=6.0)
+                self._json_call("DELETE", '/ccapi/ver100/shooting/liveview', None, timeout=6.0)
             except Exception:
                 pass
             self.session_started = False
@@ -900,10 +919,7 @@ class VolumeToolkitApp(App):
             self._display_count = 0
             self._stat_t0 = now
 
-    # ---------- CSV / headers ----------
-
-
-    # ---------- Android SAF CSV picker ----------
+    # ---------- Android-only CSV picker (SAF) ----------
 
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
@@ -934,7 +950,7 @@ class VolumeToolkitApp(App):
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
 
-            self.log("Opening Android file pickerâ€¦")
+            self.log("Opening Android file picker…")
             mActivity.startActivityForResult(intent, self._csv_req_code)
 
         except Exception as e:
@@ -996,46 +1012,11 @@ class VolumeToolkitApp(App):
         return bytes(out)
 
     def _open_csv_filechooser(self):
-        # Android: use system picker (SAF).
-        if platform == 'android':
-            return self._open_csv_saf()
-
-        # Desktop: use Kivy FileChooserListView.
-        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
-        chooser = FileChooserListView(filters=["*.csv"], size_hint=(1, 1))
-        content.add_widget(chooser)
-
-        status_lbl = Label(text="Pick a CSV file", size_hint=(1, None), height=dp(24), font_size=sp(12))
-        content.add_widget(status_lbl)
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
-        btn_ok = Button(text="Load")
-        btn_cancel = Button(text="Cancel")
-        btns.add_widget(btn_ok)
-        btns.add_widget(btn_cancel)
-        content.add_widget(btns)
-
-        popup = Popup(title="Load CSV", content=content, size_hint=(0.9, 0.9))
-
-        def do_load(*_):
-            if not chooser.selection:
-                status_lbl.text = "No file selected"
-                return
-            path = chooser.selection[0]
-            try:
-                with open(path, "rb") as f:
-                    data = f.read()
-                self._parse_csv_bytes(data)
-                status_lbl.text = f"Loaded {len(self.csv_rows)} rows"
-                popup.dismiss()
-            except Exception as e:
-                status_lbl.text = f"Error: {e}"
-                self.log(f"CSV load error: {e}")
-
-        btn_ok.bind(on_release=do_load)
-        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
-
-        popup.open()
+        # Android-only: use system picker (SAF).
+        if platform != 'android':
+            self.log("CSV load is Android-only (SAF). Please run on-device to load CSV.")
+            return
+        return self._open_csv_saf()
 
     def _parse_csv_bytes(self, b: bytes):
         self.log(f"CSV size: {len(b)} bytes")
@@ -1119,7 +1100,7 @@ class VolumeToolkitApp(App):
 
     def list_all_images(self):
         images = []
-        status, root = self._json_call("GET", "/ccapi/ver120/contents", None, timeout=8.0)
+        status, root = self._json_call("GET", '/ccapi/ver120/contents', None, timeout=8.0)
         self.log(f"/ccapi/ver120/contents -> {status}")
         if not status.startswith("200") or not root or "path" not in root:
             return images
@@ -1158,8 +1139,8 @@ class VolumeToolkitApp(App):
         try:
             os.makedirs(self.thumb_dir, exist_ok=True)
             name = os.path.basename(ccapi_path) or "image"
-            if not name.lower().endswith((".jpg", ".jpeg")):
-                name = name + ".jpg"
+            if not name.lower().endswith(('.jpg', '.jpeg')):
+                name = name + '.jpg'
             out_path = os.path.join(self.thumb_dir, name)
             with open(out_path, "wb") as f:
                 f.write(thumb_bytes)
@@ -1204,7 +1185,7 @@ class VolumeToolkitApp(App):
             self.log("No images found on camera.")
             return
 
-        jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
+        jpgs = [p for p in images if p.lower().endswith(('.jpg', '.jpeg'))]
         if not jpgs:
             self.log("No JPG files found.")
             return
@@ -1233,7 +1214,7 @@ class VolumeToolkitApp(App):
         if not images:
             return
 
-        jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
+        jpgs = [p for p in images if p.lower().endswith(('.jpg', '.jpeg'))]
         if not jpgs:
             return
 
@@ -1263,7 +1244,7 @@ class VolumeToolkitApp(App):
             self._last_seen_image = path
 
     def dump_ccapi(self):
-        status, data = self._json_call("GET", "/ccapi", None, timeout=10.0)
+        status, data = self._json_call("GET", '/ccapi', None, timeout=10.0)
         self.log(f"/ccapi status={status}")
         try:
             j = json.dumps(data, indent=2)
@@ -1274,7 +1255,7 @@ class VolumeToolkitApp(App):
             self.log(line)
         self.log("=== ccapi JSON END ===")
 
-    # ---------- thumbnail tap â†’ viewer ----------
+    # ---------- thumbnail tap -> viewer ----------
 
     def _on_thumb_touch(self, image_widget, touch):
         if not image_widget.collide_point(*touch.pos):
