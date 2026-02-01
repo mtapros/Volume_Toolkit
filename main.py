@@ -110,13 +110,14 @@ class PreviewOverlay(FloatLayout):
 
         lw = 2
         lw_qr = 6
+        lw_qr = 6
 
         with self.img.canvas.after:
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
 
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
-            self._ln_grid = Line(width=lw)
+            # Grid uses _ln_grid_list (initialized above)
 
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
             self._ln_57 = Line(width=lw)
@@ -206,6 +207,7 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
+        # v1.0.6: Grid lines drawn separately to avoid diagonal connections
         n = int(self.grid_n)
         # Clear old grid lines
         for line in self._ln_grid_list:
@@ -213,7 +215,7 @@ class PreviewOverlay(FloatLayout):
         self._ln_grid_list = []
 
         if self.show_grid and n >= 2:
-            # Draw each grid line separately to avoid diagonal connections
+            # Draw each grid line separately
             for i in range(1, n):
                 x = fx + fw * (i / n)
                 line = Line(points=[x, fy, x, fy + fh], width=2)
@@ -304,9 +306,6 @@ class VolumeToolkitApp(App):
         self.qr_enabled = True
         self.qr_interval_s = 0.15
         self.qr_new_gate_s = 0.70
-        self.qr_scan_duration = 1.0  # seconds to scan after tap
-        self.qr_scan_active = False
-        self.qr_scan_end_time = 0.0
         self._qr_detector = cv2.QRCodeDetector()
         self._qr_thread = None
         self._latest_qr_text = None
@@ -345,11 +344,6 @@ class VolumeToolkitApp(App):
         # HTTPS session
         self._session = requests.Session()
         self._session.verify = False
-
-        # Image viewer state
-        self._viewing_image = False
-        self._viewer_ccapi_path = None
-        self._full_image_cache = {}  # Cache full images by path
 
         # Android SAF picker
         self._android_activity_bound = False
@@ -403,12 +397,11 @@ class VolumeToolkitApp(App):
         self.preview_scatter.size_hint = (None, None)
 
         self.preview = PreviewOverlay(size_hint=(None, None))
-        self.preview.bind(on_touch_down=self._on_preview_tap)
         self.preview_scatter.add_widget(self.preview)
         preview_holder.add_widget(self.preview_scatter)
         main_area.add_widget(preview_holder)
 
-        sidebar = BoxLayout(orientation="vertical", size_hint=(0.2, 1), spacing=dp(4))
+        sidebar = BoxLayout(orientation="vertical", size_hint=(0.25, 1), spacing=dp(4))
         sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
         for idx in range(5):
             img = Image(size_hint=(1, 0.18), allow_stretch=True, keep_ratio=True)
@@ -421,10 +414,15 @@ class VolumeToolkitApp(App):
         root.add_widget(main_area)
 
         def fit_preview_to_holder(*_):
-            # Preview now fills the holder at fixed 80% width
-            w = preview_holder.width
-            h = preview_holder.height
+            w = max(dp(220), preview_holder.width * 0.98)
+            h = max(dp(220), preview_holder.height * 0.98)
+            self.preview_scatter.size = (w, h)
             self.preview.size = (w, h)
+            self.preview_scatter.scale = 1.0
+            self.preview_scatter.pos = (
+                preview_holder.x + (preview_holder.width - w) / 2.0,
+                preview_holder.y + (preview_holder.height - h) / 2.0
+            )
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
@@ -437,7 +435,7 @@ class VolumeToolkitApp(App):
         self.log_holder.add_widget(log_sv)
         root.add_widget(self.log_holder)
 
-        self.dropdown = self._build_dropdown()
+        self.dropdown = self._build_dropdown(fit_preview_to_holder)
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
@@ -502,7 +500,7 @@ class VolumeToolkitApp(App):
         b.color = (1, 1, 1, 1)
         return b
 
-    def _build_dropdown(self):
+    def _build_dropdown(self, reset_callback):
         dd = DropDown(auto_dismiss=True)
         dd.auto_width = False
         dd.width = dp(380)
@@ -731,7 +729,7 @@ class VolumeToolkitApp(App):
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
-        self._set_qr_ui(None, None, note="QR: tap preview to scan")
+        self._set_qr_ui(None, None, note="QR: none")
 
         self._fetch_count = 0
         self._decode_count = 0
@@ -778,27 +776,9 @@ class VolumeToolkitApp(App):
                 self.log(f"liveview fetch error: {e}")
                 time.sleep(0.10)
 
-
-    def _on_preview_tap(self, instance, touch):
-        """Trigger QR scan when user taps the preview."""
-        if instance.collide_point(*touch.pos):
-            if self.live_running and self.qr_enabled:
-                self.qr_scan_active = True
-                self.qr_scan_end_time = time.time() + self.qr_scan_duration
-                Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"QR: scanning for {self.qr_scan_duration}s..."), 0)
-                self.log(f"QR scan triggered (tap) - scanning for {self.qr_scan_duration}s")
-            return True
-        return False
-
     def _qr_loop(self):
         while self.live_running:
-            # Check if QR scanning window is active
-            now = time.time()
-            if not self.qr_scan_active or now > self.qr_scan_end_time:
-                if self.qr_scan_active:
-                    # Scanning window just expired
-                    self.qr_scan_active = False
-                    Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", "QR: tap preview to scan"), 0)
+            if not self.qr_enabled:
                 time.sleep(0.10)
                 continue
 
