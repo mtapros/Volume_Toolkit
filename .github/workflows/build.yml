@@ -1,4 +1,4 @@
-name: Build APK (Volume Toolkit)
+name: Build APK (Canon Live View)
 
 on:
   push:
@@ -37,6 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           ANDROID_SDK_ROOT="$HOME/android-sdk"
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           mkdir -p "$HOME/.android"
@@ -44,12 +45,14 @@ jobs:
 
           wget -q -O /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
           unzip -q /tmp/cmdline-tools.zip -d /tmp/android-cmdline-tools
+
           rm -rf "$ANDROID_SDK_ROOT/cmdline-tools/latest"
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
           mv /tmp/android-cmdline-tools/cmdline-tools/* "$ANDROID_SDK_ROOT/cmdline-tools/latest/"
 
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --licenses || true
+
           "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" \
             platform-tools \
             "platforms;android-27" \
@@ -69,11 +72,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           p4a apk \
             --private . \
-            --package com.hanleyai.volumetoolkit \
-            --name "Volume Toolkit" \
-            --version 1.0.6 \
+            --package org.example.canonliveview \
+            --name CanonLiveView \
+            --version 0.1.0 \
             --bootstrap sdl2 \
             --requirements python3,kivy==2.3.0,pillow,numpy,opencv,pyjnius,requests,urllib3 \
             --permission android.permission.INTERNET \
@@ -83,7 +87,6 @@ jobs:
             --permission android.permission.READ_EXTERNAL_STORAGE \
             --permission android.permission.WRITE_EXTERNAL_STORAGE \
             --orientation portrait \
-            --orientation landscape \
             --arch arm64-v8a \
             --android-api 27 \
             --ndk-api 21 \
@@ -100,5 +103,5 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: volumetoolkit-apk
+          name: canonliveview-apk
           path: output/*.apk
