@@ -1,17 +1,12 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-#
-# This is a full main.py intended to replace the repo file. Major changes:
-# - Polling for new images runs in a background thread (no blocking UI).
-# - Liveview JPEG decoding and rotation are performed in a background decoder
-#   thread using OpenCV (cv2.imdecode + cv2.rotate) to reduce latency.
-# - The decoder schedules only Texture creation/blit on the main thread.
-# - QR detection uses the latest decoded BGR frame (avoids re-decoding).
-# - PreviewOverlay grid list is initialized to avoid canvas errors.
-#
-# Keep in mind:
-# - This is Android-only code (uses android.* when running on device).
-# - The build workflow in .github/workflows/build.yml already builds an APK.
-# - The app still disables TLS verification for camera requests (self-signed certs).
+# Final updated main.py with:
+# - IP moved to Settings submenu
+# - Connect is a blue button; when connected the text turns yellow
+# - Stop button removed; Start is green (white text) and toggles to Stop (red, white text)
+# - Thumbnails rotated 90° to match preview
+# - Preview forced to 80% width; thumbs 20% width; user resizing disabled
+# - QR detection OFF by default; tapping preview starts a 1s pulse or until QR detected
+# - Background threaded decoder (cv2.imdecode) and background poller (non-blocking UI)
 #
 import os
 import json
@@ -49,7 +44,7 @@ from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.utils import platform
 
-from PIL import Image as PILImage  # used for CSV thumbnails saving/thumbnailing fallback
+from PIL import Image as PILImage
 
 import cv2
 import numpy as np
@@ -58,7 +53,6 @@ import numpy as np
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Android: keep Kivy writable files out of the extracted app directory.
-# This avoids permission errors when Kivy tries to create .kivy/icon, logs, config, etc.
 if os.environ.get("ANDROID_ARGUMENT"):
     private_dir = os.environ.get("ANDROID_PRIVATE")
     if private_dir:
@@ -288,9 +282,10 @@ class VolumeToolkitApp(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self.connected = False
-        self.camera_ip = "192.168.34.29"  # adjust as needed
+        # Default IP moved to settings popup
+        self.camera_ip = "192.168.34.29"
 
+        self.connected = False
         self.live_running = False
         self.session_started = False
 
@@ -316,8 +311,10 @@ class VolumeToolkitApp(App):
         self.dropdown = None
         self.show_log = True
 
-        # QR
-        self.qr_enabled = True
+        # QR: default OFF; temporary pulse on preview tap
+        self.qr_enabled = False
+        self._qr_temp_active = False
+        self._qr_pulse_event = None
         self.qr_interval_s = 0.15
         self.qr_new_gate_s = 0.70
         self._qr_detector = cv2.QRCodeDetector()
@@ -352,18 +349,17 @@ class VolumeToolkitApp(App):
         # Thumbnails
         self._thumb_textures = []
         self._thumb_images = []
-        self._thumb_paths = []  # CCAPI paths matching _thumb_textures
+        self._thumb_paths = []
 
         # Storage
-        self.download_dir = "downloads"  # not used now, but kept
+        self.download_dir = "downloads"
         self.thumb_dir = "thumbs"
 
         self._last_seen_image = None
         self._poll_thread = None
         self._poll_thread_stop = threading.Event()
-        self.poll_interval_s = 2.0  # seconds
+        self.poll_interval_s = 2.0
 
-        # thumbs only; no full-size auto-downloads
         self.save_full_size = False
 
         # HTTPS session
@@ -377,26 +373,24 @@ class VolumeToolkitApp(App):
     def build(self):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
+        # Header and menu
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         header.add_widget(Label(text="Volume Toolkit v1.0.6", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         root.add_widget(header)
 
-        row1 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
-        self.ip_input = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16), padding=[dp(10)] * 4)
-        row1.add_widget(self.ip_input)
-        root.add_widget(row1)
-
+        # Control row: Connect + Start only (IP in menu)
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
-        self.connect_btn = Button(text="Connect", font_size=sp(16))
-        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16))
-        self.stop_btn = Button(text="Stop", disabled=True, font_size=sp(16))
+        self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(None, 1), width=dp(120))
+        self._style_connect_button(initial=True)
+        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16), size_hint=(None, 1), width=dp(140))
+        self._style_start_button(stopped=True)
         row2.add_widget(self.connect_btn)
         row2.add_widget(self.start_btn)
-        row2.add_widget(self.stop_btn)
         root.add_widget(row2)
 
+        # Display FPS row
         row3 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(40))
         row3.add_widget(Label(text="Display FPS", size_hint=(None, 1), width=dp(110), font_size=sp(14)))
         self.fps_slider = Slider(min=5, max=30, value=12, step=1)
@@ -411,25 +405,28 @@ class VolumeToolkitApp(App):
         root.add_widget(self.status)
         root.add_widget(self.metrics)
 
-        self.qr_status = Label(text="QR: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
+        self.qr_status = Label(text="QR: off", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.qr_status)
 
+        # Main area: preview 80%, thumbs 20% (fixed)
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
-        preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.75, 1))
-        self.preview_scatter = Scatter(do_translation=True, do_scale=True, do_rotation=False,
-                                       scale_min=0.5, scale_max=2.5)
-        self.preview_scatter.size_hint = (None, None)
-
+        preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
+        # Disable user translation/scale so preview is not resizable
+        self.preview_scatter = Scatter(do_translation=False, do_scale=False, do_rotation=False,
+                                       size_hint=(None, None))
         self.preview = PreviewOverlay(size_hint=(None, None))
+        # Bind touch on preview area to trigger QR pulse
+        self.preview.bind(on_touch_down=self._on_preview_touch)
         self.preview_scatter.add_widget(self.preview)
         preview_holder.add_widget(self.preview_scatter)
         main_area.add_widget(preview_holder)
 
-        sidebar = BoxLayout(orientation="vertical", size_hint=(0.25, 1), spacing=dp(4))
+        sidebar = BoxLayout(orientation="vertical", size_hint=(0.20, 1), spacing=dp(4))
         sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
+        # Fixed thumbnail heights; user cannot resize
         for idx in range(5):
-            img = Image(size_hint=(1, 0.18), allow_stretch=True, keep_ratio=True)
+            img = Image(size_hint=(1, None), height=dp(100), allow_stretch=True, keep_ratio=True)
             img.thumb_index = idx
             img.bind(on_touch_down=self._on_thumb_touch)
             sidebar.add_widget(img)
@@ -438,12 +435,12 @@ class VolumeToolkitApp(App):
 
         root.add_widget(main_area)
 
+        # Fit preview to holder with fixed sizes
         def fit_preview_to_holder(*_):
             w = max(dp(220), preview_holder.width * 0.98)
             h = max(dp(220), preview_holder.height * 0.98)
             self.preview_scatter.size = (w, h)
             self.preview.size = (w, h)
-            self.preview_scatter.scale = 1.0
             self.preview_scatter.pos = (
                 preview_holder.x + (preview_holder.width - w) / 2.0,
                 preview_holder.y + (preview_holder.height - h) / 2.0
@@ -451,6 +448,7 @@ class VolumeToolkitApp(App):
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
+        # Log area
         self.log_holder = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(150))
         log_sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         self.log_label = Label(text="", size_hint_y=None, halign="left", valign="top", font_size=sp(11))
@@ -463,15 +461,41 @@ class VolumeToolkitApp(App):
         self.dropdown = self._build_dropdown(fit_preview_to_holder)
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
+        # Bind buttons
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
-        self.start_btn.bind(on_press=lambda *_: self.start_liveview())
-        self.stop_btn.bind(on_press=lambda *_: self.stop_liveview())
+        self.start_btn.bind(on_press=lambda *_: self._on_start_pressed())
         self.fps_slider.bind(value=self._on_fps_change)
 
+        # Run metrics/update ticker
         self._reschedule_display_loop(int(self.fps_slider.value))
         self._set_controls_idle()
         self.log("Android CCAPI GUI ready")
         return root
+
+    # ---------- styling helpers ----------
+    def _style_connect_button(self, initial=False):
+        # Blue button; when connected, text color turns yellow
+        self.connect_btn.background_normal = ""
+        self.connect_btn.background_down = ""
+        self.connect_btn.background_color = (0.06, 0.45, 0.75, 1.0)  # blue
+        if initial or not self.connected:
+            self.connect_btn.color = (1, 1, 1, 1)
+        else:
+            self.connect_btn.color = (1, 1, 0, 1)  # yellow text
+
+    def _style_start_button(self, stopped=True):
+        self.start_btn.background_normal = ""
+        self.start_btn.background_down = ""
+        if stopped:
+            # green with white text
+            self.start_btn.background_color = (0.0, 0.6, 0.0, 1.0)
+            self.start_btn.color = (1, 1, 1, 1)
+            self.start_btn.text = "Start"
+        else:
+            # running -> show as Stop (red)
+            self.start_btn.background_color = (0.8, 0.0, 0.0, 1.0)
+            self.start_btn.color = (1, 1, 1, 1)
+            self.start_btn.text = "Stop"
 
     # ---------- lifecycle permission hook ----------
     def on_start(self):
@@ -485,7 +509,6 @@ class VolumeToolkitApp(App):
                 self.log(f"Permission request failed: {e}")
 
     # ---------- logging / HTTPS ----------
-
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -522,7 +545,6 @@ class VolumeToolkitApp(App):
             return f"ERR {e}", None
 
     # ---------- menu / UI ----------
-
     def _set_log_visible(self, visible: bool):
         self.show_log = bool(visible)
         self.log_holder.height = dp(150) if self.show_log else 0
@@ -597,16 +619,20 @@ class VolumeToolkitApp(App):
         add_toggle("QR overlay", True, lambda v: setattr(self.preview, "show_qr", v))
 
         add_header("QR & Author")
-        add_toggle("QR detect (OpenCV)", True, lambda v: self._set_qr_enabled(v))
+        # Permanent QR toggle (off by default)
+        add_toggle("QR detect (OpenCV) (permanent)", False, lambda v: setattr(self, "qr_enabled", bool(v)))
         add_button("Load CSV…", lambda: self._open_csv_filechooser())
         add_button("Select headers…", lambda: self._open_headers_popup())
         add_button("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
 
         add_header("Capture")
         add_capture_type_buttons()
-        add_button("Fetch latest image", lambda: self.download_and_thumbnail_latest())
+        add_button("Fetch latest image", lambda: threading.Thread(target=self._background_download_latest, daemon=True).start())
         add_button("Start auto-fetch", lambda: self.start_polling_new_images())
         add_button("Stop auto-fetch", lambda: self.stop_polling_new_images())
+
+        add_header("Settings")
+        add_button("IP settings…", lambda: self._open_ip_popup())
 
         add_header("Debug")
         add_button("Dump /ccapi", lambda: self.dump_ccapi())
@@ -616,16 +642,39 @@ class VolumeToolkitApp(App):
 
         return dd
 
-    # ---------- connect / author ----------
+    # ---------- IP settings popup ----------
+    def _open_ip_popup(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+        ti = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16))
+        content.add_widget(Label(text="Camera IP (no port):", size_hint=(1, None), height=dp(28)))
+        content.add_widget(ti)
+        btns = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
+        btn_ok = Button(text="Save")
+        btn_cancel = Button(text="Cancel")
+        btns.add_widget(btn_ok)
+        btns.add_widget(btn_cancel)
+        content.add_widget(btns)
+        popup = Popup(title="IP settings", content=content, size_hint=(0.85, 0.35))
 
+        def do_save(*_):
+            val = ti.text.strip()
+            if val:
+                self.camera_ip = val
+                self.log(f"Camera IP set to {val}")
+            popup.dismiss()
+
+        btn_ok.bind(on_release=do_save)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    # ---------- connect / author ----------
     def connect_camera(self):
         if self.live_running:
             self.log("Connect disabled while live view is running. Stop first.")
             return
 
-        self.camera_ip = self.ip_input.text.strip()
         if not self.camera_ip:
-            self.status.text = "Status: enter an IP"
+            self.status.text = "Status: enter an IP (use Settings->IP)"
             return
 
         self.status.text = f"Status: connecting to {self.camera_ip}:443..."
@@ -636,12 +685,16 @@ class VolumeToolkitApp(App):
             self.connected = True
             self.status.text = f"Status: connected ({data.get('productname', 'camera')})"
             self.log("Connected OK")
+            # Update Connect button text color to yellow to indicate connected
+            self.connect_btn.color = (1, 1, 0, 1)
+            # Enable Start button
+            self.start_btn.disabled = False
         else:
             self.connected = False
             self.status.text = f"Status: connect failed ({status})"
             self.log(f"Connect failed: {status}")
-
-        self._set_controls_idle()
+            self.connect_btn.color = (1, 1, 1, 1)
+            self.start_btn.disabled = True
 
     def _author_value(self, payload: str) -> str:
         s = (payload or "").strip()
@@ -707,11 +760,13 @@ class VolumeToolkitApp(App):
         Clock.schedule_once(_finish, 0)
 
     # ---------- liveview + QR + decoder ----------
-
     def _set_qr_enabled(self, enabled: bool):
+        # Permanent QR enable via menu. Pulse still works independently.
         self.qr_enabled = bool(enabled)
-        if not self.qr_enabled:
+        if not self.qr_enabled and not self._qr_temp_active:
             self._set_qr_ui(None, None, note="QR: off")
+        elif self.qr_enabled:
+            self._set_qr_ui(None, None, note="QR: on")
 
     def _on_fps_change(self, *_):
         fps = int(self.fps_slider.value)
@@ -725,21 +780,33 @@ class VolumeToolkitApp(App):
         self._display_event = Clock.schedule_interval(self._ui_noop_display_tick, 1.0 / fps)
 
     def _ui_noop_display_tick(self, dt):
-        # Display is driven by decoder scheduling; this tick only updates metrics periodically.
+        # Display count used for metrics only
         self._display_count += 1
         self._update_metrics(self._last_decoded_ts)
 
     def _set_controls_idle(self):
-        self.ip_input.disabled = False
+        # connect enabled; start enabled only when connected
         self.connect_btn.disabled = False
-        self.start_btn.disabled = not self.connected
-        self.stop_btn.disabled = True
+        self._style_connect_button()
+        self._style_start_button(stopped=True)
 
     def _set_controls_running(self):
-        self.ip_input.disabled = True
+        # while running, disable connect to avoid mid-stream connect changes
         self.connect_btn.disabled = True
-        self.start_btn.disabled = True
-        self.stop_btn.disabled = False
+        self._style_connect_button()
+        self._style_start_button(stopped=False)
+
+    def _on_start_pressed(self):
+        # Start acts as a toggle (Start/Stop)
+        if not self.live_running:
+            if not self.connected:
+                self.log("Cannot start live: not connected")
+                return
+            self.start_liveview()
+            self._set_controls_running()
+        else:
+            self.stop_liveview()
+            self._set_controls_idle()
 
     def start_liveview(self):
         if not self.connected or self.live_running:
@@ -770,7 +837,7 @@ class VolumeToolkitApp(App):
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
-        self._set_qr_ui(None, None, note="QR: none")
+        self._set_qr_ui(None, None, note="QR: off" if not self.qr_enabled else "QR: on")
 
         self._fetch_count = 0
         self._decode_count = 0
@@ -892,7 +959,8 @@ class VolumeToolkitApp(App):
         # QR detection uses the last decoded BGR frame (avoid re-decoding JPEG)
         last_processed_ts = 0.0
         while self.live_running:
-            if not self.qr_enabled:
+            # scan only if permanently enabled or a temporary pulse is active
+            if not (self.qr_enabled or self._qr_temp_active):
                 time.sleep(0.10)
                 continue
 
@@ -921,7 +989,10 @@ class VolumeToolkitApp(App):
 
                 if qr_text or qr_points:
                     self._publish_qr(qr_text if qr_text else None, qr_points)
-
+                    # If this was a temporary pulse, end it immediately
+                    if self._qr_temp_active:
+                        # Schedule end on main thread to safely cancel Clock event and update UI
+                        Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
             except Exception:
                 pass
 
@@ -938,7 +1009,8 @@ class VolumeToolkitApp(App):
                 self.log(f"QR: {text}")
             self._maybe_commit_author(text, source="qr")
 
-        if not self.qr_enabled:
+        # Build status note
+        if not (self.qr_enabled or self._qr_temp_active):
             note = "QR: off"
         elif text:
             note = f"QR: {text[:80]}"
@@ -947,7 +1019,12 @@ class VolumeToolkitApp(App):
         else:
             note = self.qr_status.text if self.qr_status.text else "QR: none"
 
+        # Update UI
         Clock.schedule_once(lambda *_: self._set_qr_ui(text, points, note=note), 0)
+
+        # If this was a temporary pulse, end the pulse immediately (on main thread)
+        if getattr(self, "_qr_temp_active", False):
+            Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
 
     def _set_qr_ui(self, text, points, note="QR: none"):
         if text:
@@ -957,11 +1034,58 @@ class VolumeToolkitApp(App):
             self.preview.set_qr(points)
         self.qr_status.text = note
 
-    # ---------- UI decode/display entry point (no heavy work here) ----------
+    # ---------- preview tap handling for QR pulse ----------
+    def _on_preview_touch(self, instance, touch):
+        # only react to touches inside the preview widget
+        if not instance.collide_point(*touch.pos):
+            return False
+        # Start a QR pulse scan for 1 second (or until detection)
+        self._start_pulse_qr()
+        # Return True to indicate touch handled
+        return True
 
+    def _start_pulse_qr(self):
+        # Cancel any existing scheduled end-of-pulse
+        if getattr(self, "_qr_pulse_event", None):
+            try:
+                self._qr_pulse_event.cancel()
+            except Exception:
+                pass
+            self._qr_pulse_event = None
+
+        self._qr_temp_active = True
+        # Update UI immediately
+        self._set_qr_ui(None, None, note="QR: scanning…")
+        # Schedule end of pulse after 1 second (store event so we can cancel it early)
+        try:
+            self._qr_pulse_event = Clock.schedule_once(lambda *_: self._end_pulse_qr(), 1.0)
+        except Exception:
+            # Fallback: if scheduling fails, clear the pulse after 1s in a background timer
+            def _bg_end():
+                time.sleep(1.0)
+                Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
+            threading.Thread(target=_bg_end, daemon=True).start()
+
+    def _end_pulse_qr(self, *args):
+        # Cancel the scheduled Clock event if it still exists
+        if getattr(self, "_qr_pulse_event", None):
+            try:
+                self._qr_pulse_event.cancel()
+            except Exception:
+                pass
+            self._qr_pulse_event = None
+
+        # Turn off the temporary pulse flag
+        self._qr_temp_active = False
+
+        # Restore UI state depending on permanent qr_enabled flag
+        if not getattr(self, "qr_enabled", False):
+            self._set_qr_ui(None, None, note="QR: off")
+        else:
+            self._set_qr_ui(None, None, note="QR: on")
+
+    # ---------- UI decode/display entry point (no heavy work here) ----------
     def _ui_noop_display_tick(self, dt):
-        # stub: actual rendering is done when decoder schedules texture updates,
-        # this tick just updates metrics periodically (handled in _update_metrics).
         pass
 
     def _update_metrics(self, frame_ts):
@@ -982,7 +1106,6 @@ class VolumeToolkitApp(App):
             self._stat_t0 = now
 
     # ---------- Android-only CSV picker (SAF) ----------
-
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
             return
@@ -994,8 +1117,6 @@ class VolumeToolkitApp(App):
             self.log(f"Android activity bind failed: {e}")
 
     def _open_csv_saf(self):
-        # Android Storage Access Framework picker (returns content:// URI).
-        # We avoid jnius.j*array to prevent build/runtime issues.
         self._bind_android_activity_once()
         self._csv_req_code = getattr(self, "_csv_req_code", 4242)
 
@@ -1055,7 +1176,6 @@ class VolumeToolkitApp(App):
             self.log(f"CSV load failed (Android): {e}")
 
     def _read_android_uri_bytes(self, uri):
-        # Read bytes from content:// URI using ContentResolver.openInputStream().
         from android import mActivity
 
         cr = mActivity.getContentResolver()
@@ -1074,7 +1194,6 @@ class VolumeToolkitApp(App):
         return bytes(out)
 
     def _open_csv_filechooser(self):
-        # Android-only: use system picker (SAF).
         if platform != 'android':
             self.log("CSV load is Android-only (SAF). Please run on-device to load CSV.")
             return
@@ -1159,7 +1278,6 @@ class VolumeToolkitApp(App):
         self._headers_popup = popup
 
     # ---------- contents + download (ver120, thumbnails only) ----------
-
     def list_all_images(self):
         images = []
         status, root = self._json_call("GET", '/ccapi/ver120/contents', None, timeout=8.0)
@@ -1187,7 +1305,7 @@ class VolumeToolkitApp(App):
     def _download_thumb_for_path(self, ccapi_path: str):
         """
         Downloads thumbnail bytes and schedules a main-thread task to create a Kivy texture
-        and update UI. This keeps network and PIL work off the UI thread.
+        and update UI. Rotates thumbnail 90 degrees to match preview orientation.
         """
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         self.log(f"Downloading thumbnail (bg): {thumb_url}")
@@ -1214,9 +1332,13 @@ class VolumeToolkitApp(App):
         except Exception as e:
             self.log(f"Saving thumbnail err: {e}")
 
-        # Decode into RGB bytes using PIL on background thread (safe), then schedule UI update
+        # Decode into RGB bytes using PIL on background thread, rotate 90deg, then schedule UI update
         try:
             pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
+            try:
+                pil = pil.transpose(PILImage.ROTATE_90)
+            except Exception:
+                pil = pil.rotate(90, expand=True)
             pil.thumbnail((200, 200))
             w, h = pil.size
             rgb_bytes = pil.tobytes()
@@ -1224,7 +1346,6 @@ class VolumeToolkitApp(App):
             self.log(f"Thumbnail decode err (bg): {e}")
             return
 
-        # Schedule the Texture.create and widget update on the main thread
         def _make_texture_and_update(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ccapi_path=ccapi_path):
             try:
                 tex = Texture.create(size=(w, h), colorfmt="rgb")
@@ -1248,6 +1369,10 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_make_texture_and_update, 0)
 
+    def _background_download_latest(self):
+        # helper to run download_and_thumbnail_latest in bg thread to avoid UI blocking
+        self.download_and_thumbnail_latest()
+
     def download_and_thumbnail_latest(self):
         if not self.connected:
             self.log("Not connected; cannot fetch contents.")
@@ -1270,7 +1395,6 @@ class VolumeToolkitApp(App):
         self._last_seen_image = latest
 
     # ---------- threaded poller (background) ----------
-
     def start_polling_new_images(self):
         if self._poll_thread is not None and self._poll_thread.is_alive():
             return
@@ -1337,7 +1461,6 @@ class VolumeToolkitApp(App):
         self.log("=== ccapi JSON END ===")
 
     # ---------- thumbnail tap -> viewer ----------
-
     def _on_thumb_touch(self, image_widget, touch):
         if not image_widget.collide_point(*touch.pos):
             return False
@@ -1388,7 +1511,6 @@ class VolumeToolkitApp(App):
         popup.open()
 
     # ---------- lifecycle ----------
-
     def on_stop(self):
         try:
             self.stop_liveview()
@@ -1398,7 +1520,6 @@ class VolumeToolkitApp(App):
             self.stop_polling_new_images()
         except Exception:
             pass
-        # stop decoder thread
         try:
             self._decoder_stop.set()
         except Exception:
