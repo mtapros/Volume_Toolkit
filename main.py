@@ -1,14 +1,14 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Updates:
-# - Grid lines drawn in orange (fix color ordering bug).
-# - Thumbnails rotated to match preview orientation.
-# - Default behavior: only thumbnails are retrieved.
-# - Tapping a thumbnail displays the low-res thumbnail stretched over the preview,
-#   then downloads the full-res JPG in background and swaps it in when ready.
-# - Overlay mode prevents liveview frames from replacing the selected image until
-#   the high-res image has been applied.
-#
-# Note: This file is a drop-in replacement for main.py in the repo.
+# v12-based corrected main.py:
+# - Restored _json_call
+# - Fixed HTML-escaped characters / syntax issues
+# - Grid drawn in orange
+# - Thumbnails rotated to match preview
+# - Thumbnails only by default; tapping a thumb overlays a low-res stretched image,
+#   background-downloads full-res JPG and replaces it when ready
+# - QR pulse scanning: 1s max, highlight box shown up to 3s (green)
+# - Decoder thread started after build() to avoid race conditions
+# - Connect runs in background thread
 import os
 import json
 import threading
@@ -63,7 +63,7 @@ if os.environ.get("ANDROID_ARGUMENT"):
         os.environ["KIVY_HOME"] = kivy_home
 
 
-def pil_rotate_90s(img: PILImage.Image, ang: int) -> PILImage.Image:
+def pil_rotate_90s(img, ang):
     ang = int(ang) % 360
     if ang == 0:
         return img
@@ -77,6 +77,7 @@ def pil_rotate_90s(img: PILImage.Image, ang: int) -> PILImage.Image:
             return img.transpose(T.ROTATE_270)
         return img
     except Exception:
+        # Pillow older variants
         if ang == 90:
             return img.transpose(PILImage.ROTATE_90)
         if ang == 180:
@@ -101,7 +102,7 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
-    # Preview rotation default: rotated so phone+hotshoe orientation matches camera orientation
+    # default preview rotation (user requested preview rotated 180° from prior default)
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
@@ -118,15 +119,13 @@ class PreviewOverlay(FloatLayout):
         lw_qr = 6
 
         with self.img.canvas.after:
-            # Border color (blue)
+            # border
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
 
-            # We keep a placeholder Color object for grid, but actual grid lines are
-            # drawn dynamically in _redraw with explicit Color objects so they are orange.
+            # placeholders (grid is drawn explicitly orange later)
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
 
-            # 5:7 and 8:10 crop rectangles
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
             self._ln_57 = Line(width=lw)
 
@@ -136,11 +135,11 @@ class PreviewOverlay(FloatLayout):
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
             self._ln_oval = Line(width=lw)
 
-            # QR highlight color: green
+            # QR highlight (green)
             self._c_qr = Color(0.0, 1.0, 0.0, 0.95)
             self._ln_qr = Line(width=lw_qr, close=True)
 
-        # Grid lines list: we store (ColorObj, LineObj) pairs so we can remove both on redraw
+        # store (ColorObj, LineObj) pairs for grid lines to remove them cleanly
         self._ln_grid_list = []
 
         self.bind(pos=self._redraw, size=self._redraw)
@@ -156,7 +155,6 @@ class PreviewOverlay(FloatLayout):
         self._redraw()
 
     def set_texture(self, texture):
-        # Public setter used by app to set preview texture
         self.img.texture = texture
         self._redraw()
 
@@ -206,24 +204,21 @@ class PreviewOverlay(FloatLayout):
     def _redraw(self, *args):
         fx, fy, fw, fh = self._drawn_rect()
 
-        # border
         self._ln_border.rectangle = (fx, fy, fw, fh) if self.show_border else (0, 0, 0, 0)
 
-        # 5:7 crop
         if self.show_57:
             asp57 = self._crop_aspect(5.0, 7.0, fw, fh)
             self._ln_57.rectangle = self._center_crop_rect(fx, fy, fw, fh, asp57)
         else:
             self._ln_57.rectangle = (0, 0, 0, 0)
 
-        # 8:10 crop
         if self.show_810:
             asp810 = self._crop_aspect(4.0, 5.0, fw, fh)
             self._ln_810.rectangle = self._center_crop_rect(fx, fy, fw, fh, asp810)
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
-        # Grid: remove any previous grid Color/Line entries
+        # remove old grid color/line objects
         for col_obj, line_obj in list(self._ln_grid_list):
             try:
                 self.img.canvas.after.remove(col_obj)
@@ -235,12 +230,12 @@ class PreviewOverlay(FloatLayout):
                 pass
         self._ln_grid_list = []
 
-        # Draw grid lines in orange explicitly (so they don't pick up QR green color)
+        # Draw grid lines explicitly in orange so they don't pick up other Color state
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
             for i in range(1, n):
                 x = fx + fw * (i / n)
-                col = Color(1.0, 0.6, 0.0, 0.85)
+                col = Color(1.0, 0.6, 0.0, 0.85)  # orange
                 ln = Line(points=[x, fy, x, fy + fh], width=2)
                 self.img.canvas.after.add(col)
                 self.img.canvas.after.add(ln)
@@ -253,7 +248,6 @@ class PreviewOverlay(FloatLayout):
                 self.img.canvas.after.add(ln)
                 self._ln_grid_list.append((col, ln))
 
-        # Oval
         if self.show_oval:
             cx = fx + fw * float(self.oval_cx)
             cy = fy + fh * float(self.oval_cy)
@@ -272,7 +266,6 @@ class PreviewOverlay(FloatLayout):
             self._clear_line_modes(self._ln_oval)
             self._ln_oval.ellipse = (0, 0, 0, 0)
 
-        # QR overlay (uses pre-declared _c_qr color)
         if self.show_qr and self._qr_points_px and self.img.texture and self.img.texture.size[0] > 0:
             iw, ih = self.img.texture.size
             dx, dy, dw, dh = fx, fy, fw, fh
@@ -470,6 +463,7 @@ class VolumeToolkitApp(App):
         self.preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview_scatter = Scatter(do_translation=False, do_scale=False, do_rotation=False, size_hint=(None, None))
         self.preview = PreviewOverlay(size_hint=(None, None))
+        # make sure the handler exists (it's defined later in class)
         self.preview.bind(on_touch_down=self._on_preview_touch)
         self.preview_scatter.add_widget(self.preview)
         self.preview_holder.add_widget(self.preview_scatter)
@@ -683,7 +677,7 @@ class VolumeToolkitApp(App):
 
         return dd
 
-    # ---------- FPS / IP popups (unchanged) ----------
+    # ---------- FPS / IP popups ----------
     def _open_fps_popup(self):
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         sv = Slider(min=5, max=30, value=12, step=1)
@@ -731,7 +725,7 @@ class VolumeToolkitApp(App):
         btn_cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # ---------- connect / author (unchanged background connect) ----------
+    # ---------- connect / author ----------
     def connect_camera(self):
         if self.live_running:
             self._log_internal("Connect disabled while live view is running. Stop first.")
@@ -781,7 +775,7 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_finish, 0)
 
-    def _author_value(self, payload: str) -> str:
+    def _author_value(self, payload):
         s = (payload or "").strip()
         if not s:
             return ""
@@ -1012,7 +1006,7 @@ class VolumeToolkitApp(App):
 
                 def _update_texture_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ts=ts):
                     try:
-                        # if user has selected a thumbnail overlay, do not replace the preview
+                        # if user selected overlay, don't replace preview
                         if getattr(self, "_overlay_active", False):
                             return
                         if self._frame_texture is None or self._frame_size != (w, h):
@@ -1136,6 +1130,55 @@ class VolumeToolkitApp(App):
             self._qr_highlight_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
         self.qr_status.text = note
 
+    # ---------- preview tap handling for QR pulse ----------
+    def _on_preview_touch(self, instance, touch):
+        # only react to touches inside the preview widget
+        if not instance.collide_point(*touch.pos):
+            return False
+        # Start a QR pulse scan for 1 second (or until detection)
+        self._start_pulse_qr()
+        # Return True to indicate touch handled
+        return True
+
+    def _start_pulse_qr(self):
+        # Cancel any existing scheduled end-of-pulse
+        if getattr(self, "_qr_pulse_event", None):
+            try:
+                self._qr_pulse_event.cancel()
+            except Exception:
+                pass
+            self._qr_pulse_event = None
+
+        self._qr_temp_active = True
+        # Update UI immediately
+        self._set_qr_ui(None, None, note="QR: scanning…")
+        # Schedule end of pulse after 1 second (store event so we can cancel it early)
+        try:
+            self._qr_pulse_event = Clock.schedule_once(lambda *_: self._end_pulse_qr(), 1.0)
+        except Exception:
+            def _bg_end():
+                time.sleep(1.0)
+                Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
+            threading.Thread(target=_bg_end, daemon=True).start()
+
+    def _end_pulse_qr(self, *args):
+        # Cancel the scheduled Clock event if it still exists
+        if getattr(self, "_qr_pulse_event", None):
+            try:
+                self._qr_pulse_event.cancel()
+            except Exception:
+                pass
+            self._qr_pulse_event = None
+
+        # Turn off the temporary pulse flag
+        self._qr_temp_active = False
+
+        # Restore UI state depending on permanent qr_enabled flag
+        if not getattr(self, "qr_enabled", False):
+            self._set_qr_ui(None, None, note="QR: off")
+        else:
+            self._set_qr_ui(None, None, note="QR: on")
+
     # ---------- thumbnail selection / overlay behavior ----------
     def _on_thumb_touch(self, image_widget, touch):
         if not image_widget.collide_point(*touch.pos):
@@ -1159,8 +1202,7 @@ class VolumeToolkitApp(App):
     def _download_thumb_and_overlay(self, ccapi_path, idx):
         # helper used when a thumb hasn't been loaded but user tapped it
         self._download_thumb_for_path(ccapi_path)
-        # if added, it will be at front; find its index if different
-        # safe attempt to get texture for idx
+        # attempt to get texture for idx
         if idx < len(self._thumb_textures):
             tex = self._thumb_textures[idx]
             Clock.schedule_once(lambda *_: self._select_image_overlay(ccapi_path, tex, idx), 0)
@@ -1236,7 +1278,6 @@ class VolumeToolkitApp(App):
                 try:
                     if thumb_index < len(self._thumb_textures):
                         self._thumb_textures[thumb_index] = tex
-                        # update UI image
                         if thumb_index < len(self._thumb_images):
                             self._thumb_images[thumb_index].texture = tex
                 except Exception:
@@ -1430,8 +1471,6 @@ class VolumeToolkitApp(App):
             self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
             return
         return self._open_csv_saf()
-
-    # Thumbnail viewer removed; tapping a thumb now overlays on preview (behavior above)
 
     def on_stop(self):
         try:
