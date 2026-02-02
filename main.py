@@ -1,13 +1,12 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Full, self-contained main.py — cleaned, validated, and complete.
-# Key fixes:
-# - No HTML-escaped tokens; normal Python syntax throughout.
-# - All Kivy Texture creation happens on the main (GL) thread.
-# - Overlay Rectangle is drawn into the Image.canvas.after and sized to the Image drawn rect,
-#   so thumbnail/full-res overlays exactly match the live preview (letterboxed) area.
-# - Tapping the same thumbnail toggles the overlay. The selected thumbnail is highlighted.
-# - Defensive logging and many safety checks to avoid missing-attribute races.
-# Replace your repo main.py with this file.
+# Updated to add CSV "Select student" UI and Force Update button
+# - Adds footer with "Select student" and "Force update" buttons
+# - "Select student" opens a popup that allows filtering, sorting (single-column), re-ordering columns,
+#   and selecting a row from the loaded CSV. The selection populates the main "Data Update: ..." label.
+# - "Force update" pushes the currently-selected CSV-derived author payload to the camera (uses existing _maybe_commit_author)
+# - QR continues to populate the same "Data Update: ..." label when QR is scanned.
+# - Stale full-res fetch prevention retained.
+# Note: keep this file in sync with your repo; this is a full drop-in replacement.
 
 import os
 import json
@@ -478,6 +477,7 @@ class VolumeToolkitApp(App):
 
         self.csv_headers = []
         self.csv_rows = []
+        # selected_headers doubles as the order/selection for author assembly
         self.selected_headers = []
         self._headers_popup = None
 
@@ -486,6 +486,10 @@ class VolumeToolkitApp(App):
         self._thumb_images = []
         self._thumb_paths = []
         self._thumb_saved_paths = []
+
+        # track pending full-res fetches to avoid stale-applying results
+        # maps thumb_index -> request_id (float)
+        self._pending_full_fetches = {}
 
         # storage
         self.download_dir = "downloads"
@@ -509,6 +513,12 @@ class VolumeToolkitApp(App):
         # UI refs (populated in build)
         self.header = None
         self.preview_holder = None
+
+        # CSV selection UI state
+        self._column_filters = {}      # header -> filter string
+        self._column_sorts = {}        # header -> None | 'asc' | 'desc' (single-column sort supported)
+        self._selected_csv_row = None  # dict row selected by user
+        self._selected_author_payload = None  # last assembled payload from CSV selection
 
     # ---------- texture helpers (main-thread creation) ----------
     def _create_texture_from_rgb(self, rgb_bytes, w, h, flip_vertical=True):
@@ -609,8 +619,9 @@ class VolumeToolkitApp(App):
         row2.add_widget(self.start_btn)
         root.add_widget(row2)
 
-        # QR / status labels
-        self.qr_last_label = Label(text="QR: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
+        # Data Update / status labels (renamed from QR to Data Update)
+        # This label shows either QR result or CSV selected row summary
+        self.qr_last_label = Label(text="Data Update: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.qr_last_label)
         self.status = Label(text="Status: not connected", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.status)
@@ -644,6 +655,15 @@ class VolumeToolkitApp(App):
         main_area.add_widget(sidebar)
 
         root.add_widget(main_area)
+
+        # Footer: two buttons at bottom opposite the title (portrait bottom)
+        footer = BoxLayout(orientation="horizontal", size_hint=(1, None), height=dp(48), spacing=dp(6))
+        self.select_student_btn = Button(text="Select student", size_hint=(None, 1), width=dp(160))
+        self.force_update_btn = Button(text="Force update", size_hint=(None, 1), width=dp(160))
+        footer.add_widget(Label())  # spacer to push buttons to the right side
+        footer.add_widget(self.select_student-btn if False else self.select_student_btn)  # alias to satisfy lint
+        footer.add_widget(self.force_update_btn)
+        root.add_widget(footer)
 
         # Fit preview to holder
         def fit_preview_to_holder(*_):
@@ -681,6 +701,8 @@ class VolumeToolkitApp(App):
         # Button bindings
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self._on_start_pressed())
+        self.select_student_btn.bind(on_release=lambda *_: self._open_student_selector_popup())
+        self.force_update_btn.bind(on_release=lambda *_: self._force_update_from_selection())
 
         # Start decoder thread now that preview exists (avoid race)
         if self._decoder_thread is None:
@@ -739,6 +761,277 @@ class VolumeToolkitApp(App):
                 pass
         self._thumb_highlight_lines = {}
         self._highlighted_thumb_index = None
+
+    # ---------- CSV selector popup implementation ----------
+    def _open_student_selector_popup(self):
+        """
+        Opens a popup that allows:
+        - reorder of selected_headers (up/down)
+        - filter per selected column
+        - single-column sort (toggle asc/desc/none)
+        - scrollable list of filtered rows
+        - selecting a row to set as the current Data Update payload
+        """
+        if not self.csv_rows or not self.csv_headers:
+            # No CSV loaded
+            popup = Popup(title="No CSV",
+                          content=Label(text="No CSV loaded. Load a CSV to select students."),
+                          size_hint=(0.6, 0.3))
+            popup.open()
+            return
+
+        # Ensure selected_headers has default if empty
+        if not self.selected_headers:
+            # default choose first 3 or all
+            self.selected_headers = self.csv_headers[:3] if len(self.csv_headers) >= 3 else list(self.csv_headers)
+
+        # local widgets and state
+        popup_root = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+
+        # Column controls (reorder, filter, sort) - vertical list
+        cols_area = ScrollView(size_hint=(1, None), height=dp(160))
+        cols_inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        cols_inner.bind(minimum_height=cols_inner.setter("height"))
+        cols_area.add_widget(cols_inner)
+
+        # Helper to refresh the student list
+        list_area = ScrollView(size_hint=(1, 1))
+        list_grid = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(2))
+        list_grid.bind(minimum_height=list_grid.setter("height"))
+        list_area.add_widget(list_grid)
+
+        # Create per-column controls
+        col_controls = {}  # header -> dict of widgets (filter, up_btn, down_btn, sort_btn, label)
+        for h in list(self.selected_headers):
+            row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(4))
+            lbl = Label(text=h, size_hint=(0.28, 1), halign="left", valign="middle", font_size=sp(12))
+            lbl.bind(size=lbl.setter("text_size"))
+            up = Button(text="▲", size_hint=(None, 1), width=dp(34))
+            down = Button(text="▼", size_hint=(None, 1), width=dp(34))
+            filt = TextInput(text=self._column_filters.get(h, ""), multiline=False, size_hint=(0.4, 1), font_size=sp(12))
+            sort_b = Button(text="⋯", size_hint=(None, 1), width=dp(40))  # cycles None/asc/desc
+            row.add_widget(lbl)
+            row.add_widget(up)
+            row.add_widget(down)
+            row.add_widget(filt)
+            row.add_widget(sort_b)
+            cols_inner.add_widget(row)
+            col_controls[h] = {"label": lbl, "up": up, "down": down, "filter": filt, "sort": sort_b}
+
+        # Popup selection storage: keep list of current displayed row widgets so we can highlight
+        displayed_row_buttons = []
+
+        # Functions to operate on column controls
+        def reorder_column_up(header):
+            idx = self.selected_headers.index(header)
+            if idx > 0:
+                self.selected_headers[idx], self.selected_headers[idx - 1] = self.selected_headers[idx - 1], self.selected_headers[idx]
+                rebuild_column_controls()
+                refresh_student_list()
+
+        def reorder_column_down(header):
+            idx = self.selected_headers.index(header)
+            if idx < len(self.selected_headers) - 1:
+                self.selected_headers[idx], self.selected_headers[idx + 1] = self.selected_headers[idx + 1], self.selected_headers[idx]
+                rebuild_column_controls()
+                refresh_student_list()
+
+        def cycle_sort(header, btn):
+            # support single-column sort: clear others
+            cur = self._column_sorts.get(header)
+            if cur is None:
+                new = "asc"
+            elif cur == "asc":
+                new = "desc"
+            else:
+                new = None
+            # clear all
+            for k in list(self._column_sorts.keys()):
+                self._column_sorts[k] = None
+            if new:
+                self._column_sorts[header] = new
+            # update buttons
+            for h2, ctrls in col_controls.items():
+                txt = "⋯"
+                if self._column_sorts.get(h2) == "asc":
+                    txt = "↑"
+                elif self._column_sorts.get(h2) == "desc":
+                    txt = "↓"
+                ctrls["sort"].text = txt
+            refresh_student_list()
+
+        def rebuild_column_controls():
+            # rebuild cols_inner from selected_headers showing new order and rewire callbacks
+            cols_inner.clear_widgets()
+            # update col_controls mapping: reuse filter contents where possible
+            old_filters = dict(self._column_filters)
+            old_sorts = dict(self._column_sorts)
+            new_col_controls = {}
+            for h in self.selected_headers:
+                row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(4))
+                lbl = Label(text=h, size_hint=(0.28, 1), halign="left", valign="middle", font_size=sp(12))
+                lbl.bind(size=lbl.setter("text_size"))
+                up = Button(text="▲", size_hint=(None, 1), width=dp(34))
+                down = Button(text="▼", size_hint=(None, 1), width=dp(34))
+                filt = TextInput(text=old_filters.get(h, ""), multiline=False, size_hint=(0.4, 1), font_size=sp(12))
+                sort_b = Button(text="⋯", size_hint=(None, 1), width=dp(40))
+                # set sort button text according to old_sorts
+                st = old_sorts.get(h)
+                if st == "asc":
+                    sort_b.text = "↑"
+                elif st == "desc":
+                    sort_b.text = "↓"
+                row.add_widget(lbl)
+                row.add_widget(up)
+                row.add_widget(down)
+                row.add_widget(filt)
+                row.add_widget(sort_b)
+                cols_inner.add_widget(row)
+                new_col_controls[h] = {"label": lbl, "up": up, "down": down, "filter": filt, "sort": sort_b}
+            # update global mapping
+            col_controls.clear()
+            col_controls.update(new_col_controls)
+            # wire callbacks
+            wire_column_control_callbacks()
+
+        def wire_column_control_callbacks():
+            for h, ctrls in col_controls.items():
+                ctrls["up"].unbind(on_release=None)
+                ctrls["down"].unbind(on_release=None)
+                ctrls["sort"].unbind(on_release=None)
+                ctrls["filter"].unbind(on_text_validate=None)
+                ctrls["up"].bind(on_release=lambda inst, header=h: reorder_column_up(header))
+                ctrls["down"].bind(on_release=lambda inst, header=h: reorder_column_down(header))
+                ctrls["sort"].bind(on_release=lambda inst, header=h, btn=ctrls["sort"]: cycle_sort(header, btn))
+                # update filter on text changes
+                ctrls["filter"].bind(text=lambda inst, txt, header=h: _set_filter(header, txt))
+
+        def _set_filter(header, txt):
+            self._column_filters[header] = txt.strip()
+            refresh_student_list()
+
+        # initial wiring
+        wire_column_control_callbacks()
+
+        # Build students list based on filters/sort/order
+        def apply_filters_and_sort():
+            # Start with full rows
+            rows = list(self.csv_rows)
+            # Apply filters: every selected header with a non-empty filter must match (case-insensitive substring)
+            for h in list(self.selected_headers):
+                f = (self._column_filters.get(h) or "").strip()
+                if f:
+                    f_lower = f.lower()
+                    rows = [r for r in rows if f_lower in (str(r.get(h, "")).lower())]
+            # Apply single-column sort (first header found in selected that has sort)
+            sort_col = None
+            sort_dir = None
+            for h in self.selected_headers:
+                s = self._column_sorts.get(h)
+                if s in ("asc", "desc"):
+                    sort_col = h
+                    sort_dir = s
+                    break
+            if sort_col:
+                try:
+                    rows = sorted(rows, key=lambda r: (r.get(sort_col) or ""), reverse=(sort_dir == "desc"))
+                except Exception:
+                    pass
+            return rows
+
+        def refresh_student_list():
+            # rebuild list_grid children
+            list_grid.clear_widgets()
+            displayed_row_buttons.clear()
+            rows = apply_filters_and_sort()
+            for ridx, r in enumerate(rows):
+                # build display text using selected_headers in order
+                pieces = []
+                for h in self.selected_headers:
+                    pieces.append(str(r.get(h, "")))
+                display = " | ".join(pieces)
+                btn = Button(text=display, size_hint_y=None, height=dp(36), halign="left")
+                btn.bind(on_release=lambda inst, row=r, idx=ridx: _on_row_selected(row, inst))
+                list_grid.add_widget(btn)
+                displayed_row_buttons.append(btn)
+
+        def _on_row_selected(row, widget):
+            # highlight selection visually
+            self._selected_csv_row = row
+            # assemble payload using selected_headers in order joined by underscore
+            parts = []
+            for h in self.selected_headers:
+                parts.append(str(row.get(h, "")).strip())
+            payload = "_".join([p for p in parts if p])
+            self._selected_author_payload = payload
+            # update main label (Data Update)
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {payload}"[:200]), 0)
+            # visual highlight: set background_color of clicked widget, clear others
+            for b in displayed_row_buttons:
+                try:
+                    b.background_color = (1, 1, 1, 1)
+                except Exception:
+                    pass
+            try:
+                widget.background_color = (0.9, 0.9, 0.5, 1)
+            except Exception:
+                pass
+
+        # Footer buttons for popup
+        popup_btns = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
+        btn_select = Button(text="Confirm selection")
+        btn_force = Button(text="Force update")
+        btn_close = Button(text="Close")
+        popup_btns.add_widget(btn_select)
+        popup_btns.add_widget(btn_force)
+        popup_btns.add_widget(btn_close)
+
+        # Wire popup buttons
+        def do_confirm(*_):
+            if self._selected_author_payload:
+                self._log_internal(f"CSV selection confirmed: {self._selected_author_payload}")
+                # already applied to Data Update label in selection handler
+            popup.dismiss()
+
+        def do_force(*_):
+            if not self._selected_author_payload:
+                self._log_internal("No CSV row selected to force update")
+                # small notice
+                notice = Popup(title="No selection", content=Label(text="Select a student row first."), size_hint=(0.6, 0.3))
+                notice.open()
+                return
+            # call existing commit flow
+            self._maybe_commit_author(self._selected_author_payload, source="csv")
+            popup.dismiss()
+
+        btn_select.bind(on_release=lambda *_: do_confirm())
+        btn_force.bind(on_release=lambda *_: do_force())
+        btn_close.bind(on_release=lambda *_: popup.dismiss())
+
+        # assemble popup layout
+        popup_root.add_widget(Label(text="Columns (reorder / filter / sort):", size_hint=(1, None), height=dp(20)))
+        popup_root.add_widget(cols_area)
+        popup_root.add_widget(Label(text="Rows:", size_hint=(1, None), height=dp(18)))
+        popup_root.add_widget(list_area)
+        popup_root.add_widget(popup_btns)
+
+        popup = Popup(title="Select student from CSV", content=popup_root, size_hint=(0.95, 0.85))
+        # refresh initial student list and open
+        refresh_student_list()
+        popup.open()
+
+    def _force_update_from_selection(self):
+        """
+        Force pushing the currently selected CSV-derived payload to camera author field.
+        If no CSV selection exists show user a notice.
+        """
+        if not self._selected_author_payload:
+            self._log_internal("Force update requested but no CSV selection available")
+            notice = Popup(title="No selection", content=Label(text="No student selected. Use 'Select student' first."), size_hint=(0.6, 0.3))
+            notice.open()
+            return
+        self._log_internal(f"Forcing update with CSV payload: {self._selected_author_payload}")
+        self._maybe_commit_author(self._selected_author_payload, source="manual-csv")
 
     # ---------- window/rotation handling ----------
     def _on_window_resize(self, instance, width, height):
@@ -1144,7 +1437,7 @@ class VolumeToolkitApp(App):
         if self._author_update_in_flight:
             return
         self._author_update_in_flight = True
-        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author updating… ({source})"), 0)
+        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Data Update: updating… ({source})"), 0)
         threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
 
     def _commit_author_worker(self, value: str, source: str):
@@ -1177,19 +1470,19 @@ class VolumeToolkitApp(App):
             if ok:
                 self._last_committed_author = value
                 self._log_internal(f"Author updated+verified ({source}): '{value}'")
-                self.qr_status.text = "Author updated ✓"
+                self.qr_status.text = "Data Update: updated ✓"
             else:
                 self._log_internal(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
-                self.qr_status.text = "Author verify failed ✗"
+                self.qr_status.text = "Data Update: verify failed ✗"
         Clock.schedule_once(_finish, 0)
 
     # ---------- liveview / decoder / QR ----------
     def _set_qr_enabled(self, enabled: bool):
         self.qr_enabled = bool(enabled)
         if not self.qr_enabled and not self._qr_temp_active:
-            self._set_qr_ui(None, None, note="QR: off")
+            self._set_qr_ui(None, None, note="Data Update: none")
         elif self.qr_enabled:
-            self._set_qr_ui(None, None, note="QR: on")
+            self._set_qr_ui(None, None, note="Data Update: on")
 
     def _reschedule_display_loop(self, fps):
         if self._display_event is not None:
@@ -1210,7 +1503,6 @@ class VolumeToolkitApp(App):
     def _update_metrics(self, frame_ts):
         now = time.time()
         if now - self._stat_t0 >= 1.0:
-            dt_s = now - self._stat_t0
             if getattr(self, "show_log", False):
                 self._refresh_log_view()
             self._fetch_count = 0
@@ -1263,7 +1555,7 @@ class VolumeToolkitApp(App):
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
-        self._set_qr_ui(None, None, note="QR: off" if not self.qr_enabled else "QR: on")
+        self._set_qr_ui(None, None, note="Data Update: none")
         self._fetch_count = 0
         self._decode_count = 0
         self._display_count = 0
@@ -1428,9 +1720,9 @@ class VolumeToolkitApp(App):
 
         if text:
             self._latest_qr_text = text
-            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"QR: {text}"), 0)
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {text}"[:200]), 0)
         elif self._latest_qr_text:
-            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"QR: {self._latest_qr_text}"), 0)
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {self._latest_qr_text}"[:200]), 0)
 
         if points:
             if getattr(self, "_qr_highlight_event", None):
@@ -1449,7 +1741,7 @@ class VolumeToolkitApp(App):
                     Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 0)
                 threading.Thread(target=bg_clear, daemon=True).start()
 
-        note = f"QR: {text[:80]}" if text else ("QR: detected" if points else ("QR: on" if self.qr_enabled else "QR: off"))
+        note = f"Data Update: {text[:80]}" if text else ("QR: detected" if points else ("Data Update: on" if self.qr_enabled else "Data Update: none"))
         Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", note), 0)
 
     def _clear_qr_overlay(self):
@@ -1465,10 +1757,10 @@ class VolumeToolkitApp(App):
                 pass
             self._qr_highlight_event = None
 
-    def _set_qr_ui(self, text, points, note="QR: none"):
+    def _set_qr_ui(self, text, points, note="Data Update: none"):
         if text:
             self._latest_qr_text = text
-            self.qr_last_label.text = f"QR: {text}"
+            self.qr_last_label.text = f"Data Update: {text}"
         if points:
             self._latest_qr_points = points
             self.preview.set_qr(points)
@@ -1498,7 +1790,7 @@ class VolumeToolkitApp(App):
             self._qr_pulse_event = None
 
         self._qr_temp_active = True
-        self._set_qr_ui(None, None, note="QR: scanning…")
+        self._set_qr_ui(None, None, note="Data Update: scanning…")
         try:
             self._qr_pulse_event = Clock.schedule_once(lambda *_: self._end_pulse_qr(), 1.0)
         except Exception:
@@ -1516,9 +1808,9 @@ class VolumeToolkitApp(App):
             self._qr_pulse_event = None
         self._qr_temp_active = False
         if not getattr(self, "qr_enabled", False):
-            self._set_qr_ui(None, None, note="QR: off")
+            self._set_qr_ui(None, None, note="Data Update: none")
         else:
-            self._set_qr_ui(None, None, note="QR: on")
+            self._set_qr_ui(None, None, note="Data Update: on")
 
     # ---------- thumbnails, overlay, and full-res swap ----------
     def _download_thumb_for_path(self, ccapi_path: str):
@@ -1633,6 +1925,12 @@ class VolumeToolkitApp(App):
             self.preview.clear_overlay_texture()
             self._overlay_active = False
             self._overlay_thumb_index = None
+            # cancel any pending full-res fetch for this thumb (so it won't try to apply later)
+            try:
+                if idx in self._pending_full_fetches:
+                    del self._pending_full_fetches[idx]
+            except Exception:
+                pass
             # restore live view texture if present
             if self._frame_texture is not None:
                 try:
@@ -1690,18 +1988,34 @@ class VolumeToolkitApp(App):
     def _fetch_full_and_replace(self, ccapi_path: str, thumb_index: int):
         """
         Download full-res JPG in the background, decode to RGB bytes, then schedule
-        creation of the Kivy Texture on the main thread. Do NOT create Textures on bg threads.
+        creation of the Kivy Texture on the main thread. If the user selects a different
+        thumbnail before this finishes, the result is discarded.
         """
+        # create a request id so we can detect staleness
+        request_id = time.time()
+        self._pending_full_fetches[thumb_index] = request_id
+
         full_url = f"https://{self.camera_ip}{ccapi_path}"
-        self._log_internal(f"Fetching full-res: {full_url}")
+        self._log_internal(f"Fetching full-res: {full_url} (req={request_id})")
         try:
             resp = self._session.get(full_url, timeout=20.0, stream=True)
             if resp.status_code != 200 or not resp.content:
-                self._log_internal(f"Full image download failed: {resp.status_code}")
+                self._log_internal(f"Full image download failed: {resp.status_code} (req={request_id})")
+                # clean up tracking
+                try:
+                    if self._pending_full_fetches.get(thumb_index) == request_id:
+                        del self._pending_full_fetches[thumb_index]
+                except Exception:
+                    pass
                 return
             data = resp.content
         except Exception as e:
-            self._log_internal(f"Full image download err: {e}")
+            self._log_internal(f"Full image download err: {e} (req={request_id})")
+            try:
+                if self._pending_full_fetches.get(thumb_index) == request_id:
+                    del self._pending_full_fetches[thumb_index]
+            except Exception:
+                pass
             return
 
         # Decode + rotate in background
@@ -1709,7 +2023,12 @@ class VolumeToolkitApp(App):
             arr = np.frombuffer(data, dtype=np.uint8)
             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if bgr is None:
-                self._log_internal("cv2.imdecode returned None for full image")
+                self._log_internal(f"cv2.imdecode returned None for full image (req={request_id})")
+                try:
+                    if self._pending_full_fetches.get(thumb_index) == request_id:
+                        del self._pending_full_fetches[thumb_index]
+                except Exception:
+                    pass
                 return
 
             rot = getattr(self.preview, "preview_rotation", 0) % 360 if hasattr(self, "preview") else 0
@@ -1724,20 +2043,53 @@ class VolumeToolkitApp(App):
             h, w = rgb.shape[:2]
             rgb_bytes = rgb.tobytes()
         except Exception as e:
-            self._log_internal(f"Full image decode err (bg): {e}")
+            self._log_internal(f"Full image decode err (bg): {e} (req={request_id})")
+            try:
+                if self._pending_full_fetches.get(thumb_index) == request_id:
+                    del self._pending_full_fetches[thumb_index]
+            except Exception:
+                pass
             return
 
-        # Create the Kivy texture on the main thread and apply it
-        def _apply_full_on_main(_dt):
+        # Create the Kivy texture on the main thread and apply it, but only if still current
+        def _apply_full_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, thumb_index=thumb_index, request_id=request_id):
+            # If another selection happened, the pending id won't match
+            cur_req = self._pending_full_fetches.get(thumb_index)
+            if cur_req != request_id:
+                self._log_internal(f"Full-res fetch for thumb {thumb_index} aborted (stale req={request_id}, cur={cur_req})")
+                try:
+                    if thumb_index in self._pending_full_fetches and self._pending_full_fetches[thumb_index] == request_id:
+                        del self._pending_full_fetches[thumb_index]
+                except Exception:
+                    pass
+                return
+
+            # Also ensure overlay is still active and targeting this thumb
+            if (not getattr(self, "_overlay_active", False)) or (self._overlay_thumb_index != thumb_index):
+                self._log_internal(f"Full-res fetch for thumb {thumb_index} aborted: overlay not active or changed (req={request_id})")
+                try:
+                    if thumb_index in self._pending_full_fetches:
+                        del self._pending_full_fetches[thumb_index]
+                except Exception:
+                    pass
+                return
+
             tex = self._create_texture_from_rgb(rgb_bytes, w, h, flip_vertical=True)
             if not tex:
-                self._log_internal("Failed to create full-res texture on main thread")
+                self._log_internal(f"Failed to create full-res texture on main thread (req={request_id})")
+                try:
+                    if thumb_index in self._pending_full_fetches:
+                        del self._pending_full_fetches[thumb_index]
+                except Exception:
+                    pass
                 return
+
             try:
                 self.preview.set_overlay_texture(tex)
             except Exception:
                 pass
-            # Update strip thumbnail feedback
+
+            # Update thumbnail strip visual feedback if still relevant
             try:
                 if thumb_index < len(self._thumb_textures):
                     self._thumb_textures[thumb_index] = tex
@@ -1745,7 +2097,15 @@ class VolumeToolkitApp(App):
                         self._thumb_images[thumb_index].texture = tex
             except Exception:
                 pass
-            self._log_internal("Full-res applied to overlay (overlay remains until user taps thumb again to close)")
+
+            self._log_internal(f"Full-res applied to overlay for thumb {thumb_index} (req={request_id})")
+
+            # cleanup pending map
+            try:
+                if thumb_index in self._pending_full_fetches and self._pending_full_fetches[thumb_index] == request_id:
+                    del self._pending_full_fetches[thumb_index]
+            except Exception:
+                pass
 
         Clock.schedule_once(_apply_full_on_main, 0)
 
@@ -1831,9 +2191,6 @@ class VolumeToolkitApp(App):
         self._log_internal("=== ccapi JSON END ===")
 
     def _open_csv_filechooser(self):
-        if platform != 'android':
-            self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
-            return
         return self._open_csv_saf()
 
     def on_stop(self):
