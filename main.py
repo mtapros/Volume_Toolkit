@@ -1,12 +1,12 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Updated to add CSV "Select student" UI and Force Update button
-# - Adds footer with "Select student" and "Force update" buttons
-# - "Select student" opens a popup that allows filtering, sorting (single-column), re-ordering columns,
-#   and selecting a row from the loaded CSV. The selection populates the main "Data Update: ..." label.
-# - "Force update" pushes the currently-selected CSV-derived author payload to the camera (uses existing _maybe_commit_author)
-# - QR continues to populate the same "Data Update: ..." label when QR is scanned.
-# - Stale full-res fetch prevention retained.
-# Note: keep this file in sync with your repo; this is a full drop-in replacement.
+# Updated:
+# - QR results now always override any CSV selection displayed in "Data Update:"
+# - CSV controls moved under a bottom "CSV" button (Load CSV, Select Students, Select Headers)
+# - Removed "Fetch latest image" from the main menu
+# - Menu reorganized into sub-popups for Overlays, Capture, and Settings
+# - Added an Autofetch toggle button on the main control row (behaves like Start/Stop)
+# - CSV selection UI retained and integrated; QR will clear CSV selection when received
+# - Defensive checks and request-id handling for full-res fetches retained
 
 import os
 import json
@@ -520,6 +520,9 @@ class VolumeToolkitApp(App):
         self._selected_csv_row = None  # dict row selected by user
         self._selected_author_payload = None  # last assembled payload from CSV selection
 
+        # Autofetch state (toggle on main UI)
+        self.autofetch_running = False
+
     # ---------- texture helpers (main-thread creation) ----------
     def _create_texture_from_rgb(self, rgb_bytes, w, h, flip_vertical=True):
         try:
@@ -609,14 +612,17 @@ class VolumeToolkitApp(App):
         self.header.add_widget(self.menu_btn)
         root.add_widget(self.header)
 
-        # Connect / Start row
+        # Control row: Connect / Start live / Autofetch toggle
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(None, 1), width=dp(120))
         self._style_connect_button(initial=True)
-        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16), size_hint=(None, 1), width=dp(140))
+        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16), size_hint=(None, 1), width=dp(120))
         self._style_start_button(stopped=True)
+        self.autofetch_btn = Button(text="Autofetch Off", font_size=sp(14), size_hint=(None, 1), width=dp(140))
+        self._style_autofetch_button(running=False)
         row2.add_widget(self.connect_btn)
         row2.add_widget(self.start_btn)
+        row2.add_widget(self.autofetch_btn)
         root.add_widget(row2)
 
         # Data Update / status labels (renamed from QR to Data Update)
@@ -656,12 +662,12 @@ class VolumeToolkitApp(App):
 
         root.add_widget(main_area)
 
-        # Footer: two buttons at bottom opposite the title (portrait bottom)
+        # Footer: CSV button and Force update button
         footer = BoxLayout(orientation="horizontal", size_hint=(1, None), height=dp(48), spacing=dp(6))
-        self.select_student_btn = Button(text="Select student", size_hint=(None, 1), width=dp(160))
-        self.force_update_btn = Button(text="Force update", size_hint=(None, 1), width=dp(160))
         footer.add_widget(Label())  # spacer to push buttons to the right side
-        footer.add_widget(self.select_student-btn if False else self.select_student_btn)  # alias to satisfy lint
+        self.csv_btn = Button(text="CSV", size_hint=(None, 1), width=dp(140))
+        self.force_update_btn = Button(text="Force update", size_hint=(None, 1), width=dp(140))
+        footer.add_widget(self.csv_btn)
         footer.add_widget(self.force_update_btn)
         root.add_widget(footer)
 
@@ -694,14 +700,14 @@ class VolumeToolkitApp(App):
         self.log_holder.add_widget(log_sv)
         root.add_widget(self.log_holder)
 
-        # Menu
+        # Menu and bindings
         self.dropdown = self._build_dropdown()
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
-        # Button bindings
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self._on_start_pressed())
-        self.select_student_btn.bind(on_release=lambda *_: self._open_student_selector_popup())
+        self.autofetch_btn.bind(on_press=lambda *_: self._on_autofetch_pressed())
+        self.csv_btn.bind(on_release=lambda *_: self._open_csv_menu())
         self.force_update_btn.bind(on_release=lambda *_: self._force_update_from_selection())
 
         # Start decoder thread now that preview exists (avoid race)
@@ -718,6 +724,31 @@ class VolumeToolkitApp(App):
         self._set_controls_idle()
         self._log_internal("UI ready")
         return root
+
+    # ---------- UI helpers ----------
+    def _style_autofetch_button(self, running=False):
+        try:
+            self.autofetch_btn.background_normal = ""
+            self.autofetch_btn.background_down = ""
+            if running:
+                self.autofetch_btn.background_color = (0.1, 0.6, 0.1, 1.0)
+                self.autofetch_btn.text = "Autofetch On"
+            else:
+                self.autofetch_btn.background_color = (0.4, 0.4, 0.4, 1.0)
+                self.autofetch_btn.text = "Autofetch Off"
+        except Exception:
+            pass
+
+    def _on_autofetch_pressed(self):
+        if not self.autofetch_running:
+            # start poller
+            self.start_polling_new_images()
+            self.autofetch_running = True
+            self._style_autofetch_button(running=True)
+        else:
+            self.stop_polling_new_images()
+            self.autofetch_running = False
+            self._style_autofetch_button(running=False)
 
     # ---------- helper to create per-thumb pos updaters ----------
     def _make_thumb_pos_updater(self, idx):
@@ -762,6 +793,25 @@ class VolumeToolkitApp(App):
         self._thumb_highlight_lines = {}
         self._highlighted_thumb_index = None
 
+    # ---------- CSV menu (footer CSV button) ----------
+    def _open_csv_menu(self):
+        # Small popup with CSV actions
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+        b_load = Button(text="Load CSV (Android SAF)", size_hint=(1, None), height=dp(44))
+        b_select = Button(text="Select Students", size_hint=(1, None), height=dp(44))
+        b_headers = Button(text="Select Headers", size_hint=(1, None), height=dp(44))
+        b_close = Button(text="Close", size_hint=(1, None), height=dp(44))
+        content.add_widget(b_load)
+        content.add_widget(b_select)
+        content.add_widget(b_headers)
+        content.add_widget(b_close)
+        popup = Popup(title="CSV", content=content, size_hint=(0.6, 0.5))
+        b_load.bind(on_release=lambda *_: (popup.dismiss(), self._open_csv_filechooser()))
+        b_select.bind(on_release=lambda *_: (popup.dismiss(), self._open_student_selector_popup()))
+        b_headers.bind(on_release=lambda *_: (popup.dismiss(), self._open_headers_popup()))
+        b_close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
     # ---------- CSV selector popup implementation ----------
     def _open_student_selector_popup(self):
         """
@@ -801,7 +851,7 @@ class VolumeToolkitApp(App):
         list_area.add_widget(list_grid)
 
         # Create per-column controls
-        col_controls = {}  # header -> dict of widgets (filter, up_btn, down_btn, sort_btn, label)
+        col_controls = {}
         for h in list(self.selected_headers):
             row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(4))
             lbl = Label(text=h, size_hint=(0.28, 1), halign="left", valign="middle", font_size=sp(12))
@@ -809,7 +859,7 @@ class VolumeToolkitApp(App):
             up = Button(text="▲", size_hint=(None, 1), width=dp(34))
             down = Button(text="▼", size_hint=(None, 1), width=dp(34))
             filt = TextInput(text=self._column_filters.get(h, ""), multiline=False, size_hint=(0.4, 1), font_size=sp(12))
-            sort_b = Button(text="⋯", size_hint=(None, 1), width=dp(40))  # cycles None/asc/desc
+            sort_b = Button(text="⋯", size_hint=(None, 1), width=dp(40))
             row.add_widget(lbl)
             row.add_widget(up)
             row.add_widget(down)
@@ -818,10 +868,8 @@ class VolumeToolkitApp(App):
             cols_inner.add_widget(row)
             col_controls[h] = {"label": lbl, "up": up, "down": down, "filter": filt, "sort": sort_b}
 
-        # Popup selection storage: keep list of current displayed row widgets so we can highlight
         displayed_row_buttons = []
 
-        # Functions to operate on column controls
         def reorder_column_up(header):
             idx = self.selected_headers.index(header)
             if idx > 0:
@@ -837,7 +885,6 @@ class VolumeToolkitApp(App):
                 refresh_student_list()
 
         def cycle_sort(header, btn):
-            # support single-column sort: clear others
             cur = self._column_sorts.get(header)
             if cur is None:
                 new = "asc"
@@ -861,9 +908,7 @@ class VolumeToolkitApp(App):
             refresh_student_list()
 
         def rebuild_column_controls():
-            # rebuild cols_inner from selected_headers showing new order and rewire callbacks
             cols_inner.clear_widgets()
-            # update col_controls mapping: reuse filter contents where possible
             old_filters = dict(self._column_filters)
             old_sorts = dict(self._column_sorts)
             new_col_controls = {}
@@ -875,7 +920,6 @@ class VolumeToolkitApp(App):
                 down = Button(text="▼", size_hint=(None, 1), width=dp(34))
                 filt = TextInput(text=old_filters.get(h, ""), multiline=False, size_hint=(0.4, 1), font_size=sp(12))
                 sort_b = Button(text="⋯", size_hint=(None, 1), width=dp(40))
-                # set sort button text according to old_sorts
                 st = old_sorts.get(h)
                 if st == "asc":
                     sort_b.text = "↑"
@@ -888,10 +932,8 @@ class VolumeToolkitApp(App):
                 row.add_widget(sort_b)
                 cols_inner.add_widget(row)
                 new_col_controls[h] = {"label": lbl, "up": up, "down": down, "filter": filt, "sort": sort_b}
-            # update global mapping
             col_controls.clear()
             col_controls.update(new_col_controls)
-            # wire callbacks
             wire_column_control_callbacks()
 
         def wire_column_control_callbacks():
@@ -899,31 +941,25 @@ class VolumeToolkitApp(App):
                 ctrls["up"].unbind(on_release=None)
                 ctrls["down"].unbind(on_release=None)
                 ctrls["sort"].unbind(on_release=None)
-                ctrls["filter"].unbind(on_text_validate=None)
+                ctrls["filter"].unbind(text=None)
                 ctrls["up"].bind(on_release=lambda inst, header=h: reorder_column_up(header))
                 ctrls["down"].bind(on_release=lambda inst, header=h: reorder_column_down(header))
                 ctrls["sort"].bind(on_release=lambda inst, header=h, btn=ctrls["sort"]: cycle_sort(header, btn))
-                # update filter on text changes
                 ctrls["filter"].bind(text=lambda inst, txt, header=h: _set_filter(header, txt))
 
         def _set_filter(header, txt):
             self._column_filters[header] = txt.strip()
             refresh_student_list()
 
-        # initial wiring
         wire_column_control_callbacks()
 
-        # Build students list based on filters/sort/order
         def apply_filters_and_sort():
-            # Start with full rows
             rows = list(self.csv_rows)
-            # Apply filters: every selected header with a non-empty filter must match (case-insensitive substring)
             for h in list(self.selected_headers):
                 f = (self._column_filters.get(h) or "").strip()
                 if f:
                     f_lower = f.lower()
                     rows = [r for r in rows if f_lower in (str(r.get(h, "")).lower())]
-            # Apply single-column sort (first header found in selected that has sort)
             sort_col = None
             sort_dir = None
             for h in self.selected_headers:
@@ -940,12 +976,10 @@ class VolumeToolkitApp(App):
             return rows
 
         def refresh_student_list():
-            # rebuild list_grid children
             list_grid.clear_widgets()
             displayed_row_buttons.clear()
             rows = apply_filters_and_sort()
             for ridx, r in enumerate(rows):
-                # build display text using selected_headers in order
                 pieces = []
                 for h in self.selected_headers:
                     pieces.append(str(r.get(h, "")))
@@ -956,17 +990,18 @@ class VolumeToolkitApp(App):
                 displayed_row_buttons.append(btn)
 
         def _on_row_selected(row, widget):
-            # highlight selection visually
+            # selecting a CSV row should set CSV selection and display it in Data Update label
             self._selected_csv_row = row
-            # assemble payload using selected_headers in order joined by underscore
             parts = []
             for h in self.selected_headers:
                 parts.append(str(row.get(h, "")).strip())
             payload = "_".join([p for p in parts if p])
             self._selected_author_payload = payload
-            # update main label (Data Update)
+            # clear any QR selection override state (QR should still override later, but CSV selection is active now)
+            self._latest_qr_text = ""
+            # show CSV payload
             Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {payload}"[:200]), 0)
-            # visual highlight: set background_color of clicked widget, clear others
+            # highlight selected button
             for b in displayed_row_buttons:
                 try:
                     b.background_color = (1, 1, 1, 1)
@@ -986,21 +1021,17 @@ class VolumeToolkitApp(App):
         popup_btns.add_widget(btn_force)
         popup_btns.add_widget(btn_close)
 
-        # Wire popup buttons
         def do_confirm(*_):
             if self._selected_author_payload:
                 self._log_internal(f"CSV selection confirmed: {self._selected_author_payload}")
-                # already applied to Data Update label in selection handler
             popup.dismiss()
 
         def do_force(*_):
             if not self._selected_author_payload:
                 self._log_internal("No CSV row selected to force update")
-                # small notice
                 notice = Popup(title="No selection", content=Label(text="Select a student row first."), size_hint=(0.6, 0.3))
                 notice.open()
                 return
-            # call existing commit flow
             self._maybe_commit_author(self._selected_author_payload, source="csv")
             popup.dismiss()
 
@@ -1008,7 +1039,6 @@ class VolumeToolkitApp(App):
         btn_force.bind(on_release=lambda *_: do_force())
         btn_close.bind(on_release=lambda *_: popup.dismiss())
 
-        # assemble popup layout
         popup_root.add_widget(Label(text="Columns (reorder / filter / sort):", size_hint=(1, None), height=dp(20)))
         popup_root.add_widget(cols_area)
         popup_root.add_widget(Label(text="Rows:", size_hint=(1, None), height=dp(18)))
@@ -1016,7 +1046,6 @@ class VolumeToolkitApp(App):
         popup_root.add_widget(popup_btns)
 
         popup = Popup(title="Select student from CSV", content=popup_root, size_hint=(0.95, 0.85))
-        # refresh initial student list and open
         refresh_student_list()
         popup.open()
 
@@ -1027,7 +1056,7 @@ class VolumeToolkitApp(App):
         """
         if not self._selected_author_payload:
             self._log_internal("Force update requested but no CSV selection available")
-            notice = Popup(title="No selection", content=Label(text="No student selected. Use 'Select student' first."), size_hint=(0.6, 0.3))
+            notice = Popup(title="No selection", content=Label(text="No student selected. Use 'CSV' first."), size_hint=(0.6, 0.3))
             notice.open()
             return
         self._log_internal(f"Forcing update with CSV payload: {self._selected_author_payload}")
@@ -1051,11 +1080,11 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
 
-    # ---------- styling / menu / logging (unchanged) ----------
+    # ---------- styling / menu / logging ----------
     def _style_connect_button(self, initial=False):
         self.connect_btn.background_normal = ""
         self.connect_btn.background_down = ""
-        self.connect_btn.background_color = (0.06, 0.45, 0.75, 1.0)  # blue
+        self.connect_btn.background_color = (0.06, 0.45, 0.75, 1.0)
         if initial or not self.connected:
             self.connect_btn.color = (1, 1, 1, 1)
         else:
@@ -1101,14 +1130,7 @@ class VolumeToolkitApp(App):
             self.log_holder.opacity = 0
             self.log_holder.disabled = True
 
-    # ---------- menu building ----------
-    def _style_menu_button(self, b):
-        b.background_normal = ""
-        b.background_down = ""
-        b.background_color = (0.10, 0.10, 0.10, 0.80)
-        b.color = (1, 1, 1, 1)
-        return b
-
+    # ---------- reorganized menu: Build dropdown (top-level) and sub-popups ----------
     def _build_dropdown(self):
         dd = DropDown(auto_dismiss=True)
         dd.auto_width = False
@@ -1123,65 +1145,102 @@ class VolumeToolkitApp(App):
         def add_header(text):
             dd.add_widget(Label(text=text, size_hint_y=None, height=dp(26), font_size=sp(15), color=(1, 1, 1, 1)))
 
-        def add_button(text, on_press):
+        def add_button_to_dd(text, fn):
             b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
             self._style_menu_button(b)
-            b.bind(on_release=lambda *_: on_press())
+            b.bind(on_release=lambda *_: (fn(), dd.dismiss()))
             dd.add_widget(b)
 
-        def add_toggle(text, initial, on_change):
-            row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(6), 0, dp(6), 0])
-            row.add_widget(Label(text=text, font_size=sp(13), color=(1, 1, 1, 1)))
-            cb = CheckBox(active=initial, size_hint=(None, 1), width=dp(44))
-            cb.bind(active=lambda inst, val: on_change(val))
-            row.add_widget(cb)
-            dd.add_widget(row)
-
+        # Framing
         add_header("Framing")
-        add_button("Reset framing", lambda: self._fit_preview_to_holder())
+        add_button_to_dd("Reset framing", lambda: self._fit_preview_to_holder())
 
-        add_header("Overlays")
-        add_toggle("Border (blue)", True, lambda v: setattr(self.preview, "show_border", v))
-        add_toggle("Grid (orange)", True, lambda v: setattr(self.preview, "show_grid", v))
-        add_toggle("Crop 5:7 (red)", True, lambda v: setattr(self.preview, "show_57", v))
-        add_toggle("Crop 8:10 (yellow)", True, lambda v: setattr(self.preview, "show_810", v))
-        add_toggle("Oval (purple)", True, lambda v: setattr(self.preview, "show_oval", v))
-        add_toggle("QR overlay", True, lambda v: setattr(self.preview, "show_qr", v))
+        # Submenus implemented as popups for clarity and placement control
+        add_header("Groups")
+        add_button_to_dd("Overlays...", lambda: self._open_overlays_popup())
+        add_button_to_dd("Capture...", lambda: self._open_capture_popup())
+        add_button_to_dd("Settings...", lambda: self._open_settings_popup())
+
+        add_header("CSV")
+        # CSV actions moved to CSV footer button; keep a shortcut here to open the CSV menu
+        add_button_to_dd("CSV tools...", lambda: self._open_csv_menu())
 
         add_header("QR & Author")
-        add_toggle("QR detect (OpenCV) (permanent)", False, lambda v: self._set_qr_enabled(bool(v)))
-        add_button("Load CSV…", lambda: self._open_csv_filechooser())
-        add_button("Select headers…", lambda: self._open_headers_popup())
-        add_button("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
+        add_button_to_dd("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
 
-        add_header("Capture")
-        row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4), padding=[dp(4), 0, dp(4), 0])
-        row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70), font_size=sp(13), color=(1, 1, 1, 1)))
+        add_header("Debug")
+        add_button_to_dd("Dump /ccapi", lambda: self.dump_ccapi())
+
+        return dd
+
+    # Overlays popup
+    def _open_overlays_popup(self):
+        content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
+        content.add_widget(Label(text="Overlays", size_hint=(1, None), height=dp(28)))
+        def mk_toggle(text, prop, initial):
+            row = BoxLayout(size_hint=(1, None), height=dp(34))
+            lbl = Label(text=text, size_hint=(0.7, 1))
+            cb = CheckBox(active=initial, size_hint=(0.3, 1))
+            cb.bind(active=lambda inst, val: setattr(self.preview, prop, val))
+            row.add_widget(lbl)
+            row.add_widget(cb)
+            content.add_widget(row)
+        mk_toggle("Border (blue)", "show_border", self.preview.show_border)
+        mk_toggle("Grid (orange)", "show_grid", self.preview.show_grid)
+        mk_toggle("Crop 5:7 (red)", "show_57", self.preview.show_57)
+        mk_toggle("Crop 8:10 (yellow)", "show_810", self.preview.show_810)
+        mk_toggle("Oval (purple)", "show_oval", self.preview.show_oval)
+        mk_toggle("QR overlay", "show_qr", self.preview.show_qr)
+        btn_close = Button(text="Close", size_hint=(1, None), height=dp(40))
+        content.add_widget(btn_close)
+        popup = Popup(title="Overlays", content=content, size_hint=(0.6, 0.6))
+        btn_close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    # Capture popup
+    def _open_capture_popup(self):
+        content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
+        content.add_widget(Label(text="Capture", size_hint=(1, None), height=dp(28)))
+        row = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(4))
+        row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70)))
         def mk_btn(label, ctype):
-            b = Button(text=label, size_hint=(1, 1), font_size=sp(12))
-            self._style_menu_button(b)
+            b = Button(text=label)
             b.bind(on_release=lambda *_: (setattr(self, "capture_type", ctype), self._log_internal(f"Capture type set to {ctype}")))
             return b
         row.add_widget(mk_btn("JPG", CaptureType.JPG))
         row.add_widget(mk_btn("RAW", CaptureType.RAW))
         row.add_widget(mk_btn("Both", CaptureType.BOTH))
-        dd.add_widget(row)
+        content.add_widget(row)
+        btn_close = Button(text="Close", size_hint=(1, None), height=dp(40))
+        content.add_widget(btn_close)
+        popup = Popup(title="Capture", content=content, size_hint=(0.6, 0.5))
+        btn_close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
 
-        add_button("Fetch latest image", lambda: threading.Thread(target=self._background_download_latest, daemon=True).start())
-        add_button("Start auto-fetch", lambda: self.start_polling_new_images())
-        add_button("Stop auto-fetch", lambda: self.stop_polling_new_images())
+    # Settings popup
+    def _open_settings_popup(self):
+        content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
+        content.add_widget(Label(text="Settings", size_hint=(1, None), height=dp(28)))
+        btn_ip = Button(text="IP settings…", size_hint=(1, None), height=dp(44))
+        btn_fps = Button(text="Display FPS…", size_hint=(1, None), height=dp(44))
+        cb_row = BoxLayout(size_hint=(1, None), height=dp(36))
+        lbl = Label(text="Show log", size_hint=(0.7, 1))
+        cb = CheckBox(active=self.show_log, size_hint=(0.3, 1))
+        cb.bind(active=lambda inst, val: self._set_log_visible(val))
+        cb_row.add_widget(lbl)
+        cb_row.add_widget(cb)
+        content.add_widget(btn_ip)
+        content.add_widget(btn_fps)
+        content.add_widget(cb_row)
+        btn_close = Button(text="Close", size_hint=(1, None), height=dp(40))
+        content.add_widget(btn_close)
+        popup = Popup(title="Settings", content=content, size_hint=(0.6, 0.5))
+        btn_ip.bind(on_release=lambda *_: (popup.dismiss(), self._open_ip_popup()))
+        btn_fps.bind(on_release=lambda *_: (popup.dismiss(), self._open_fps_popup()))
+        btn_close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
 
-        add_header("Settings")
-        add_button("IP settings…", lambda: self._open_ip_popup())
-        add_button("Display FPS…", lambda: self._open_fps_popup())
-        add_toggle("Show log", False, lambda v: self._set_log_visible(v))
-
-        add_header("Debug")
-        add_button("Dump /ccapi", lambda: self.dump_ccapi())
-
-        return dd
-
-    # ---------- FPS / IP popups ----------
+    # ---------- FPS / IP popups (unchanged) ----------
     def _open_fps_popup(self):
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         sv = Slider(min=5, max=30, value=12, step=1)
@@ -1229,7 +1288,7 @@ class VolumeToolkitApp(App):
         btn_cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # ---------- Android CSV (SAF) helpers ----------
+    # ---------- Android CSV (SAF) helpers (unchanged) ----------
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
             return
@@ -1711,11 +1770,18 @@ class VolumeToolkitApp(App):
     def _publish_qr(self, text, points):
         now = time.time()
 
+        # When a QR is read, it should override any CSV selection currently displayed.
+        # Clear CSV selection state so the QR becomes the active Data Update source.
+        if text:
+            self._selected_csv_row = None
+            self._selected_author_payload = None
+
         if text:
             if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
                 self._qr_seen.add(text)
                 self._qr_last_add_time = now
                 self._log_internal(f"QR: {text}")
+            # auto-commit from QR if desired
             self._maybe_commit_author(text, source="qr")
 
         if text:
@@ -1759,6 +1825,9 @@ class VolumeToolkitApp(App):
 
     def _set_qr_ui(self, text, points, note="Data Update: none"):
         if text:
+            # QR becomes the visible Data Update and clears any CSV selection
+            self._selected_csv_row = None
+            self._selected_author_payload = None
             self._latest_qr_text = text
             self.qr_last_label.text = f"Data Update: {text}"
         if points:
@@ -1884,6 +1953,7 @@ class VolumeToolkitApp(App):
         Clock.schedule_once(_make_texture_and_update, 0)
 
     def _background_download_latest(self):
+        # removed direct menu action; kept for internal use
         self.download_and_thumbnail_latest()
 
     def download_and_thumbnail_latest(self):
@@ -2140,6 +2210,9 @@ class VolumeToolkitApp(App):
         self._poll_thread_stop.clear()
         self._poll_thread = threading.Thread(target=self._poll_worker, daemon=True)
         self._poll_thread.start()
+        # reflect UI state
+        self.autofetch_running = True
+        self._style_autofetch_button(running=True)
 
     def stop_polling_new_images(self):
         if self._poll_thread is None:
@@ -2147,6 +2220,8 @@ class VolumeToolkitApp(App):
         self._log_internal("Stopping image poller (background thread)")
         self._poll_thread_stop.set()
         self._poll_thread = None
+        self.autofetch_running = False
+        self._style_autofetch_button(running=False)
 
     def _poll_worker(self):
         while not self._poll_thread_stop.is_set():
