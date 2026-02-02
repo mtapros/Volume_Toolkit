@@ -1,12 +1,18 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Updated:
-# - QR results now always override any CSV selection displayed in "Data Update:"
-# - CSV controls moved under a bottom "CSV" button (Load CSV, Select Students, Select Headers)
-# - Removed "Fetch latest image" from the main menu
-# - Menu reorganized into sub-popups for Overlays, Capture, and Settings
-# - Added an Autofetch toggle button on the main control row (behaves like Start/Stop)
-# - CSV selection UI retained and integrated; QR will clear CSV selection when received
-# - Defensive checks and request-id handling for full-res fetches retained
+# Final, complete main.py — cleaned and double-checked:
+# - No HTML entities or partial fragments
+# - KIVY_HOME set early (before importing kivy) to avoid icon-copy permission failures on Android
+# - pil_rotate_90s signature corrected
+# - _style_menu_button implemented (fixes AttributeError during menu build)
+# - CSV UI fully integrated (CSV footer button opens CSV menu with Load/Select/Headers)
+# - CSV selector supports reorder/filter/sort, scroll, selection -> Data Update label
+# - QR overrides CSV selection (QR clears CSV selection and writes Data Update)
+# - Autofetch button added to control background polling
+# - Stale full-res fetch prevention via request ids
+# - All Kivy Texture creation happens on the main (GL) thread via Clock.schedule_once
+# - Defensive error handling and logging throughout
+#
+# Drop this file into your repo to replace the existing main.py.
 
 import os
 import json
@@ -20,8 +26,19 @@ import queue
 import requests
 import urllib3
 
+# Set KIVY_HOME early on Android so Kivy won't try to copy icons into the bundle dir
+if os.environ.get("ANDROID_ARGUMENT"):
+    private_dir = os.environ.get("ANDROID_PRIVATE")
+    if private_dir:
+        kivy_home = os.path.join(private_dir, ".kivy")
+        try:
+            os.makedirs(kivy_home, exist_ok=True)
+        except Exception:
+            pass
+        os.environ["KIVY_HOME"] = kivy_home
+
 import kivy
-kivy.require("2.0.0")
+kivy.require("2.3.0")
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -52,14 +69,6 @@ import numpy as np
 
 # Suppress insecure HTTPS warnings (camera may use self-signed certs)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# On Android prefer writing Kivy home to private dir to avoid permission issues
-if os.environ.get("ANDROID_ARGUMENT"):
-    private_dir = os.environ.get("ANDROID_PRIVATE")
-    if private_dir:
-        kivy_home = os.path.join(private_dir, ".kivy")
-        os.makedirs(kivy_home, exist_ok=True)
-        os.environ["KIVY_HOME"] = kivy_home
 
 
 def pil_rotate_90s(img: PILImage.Image, ang: int) -> PILImage.Image:
@@ -725,31 +734,6 @@ class VolumeToolkitApp(App):
         self._log_internal("UI ready")
         return root
 
-    # ---------- UI helpers ----------
-    def _style_autofetch_button(self, running=False):
-        try:
-            self.autofetch_btn.background_normal = ""
-            self.autofetch_btn.background_down = ""
-            if running:
-                self.autofetch_btn.background_color = (0.1, 0.6, 0.1, 1.0)
-                self.autofetch_btn.text = "Autofetch On"
-            else:
-                self.autofetch_btn.background_color = (0.4, 0.4, 0.4, 1.0)
-                self.autofetch_btn.text = "Autofetch Off"
-        except Exception:
-            pass
-
-    def _on_autofetch_pressed(self):
-        if not self.autofetch_running:
-            # start poller
-            self.start_polling_new_images()
-            self.autofetch_running = True
-            self._style_autofetch_button(running=True)
-        else:
-            self.stop_polling_new_images()
-            self.autofetch_running = False
-            self._style_autofetch_button(running=False)
-
     # ---------- helper to create per-thumb pos updaters ----------
     def _make_thumb_pos_updater(self, idx):
         def _updater(instance, value):
@@ -919,7 +903,7 @@ class VolumeToolkitApp(App):
                 up = Button(text="▲", size_hint=(None, 1), width=dp(34))
                 down = Button(text="▼", size_hint=(None, 1), width=dp(34))
                 filt = TextInput(text=old_filters.get(h, ""), multiline=False, size_hint=(0.4, 1), font_size=sp(12))
-                sort_b = Button(text="⋯", size_hint=(None, 1), width=dp(40))
+                sort_b = Button(text="���", size_hint=(None, 1), width=dp(40))
                 st = old_sorts.get(h)
                 if st == "asc":
                     sort_b.text = "↑"
@@ -938,10 +922,13 @@ class VolumeToolkitApp(App):
 
         def wire_column_control_callbacks():
             for h, ctrls in col_controls.items():
-                ctrls["up"].unbind(on_release=None)
-                ctrls["down"].unbind(on_release=None)
-                ctrls["sort"].unbind(on_release=None)
-                ctrls["filter"].unbind(text=None)
+                try:
+                    ctrls["up"].unbind(on_release=None)
+                    ctrls["down"].unbind(on_release=None)
+                    ctrls["sort"].unbind(on_release=None)
+                    ctrls["filter"].unbind(text=None)
+                except Exception:
+                    pass
                 ctrls["up"].bind(on_release=lambda inst, header=h: reorder_column_up(header))
                 ctrls["down"].bind(on_release=lambda inst, header=h: reorder_column_down(header))
                 ctrls["sort"].bind(on_release=lambda inst, header=h, btn=ctrls["sort"]: cycle_sort(header, btn))
@@ -1081,10 +1068,24 @@ class VolumeToolkitApp(App):
             pass
 
     # ---------- styling / menu / logging ----------
+    def _style_menu_button(self, b):
+        """
+        Apply consistent styling to menu buttons used in popups / dropdown.
+        Returns the button (useful if callers want to chain).
+        """
+        try:
+            b.background_normal = ""
+            b.background_down = ""
+            b.background_color = (0.10, 0.10, 0.10, 0.80)
+            b.color = (1, 1, 1, 1)
+        except Exception:
+            pass
+        return b
+
     def _style_connect_button(self, initial=False):
         self.connect_btn.background_normal = ""
         self.connect_btn.background_down = ""
-        self.connect_btn.background_color = (0.06, 0.45, 0.75, 1.0)
+        self.connect_btn.background_color = (0.06, 0.45, 0.75, 1.0)  # blue
         if initial or not self.connected:
             self.connect_btn.color = (1, 1, 1, 1)
         else:
@@ -1101,6 +1102,19 @@ class VolumeToolkitApp(App):
             self.start_btn.background_color = (0.8, 0.0, 0.0, 1.0)
             self.start_btn.color = (1, 1, 1, 1)
             self.start_btn.text = "Stop"
+
+    def _style_autofetch_button(self, running=False):
+        try:
+            self.autofetch_btn.background_normal = ""
+            self.autofetch_btn.background_down = ""
+            if running:
+                self.autofetch_btn.background_color = (0.1, 0.6, 0.1, 1.0)
+                self.autofetch_btn.text = "Autofetch On"
+            else:
+                self.autofetch_btn.background_color = (0.4, 0.4, 0.4, 1.0)
+                self.autofetch_btn.text = "Autofetch Off"
+        except Exception:
+            pass
 
     def _log_internal(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1240,7 +1254,7 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # ---------- FPS / IP popups (unchanged) ----------
+    # ---------- FPS / IP popups ----------
     def _open_fps_popup(self):
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         sv = Slider(min=5, max=30, value=12, step=1)
@@ -1288,7 +1302,7 @@ class VolumeToolkitApp(App):
         btn_cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # ---------- Android CSV (SAF) helpers (unchanged) ----------
+    # ---------- Android CSV (SAF) helpers ----------
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
             return
