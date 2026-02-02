@@ -1,15 +1,13 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Fully reviewed and corrected main.py
-# Key fixes applied:
-# - All Kivy Texture creation happens on the main thread (prevents black textures).
-# - Thumbnail overlay persists until user closes it; added "X" close button.
-# - When overlay is active, preview.img.keep_ratio=False and allow_stretch=True so crop overlays align.
-# - On close, preview restore keep_ratio=True so liveview is letterboxed as before.
-# - Thumbnails saved and rotated to preview orientation; preview textures created consistently.
-# - Repaired HTML-escaped entities, restored missing helpers, fixed small logic bugs.
-# - Decoder thread starts in build() to avoid races with preview object creation.
+# Updated:
+# - When a thumb is selected we draw the low-res (and later full-res) image into a dedicated
+#   overlay Rectangle that covers exactly the preview widget bounds (so width/height match).
+# - Overlay is closed by tapping the same thumbnail again (no "X"). The thumbnail being reviewed
+#   is highlighted with a colored border so the user knows which to tap to close.
+# - All Kivy Texture creation remains on the main thread.
+# - Restores consistent behavior for keep_ratio/allow_stretch (we let the overlay Rectangle fill exactly).
 #
-# Replace your main.py with this file. Test on-device and paste any logcat tracebacks if issues remain.
+# Replace your main.py with this file.
 
 import os
 import json
@@ -53,10 +51,9 @@ from PIL import Image as PILImage
 import cv2
 import numpy as np
 
-# Suppress InsecureRequestWarning from urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Android: prefer writing Kivy config into private directory
+# Android: keep Kivy writable files out of the extracted app directory.
 if os.environ.get("ANDROID_ARGUMENT"):
     private_dir = os.environ.get("ANDROID_PRIVATE")
     if private_dir:
@@ -79,7 +76,6 @@ def pil_rotate_90s(img: PILImage.Image, ang: int) -> PILImage.Image:
             return img.transpose(T.ROTATE_270)
         return img
     except Exception:
-        # Pillow older versions fallback
         if ang == 90:
             return img.transpose(PILImage.ROTATE_90)
         if ang == 180:
@@ -104,12 +100,13 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
-    # default rotation: user wants preview rotated (device/hotshoe)
+    # Preview rotation default to match phone orientation on hotshoe
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+        # Image widget used by live view pipeline (we keep it but won't use its scaling when overlay is active)
         self.img = Image(allow_stretch=True, keep_ratio=True)
         try:
             self.img.fit_mode = "contain"
@@ -121,14 +118,13 @@ class PreviewOverlay(FloatLayout):
         lw_qr = 6
 
         with self.img.canvas.after:
-            # Border (blue)
+            # Border color (blue)
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
 
-            # placeholder color for grid (we will draw explicit Color+Line per grid line)
+            # placeholder Color for grid (we add explicit Colors for each grid line)
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
 
-            # 5:7 and 8:10 crop rectangles
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
             self._ln_57 = Line(width=lw)
 
@@ -138,27 +134,93 @@ class PreviewOverlay(FloatLayout):
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
             self._ln_oval = Line(width=lw)
 
-            # QR highlight (green)
+            # QR highlight color: green
             self._c_qr = Color(0.0, 1.0, 0.0, 0.95)
             self._ln_qr = Line(width=lw_qr, close=True)
 
-        # store (ColorObj, LineObj) pairs for grid lines so we can remove them cleanly
+        # Grid lines list (so we can remove them cleanly)
         self._ln_grid_list = []
 
-        self.bind(pos=self._redraw, size=self._redraw)
+        # Overlay Rectangle: used to draw the selected thumb/full-res and guarantee exact bounds
+        self._overlay_rect = None  # type: Rectangle | None
+        self._overlay_rect_color = None  # Color object for potential tint (not used)
+        self._overlay_texture = None  # keep reference to Texture
+
+        # keep overlay rect in canvas.before so it is drawn under the border/QR overlays
+        self.canvas.before.clear()
+
+        # Bind changes so we can update overlay rect bounds if preview moves/resizes
+        self.bind(pos=self._update_overlay_rect, size=self._update_overlay_rect)
+        self.img.bind(pos=self._update_overlay_rect, size=self._update_overlay_rect)
+
         self.bind(
+            pos=self._redraw, size=self._redraw,
             show_border=self._redraw, show_grid=self._redraw, show_57=self._redraw,
             show_810=self._redraw, show_oval=self._redraw, show_qr=self._redraw,
             grid_n=self._redraw,
             oval_cx=self._redraw, oval_cy=self._redraw, oval_w=self._redraw, oval_h=self._redraw
         )
-        self.img.bind(pos=self._redraw, size=self._redraw, texture=self._redraw, texture_size=self._redraw)
 
         self._qr_points_px = None
         self._redraw()
 
+    # Overlay rectangle helpers
+    def set_overlay_texture(self, texture: Texture):
+        """
+        Draw the given texture into a Rectangle that exactly matches the preview widget's bounds.
+        This bypasses Image's keep_ratio behavior so we control exact sizing.
+        Must be called on main thread.
+        """
+        # remove any previous overlay
+        self.clear_overlay_texture()
+
+        if texture is None:
+            return
+
+        # ensure the texture is not flipped unexpectedly — we assume textures are prepared correctly
+        self._overlay_texture = texture
+        with self.canvas.before:
+            # color placeholder (no tint)
+            self._overlay_rect_color = Color(1.0, 1.0, 1.0, 1.0)
+            # rectangle will be positioned and sized by _update_overlay_rect
+            self._overlay_rect = Rectangle(texture=self._overlay_texture, pos=self.pos, size=self.size)
+
+        # immediately update pos/size
+        self._update_overlay_rect()
+
+    def clear_overlay_texture(self):
+        # remove overlay rectangle and color safely
+        try:
+            if self._overlay_rect is not None:
+                try:
+                    self.canvas.before.remove(self._overlay_rect)
+                except Exception:
+                    pass
+                self._overlay_rect = None
+            if self._overlay_rect_color is not None:
+                try:
+                    self.canvas.before.remove(self._overlay_rect_color)
+                except Exception:
+                    pass
+                self._overlay_rect_color = None
+            self._overlay_texture = None
+        except Exception:
+            pass
+
+    def _update_overlay_rect(self, *a):
+        # update overlay rectangle pos/size to exactly match this widget bounds
+        if self._overlay_rect is None:
+            return
+        try:
+            # draw exactly in the PreviewOverlay bounds
+            self._overlay_rect.pos = self.pos
+            self._overlay_rect.size = self.size
+        except Exception:
+            pass
+
+    # Keep the rest of overlay drawing logic (border, grids, QR) intact
     def set_texture(self, texture):
-        # Set preview texture (call from main thread)
+        # Normal path used by liveview: set the Image widget texture (still used when overlay not active)
         self.img.texture = texture
         self._redraw()
 
@@ -167,6 +229,7 @@ class PreviewOverlay(FloatLayout):
         self._redraw()
 
     def _drawn_rect(self):
+        # returns the area where Image would draw the texture (for center/letterbox calculations)
         wx, wy = self.img.pos
         ww, wh = self.img.size
         try:
@@ -208,21 +271,24 @@ class PreviewOverlay(FloatLayout):
     def _redraw(self, *args):
         fx, fy, fw, fh = self._drawn_rect()
 
+        # border
         self._ln_border.rectangle = (fx, fy, fw, fh) if self.show_border else (0, 0, 0, 0)
 
+        # 5:7 crop
         if self.show_57:
             asp57 = self._crop_aspect(5.0, 7.0, fw, fh)
             self._ln_57.rectangle = self._center_crop_rect(fx, fy, fw, fh, asp57)
         else:
             self._ln_57.rectangle = (0, 0, 0, 0)
 
+        # 8:10 crop
         if self.show_810:
             asp810 = self._crop_aspect(4.0, 5.0, fw, fh)
             self._ln_810.rectangle = self._center_crop_rect(fx, fy, fw, fh, asp810)
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
-        # remove previous grid color/line objects
+        # Grid: remove old
         for col_obj, line_obj in list(self._ln_grid_list):
             try:
                 self.img.canvas.after.remove(col_obj)
@@ -252,6 +318,7 @@ class PreviewOverlay(FloatLayout):
                 self.img.canvas.after.add(ln)
                 self._ln_grid_list.append((col, ln))
 
+        # Oval
         if self.show_oval:
             cx = fx + fw * float(self.oval_cx)
             cy = fy + fh * float(self.oval_cy)
@@ -270,6 +337,7 @@ class PreviewOverlay(FloatLayout):
             self._clear_line_modes(self._ln_oval)
             self._ln_oval.ellipse = (0, 0, 0, 0)
 
+        # QR overlay
         if self.show_qr and self._qr_points_px and self.img.texture and self.img.texture.size[0] > 0:
             iw, ih = self.img.texture.size
             dx, dy, dw, dh = fx, fy, fw, fh
@@ -299,7 +367,7 @@ class VolumeToolkitApp(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # Default IP (editable in UI)
+        # Default IP
         self.camera_ip = "192.168.34.29"
 
         self.connected = False
@@ -319,18 +387,16 @@ class VolumeToolkitApp(App):
         self._display_count = 0
         self._stat_t0 = time.time()
 
-        # internal logging
         self._log_lines = []
         self._max_log_lines = 300
         self.show_log = False
 
-        # frame texture currently used for liveview
         self._frame_texture = None
         self._frame_size = None
 
         self.dropdown = None
 
-        # QR state
+        # QR
         self.qr_enabled = False
         self._qr_temp_active = False
         self._qr_pulse_event = None
@@ -343,11 +409,9 @@ class VolumeToolkitApp(App):
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
 
-        # latest decoded BGR for QR thread
         self._latest_decoded_bgr = None
         self._latest_decoded_bgr_ts = 0.0
 
-        # decoder queue + thread
         self._decode_queue = queue.Queue(maxsize=2)
         self._decoder_thread = None
         self._decoder_stop = threading.Event()
@@ -356,10 +420,12 @@ class VolumeToolkitApp(App):
         self._overlay_active = False
         self._overlay_thumb_index = None
 
-        # QR highlight timer
+        # highlight index for thumb border
+        self._highlighted_thumb_index = None
+        self._thumb_highlight_lines = {}  # maps idx -> (ColorObj, LineObj)
+
         self._qr_highlight_event = None
 
-        # author / CSV
         self.author_max_chars = 60
         self._last_committed_author = None
         self._author_update_in_flight = False
@@ -370,13 +436,11 @@ class VolumeToolkitApp(App):
         self.selected_headers = []
         self._headers_popup = None
 
-        # thumbnails
         self._thumb_textures = []
         self._thumb_images = []
         self._thumb_paths = []
         self._thumb_saved_paths = []
 
-        # storage
         self.download_dir = "downloads"
         self.thumb_dir = "thumbs"
 
@@ -387,23 +451,16 @@ class VolumeToolkitApp(App):
 
         self.save_full_size = False
 
-        # HTTP session (insecure certs allowed for camera)
         self._session = requests.Session()
         self._session.verify = False
 
-        # Android SAF
         self._android_activity_bound = False
         self._csv_req_code = 4242
 
-        # UI refs (populated in build)
         self.header = None
         self.preview_holder = None
 
-        # overlay UI refs created in build()
-        self._overlay_layer = None
-        self._overlay_close_btn = None
-
-    # ---------- texture helpers (main-thread creation) ----------
+    # ---------- texture helpers ----------
     def _create_texture_from_rgb(self, rgb_bytes, w, h, flip_vertical=True):
         try:
             tex = Texture.create(size=(w, h), colorfmt="rgb")
@@ -424,11 +481,10 @@ class VolumeToolkitApp(App):
             self._log_internal(f"texture from bgr err: {e}")
             return None
 
-    def _create_texture_from_jpeg_bytes_on_main(self, jpeg_bytes, rotate=0, flip_vertical=True):
+    def _create_texture_from_jpeg_bytes(self, jpeg_bytes, rotate=0, flip_vertical=True):
         """
-        Decode JPEG bytes (on the main thread) and create a Texture.
-        Use sparingly; preferred path decodes in background then schedules this function
-        to create the texture from RGB bytes.
+        Decode JPEG bytes (on main thread or scheduled from main) and create a Texture.
+        Prefer background decode -> schedule create on main thread using rgb bytes.
         """
         try:
             arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
@@ -446,16 +502,16 @@ class VolumeToolkitApp(App):
             self._log_internal(f"jpeg->texture err: {e}")
             return None
 
-    def _create_texture_from_jpeg_file_on_main(self, path, rotate=0, flip_vertical=True):
+    def _create_texture_from_jpeg_file(self, path, rotate=0, flip_vertical=True):
         try:
             with open(path, "rb") as f:
                 data = f.read()
-            return self._create_texture_from_jpeg_bytes_on_main(data, rotate=rotate, flip_vertical=flip_vertical)
+            return self._create_texture_from_jpeg_bytes(data, rotate=rotate, flip_vertical=flip_vertical)
         except Exception as e:
             self._log_internal(f"jpeg file->texture err: {e}")
             return None
 
-    # ---------- networking ----------
+    # ---------- network helper ----------
     def _json_call(self, method, path, payload=None, timeout=8.0):
         url = f"https://{self.camera_ip}{path}"
         try:
@@ -469,6 +525,7 @@ class VolumeToolkitApp(App):
                 resp = self._session.delete(url, timeout=timeout)
             else:
                 raise ValueError("Unsupported method")
+
             status = f"{resp.status_code} {resp.reason}"
             data = None
             if resp.content:
@@ -484,7 +541,7 @@ class VolumeToolkitApp(App):
     def build(self):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
-        # Header
+        # Header and menu
         self.header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         self.header_title = Label(text="Volume Toolkit v1.0.6", font_size=sp(18))
         self.header.add_widget(self.header_title)
@@ -492,7 +549,7 @@ class VolumeToolkitApp(App):
         self.header.add_widget(self.menu_btn)
         root.add_widget(self.header)
 
-        # Connect / Start row
+        # Control row
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(None, 1), width=dp(120))
         self._style_connect_button(initial=True)
@@ -510,10 +567,9 @@ class VolumeToolkitApp(App):
         self.qr_status = Label(text="", size_hint=(1, None), height=dp(18), font_size=sp(11))
         root.add_widget(self.qr_status)
 
-        # Main area: preview (80%) + thumbs (20%)
+        # Main area: preview 80%, thumbs 20%
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
-        # Preview holder and overlay layer
         self.preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview_scatter = Scatter(do_translation=False, do_scale=False, do_rotation=False, size_hint=(None, None))
         self.preview = PreviewOverlay(size_hint=(None, None))
@@ -521,25 +577,17 @@ class VolumeToolkitApp(App):
         self.preview_scatter.add_widget(self.preview)
         self.preview_holder.add_widget(self.preview_scatter)
 
-        # Overlay layer (for close button) sits above scatter
-        self._overlay_layer = FloatLayout(size_hint=(None, None))
-        self._overlay_close_btn = Button(text="✕", size_hint=(None, None), size=(dp(36), dp(36)),
-                                         background_normal="", background_color=(0.15, 0.15, 0.15, 0.85),
-                                         color=(1, 1, 1, 1))
-        self._overlay_close_btn.bind(on_release=lambda *_: self._close_overlay())
-        self._overlay_close_btn.opacity = 0
-        self._overlay_close_btn.disabled = True
-        self._overlay_layer.add_widget(self._overlay_close_btn)
-        self.preview_holder.add_widget(self._overlay_layer)
-
+        # We do NOT use an X close button; overlay is closed by tapping the selected thumb.
         main_area.add_widget(self.preview_holder)
 
-        # Thumbnails sidebar
+        # Sidebar (thumbs)
         sidebar = BoxLayout(orientation="vertical", size_hint=(0.20, 1), spacing=dp(4))
         sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
         for idx in range(5):
             img = Image(size_hint=(1, None), height=dp(100), allow_stretch=True, keep_ratio=True)
             img.thumb_index = idx
+            # create a placeholder highlight line for each thumb (none initially)
+            img.bind(pos=self._make_thumb_pos_updater(idx), size=self._make_thumb_pos_updater(idx))
             img.bind(on_touch_down=self._on_thumb_touch)
             sidebar.add_widget(img)
             self._thumb_images.append(img)
@@ -557,20 +605,17 @@ class VolumeToolkitApp(App):
                 self.preview_holder.x + (self.preview_holder.width - w) / 2.0,
                 self.preview_holder.y + (self.preview_holder.height - h) / 2.0
             )
-            # overlay layer match preview size/pos
-            self._overlay_layer.size = (w, h)
-            self._overlay_layer.pos = self.preview_scatter.pos
-            # position close button in overlay top-right with margin
-            try:
-                self._overlay_close_btn.pos = (self._overlay_layer.x + w - self._overlay_close_btn.width - dp(6),
-                                               self._overlay_layer.y + h - self._overlay_close_btn.height - dp(6))
-            except Exception:
-                pass
+            # ensure overlay rectangle follows
+            self.preview._update_overlay_rect()
+
+            # update thumb highlight positions (line objects attached to each thumb)
+            for idx, img in enumerate(self._thumb_images):
+                self._update_thumb_highlight_pos(idx)
 
         self._fit_preview_to_holder = fit_preview_to_holder
         self.preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
-        # Log area hidden by default
+        # Log area
         self.log_holder = BoxLayout(orientation="vertical", size_hint=(1, None), height=0)
         log_sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         self.log_label = Label(text="", size_hint_y=None, halign="left", valign="top", font_size=sp(11))
@@ -584,7 +629,7 @@ class VolumeToolkitApp(App):
         self.dropdown = self._build_dropdown()
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
-        # Button bindings
+        # Bind buttons
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self._on_start_pressed())
 
@@ -596,14 +641,61 @@ class VolumeToolkitApp(App):
         # Display ticker
         self._reschedule_display_loop(12)
 
-        # React to rotation/resize
+        # Window resize
         Window.bind(on_resize=self._on_window_resize)
 
         self._set_controls_idle()
         self._log_internal("UI ready")
         return root
 
-    # ---------- UI helpers ----------
+    # ---------- helper to create per-thumb pos updaters ----------
+    def _make_thumb_pos_updater(self, idx):
+        def _updater(instance, value):
+            # ensure highlight rectangle follows the thumb widget
+            self._update_thumb_highlight_pos(idx)
+        return _updater
+
+    # ---------- thumbnail highlight helpers ----------
+    def _highlight_thumb(self, idx):
+        # Remove previous highlight
+        self._clear_thumb_highlight()
+        if idx is None or idx >= len(self._thumb_images):
+            return
+        img = self._thumb_images[idx]
+        # create a border Line in img.canvas.after
+        try:
+            with img.canvas.after:
+                col = Color(1.0, 0.8, 0.0, 1.0)  # yellow-ish
+                ln = Line(rectangle=(img.x, img.y, img.width, img.height), width=2)
+            self._thumb_highlight_lines[idx] = (col, ln)
+            self._highlighted_thumb_index = idx
+        except Exception:
+            self._thumb_highlight_lines = {}
+            self._highlighted_thumb_index = None
+
+    def _update_thumb_highlight_pos(self, idx):
+        # update rectangle coordinates for highlight line to match the thumb widget
+        if idx not in self._thumb_highlight_lines:
+            return
+        img = self._thumb_images[idx]
+        col, ln = self._thumb_highlight_lines[idx]
+        try:
+            ln.rectangle = (img.x, img.y, img.width, img.height)
+        except Exception:
+            pass
+
+    def _clear_thumb_highlight(self):
+        for k, (col, ln) in list(self._thumb_highlight_lines.items()):
+            try:
+                widget = self._thumb_images[k]
+                widget.canvas.after.remove(col)
+                widget.canvas.after.remove(ln)
+            except Exception:
+                pass
+        self._thumb_highlight_lines = {}
+        self._highlighted_thumb_index = None
+
+    # ---------- window/rotation handling ----------
     def _on_window_resize(self, instance, width, height):
         try:
             if width > height:
@@ -621,6 +713,7 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
 
+    # ---------- styling / menu / logging (unchanged) ----------
     def _style_connect_button(self, initial=False):
         self.connect_btn.background_normal = ""
         self.connect_btn.background_down = ""
@@ -642,7 +735,6 @@ class VolumeToolkitApp(App):
             self.start_btn.color = (1, 1, 1, 1)
             self.start_btn.text = "Stop"
 
-    # ---------- logging ----------
     def _log_internal(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -671,7 +763,6 @@ class VolumeToolkitApp(App):
             self.log_holder.opacity = 0
             self.log_holder.disabled = True
 
-    # ---------- menu ----------
     def _style_menu_button(self, b):
         b.background_normal = ""
         b.background_down = ""
@@ -742,7 +833,7 @@ class VolumeToolkitApp(App):
         add_button("Stop auto-fetch", lambda: self.stop_polling_new_images())
 
         add_header("Settings")
-        add_button("IP settings…", lambda: self._open_ip_popup())
+        add_button("IP settings��", lambda: self._open_ip_popup())
         add_button("Display FPS…", lambda: self._open_fps_popup())
         add_toggle("Show log", False, lambda v: self._set_log_visible(v))
 
@@ -751,7 +842,7 @@ class VolumeToolkitApp(App):
 
         return dd
 
-    # ---------- FPS / IP popups ----------
+    # ---------- FPS / IP popups (unchanged) ----------
     def _open_fps_popup(self):
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         sv = Slider(min=5, max=30, value=12, step=1)
@@ -799,7 +890,7 @@ class VolumeToolkitApp(App):
         btn_cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # ---------- Android CSV helpers ----------
+    # ---------- Android CSV (unchanged) ----------
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
             return
@@ -819,11 +910,14 @@ class VolumeToolkitApp(App):
             from jnius import autoclass
 
             Intent = autoclass("android.content.Intent")
+
             intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
             intent.addCategory(Intent.CATEGORY_OPENABLE)
             intent.setType("*/*")
+
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
             self._log_internal("Opening Android file picker…")
             mActivity.startActivityForResult(intent, self._csv_req_code)
         except Exception as e:
@@ -844,12 +938,14 @@ class VolumeToolkitApp(App):
             if uri is None:
                 self._log_internal("CSV picker returned no URI")
                 return
+
             try:
                 flags = intent.getFlags()
                 take_flags = flags & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
                 mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
             except Exception:
                 pass
+
             data = self._read_android_uri_bytes(uri)
             self._parse_csv_bytes(data)
             self._log_internal(f"CSV loaded from picker: {len(self.csv_rows)} rows")
@@ -947,12 +1043,15 @@ class VolumeToolkitApp(App):
         if self.live_running:
             self._log_internal("Connect disabled while live view is running. Stop first.")
             return
+
         if not self.camera_ip:
             self.status.text = "Status: enter an IP (use Settings->IP)"
             return
+
         self.connect_btn.disabled = True
         self.status.text = f"Status: connecting to {self.camera_ip}:443..."
         self._log_internal(f"Connecting to {self.camera_ip}:443")
+
         threading.Thread(target=self._connect_worker, daemon=True).start()
 
     def _connect_worker(self):
@@ -960,6 +1059,7 @@ class VolumeToolkitApp(App):
             status, data = self._json_call("GET", '/ccapi/ver100/deviceinformation', None, timeout=8.0)
         except Exception as e:
             status, data = f"ERR {e}", None
+
         def _finish(dt):
             try:
                 if status and str(status).startswith("200") and data:
@@ -985,6 +1085,7 @@ class VolumeToolkitApp(App):
                     self.connect_btn.disabled = False
                 except Exception:
                     pass
+
         Clock.schedule_once(_finish, 0)
 
     def _author_value(self, payload):
@@ -1004,6 +1105,7 @@ class VolumeToolkitApp(App):
             return
         if self._author_update_in_flight:
             return
+
         self._author_update_in_flight = True
         Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author updating… ({source})"), 0)
         threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
@@ -1021,6 +1123,7 @@ class VolumeToolkitApp(App):
             )
             if not st_put.startswith("200"):
                 raise Exception(f"PUT failed: {st_put}")
+
             st_get, data = self._json_call(
                 "GET",
                 '/ccapi/ver100/functions/registeredname/author',
@@ -1029,10 +1132,13 @@ class VolumeToolkitApp(App):
             )
             if not st_get.startswith("200") or not isinstance(data, dict):
                 raise Exception(f"GET failed: {st_get}")
+
             got = (data.get("author") or "").strip()
             ok = (got == value)
+
         except Exception as e:
             err = str(e)
+
         def _finish(_dt):
             self._author_update_in_flight = False
             if ok:
@@ -1042,9 +1148,10 @@ class VolumeToolkitApp(App):
             else:
                 self._log_internal(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
                 self.qr_status.text = "Author verify failed ✗"
+
         Clock.schedule_once(_finish, 0)
 
-    # ---------- liveview / decoder / QR ----------
+    # ---------- liveview + QR + decoder ----------
     def _set_qr_enabled(self, enabled: bool):
         self.qr_enabled = bool(enabled)
         if not self.qr_enabled and not self._qr_temp_active:
@@ -1103,28 +1210,34 @@ class VolumeToolkitApp(App):
     def start_liveview(self):
         if not self.connected or self.live_running:
             return
+
         payload = {"liveviewsize": "small", "cameradisplay": "on"}
         self._log_internal("Starting live view size=small, cameradisplay=on")
+
         status, _ = self._json_call("POST", '/ccapi/ver100/shooting/liveview', payload, timeout=10.0)
         if not status.startswith("200"):
             self.status.text = f"Status: live view start failed ({status})"
             self._log_internal(f"Live view start failed: {status}")
             return
+
         self.session_started = True
         self.live_running = True
         self._set_controls_running()
         self.status.text = "Status: live"
+
         with self._lock:
             self._latest_jpeg = None
             self._latest_jpeg_ts = 0.0
         self._last_decoded_ts = 0.0
         self._frame_texture = None
         self._frame_size = None
+
         self._latest_qr_text = ""
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
         self._set_qr_ui(None, None, note="QR: off" if not self.qr_enabled else "QR: on")
+
         self._fetch_count = 0
         self._decode_count = 0
         self._display_count = 0
@@ -1141,13 +1254,16 @@ class VolumeToolkitApp(App):
         if not self.live_running:
             self._set_controls_idle()
             return
+
         self.live_running = False
+
         if self.session_started:
             try:
                 self._json_call("DELETE", '/ccapi/ver100/shooting/liveview', None, timeout=6.0)
             except Exception:
                 pass
             self.session_started = False
+
         self.status.text = "Status: connected (live stopped)" if self.connected else "Status: not connected"
         self._log_internal("Live view stopped")
         self._set_controls_idle()
@@ -1188,7 +1304,7 @@ class VolumeToolkitApp(App):
             except queue.Empty:
                 continue
 
-            # defensive: ensure preview exists
+            # defensive: ensure preview exists before using preview.preview_rotation
             if not hasattr(self, "preview") or self.preview is None:
                 time.sleep(0.05)
                 continue
@@ -1217,7 +1333,7 @@ class VolumeToolkitApp(App):
 
                 def _update_texture_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ts=ts):
                     try:
-                        # if overlay active, don't replace preview
+                        # if overlay active, do not replace the overlay Rectangle (we want it to persist)
                         if getattr(self, "_overlay_active", False):
                             return
                         if self._frame_texture is None or self._frame_size != (w, h):
@@ -1227,6 +1343,7 @@ class VolumeToolkitApp(App):
                             self._frame_size = (w, h)
                             self._log_internal(f"texture init size={w}x{h}")
                         self._frame_texture.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
+                        # set live texture on Image widget (letterboxed according to keep_ratio)
                         self.preview.set_texture(self._frame_texture)
                         self._last_decoded_ts = ts
                     except Exception as e:
@@ -1341,46 +1458,12 @@ class VolumeToolkitApp(App):
             self._qr_highlight_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
         self.qr_status.text = note
 
-    # ---------- preview tap handling ----------
-    def _on_preview_touch(self, instance, touch):
-        if not instance.collide_point(*touch.pos):
-            return False
-        self._start_pulse_qr()
-        return True
-
-    def _start_pulse_qr(self):
-        if getattr(self, "_qr_pulse_event", None):
-            try:
-                self._qr_pulse_event.cancel()
-            except Exception:
-                pass
-            self._qr_pulse_event = None
-
-        self._qr_temp_active = True
-        self._set_qr_ui(None, None, note="QR: scanning…")
-        try:
-            self._qr_pulse_event = Clock.schedule_once(lambda *_: self._end_pulse_qr(), 1.0)
-        except Exception:
-            def _bg_end():
-                time.sleep(1.0)
-                Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
-            threading.Thread(target=_bg_end, daemon=True).start()
-
-    def _end_pulse_qr(self, *args):
-        if getattr(self, "_qr_pulse_event", None):
-            try:
-                self._qr_pulse_event.cancel()
-            except Exception:
-                pass
-            self._qr_pulse_event = None
-        self._qr_temp_active = False
-        if not getattr(self, "qr_enabled", False):
-            self._set_qr_ui(None, None, note="QR: off")
-        else:
-            self._set_qr_ui(None, None, note="QR: on")
-
-    # ---------- thumbnails, overlay, full-res swap (fixed texture creation) ----------
+    # ---------- thumbnail selection / overlay behavior ----------
     def _download_thumb_for_path(self, ccapi_path: str):
+        """
+        Downloads thumbnail bytes and creates a Kivy texture on the main thread.
+        Also saves the thumbnail to disk so we can create correctly-rotated preview textures later.
+        """
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         self._log_internal(f"Downloading thumbnail (bg): {thumb_url}")
         try:
@@ -1393,7 +1476,7 @@ class VolumeToolkitApp(App):
             self._log_internal(f"Thumbnail download error: {e}")
             return
 
-        # Save thumbnail to disk (so we can reconstruct oriented preview textures later)
+        # Save to disk (optional, used for consistent preview orientation creation)
         out_path = None
         try:
             os.makedirs(self.thumb_dir, exist_ok=True)
@@ -1408,7 +1491,7 @@ class VolumeToolkitApp(App):
             self._log_internal(f"Saving thumbnail err: {e}")
             out_path = None
 
-        # Decode using PIL, rotate to preview orientation, create rgb bytes
+        # Decode using PIL, rotate to preview orientation
         try:
             pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
             rot = getattr(self.preview, "preview_rotation", 0) if hasattr(self, "preview") else 0
@@ -1430,7 +1513,7 @@ class VolumeToolkitApp(App):
                 self._log_internal(f"Texture create/blit err: {e}")
                 return
 
-            # Insert at front (most recent first)
+            # Insert at front (thumb0 is newest)
             self._thumb_textures.insert(0, tex)
             self._thumb_paths.insert(0, ccapi_path)
             self._thumb_saved_paths.insert(0, out_path if out_path else "")
@@ -1453,15 +1536,18 @@ class VolumeToolkitApp(App):
         if not self.connected:
             self._log_internal("Not connected; cannot fetch contents.")
             return
+
         images = self.list_all_images()
         self._log_internal(f"contents: {len(images)} total entries")
         if not images:
             self._log_internal("No images found on camera.")
             return
+
         jpgs = [p for p in images if p.lower().endswith(('.jpg', '.jpeg'))]
         if not jpgs:
             self._log_internal("No JPG files found.")
             return
+
         latest = jpgs[-1]
         threading.Thread(target=self._download_thumb_for_path, args=(latest,), daemon=True).start()
         self._last_seen_image = latest
@@ -1475,25 +1561,50 @@ class VolumeToolkitApp(App):
         if idx >= len(self._thumb_paths):
             return False
 
-        ccapi_path = self._thumb_paths[idx]
-        saved_path = self._thumb_saved_paths[idx] if idx < len(self._thumb_saved_paths) else None
-        rot = getattr(self.preview, "preview_rotation", 0) if hasattr(self, "preview") else 0
-
-        # Prefer creating preview texture from saved thumbnail file (keeps orientation consistent)
-        if saved_path and os.path.exists(saved_path):
-            # create texture on main thread (we are on main thread here)
-            tex = self._create_texture_from_jpeg_file_on_main(saved_path, rotate=rot, flip_vertical=True)
-            if tex:
-                self._select_image_overlay(ccapi_path, tex, idx)
-                return True
-
-        # fallback to in-memory thumb texture (already created on main thread)
-        if idx < len(self._thumb_textures):
-            thumb_tex = self._thumb_textures[idx]
-            self._select_image_overlay(ccapi_path, thumb_tex, idx)
+        # If user taps the thumbnail that is already selected (overlay active and same index), close overlay
+        if self._overlay_active and (self._overlay_thumb_index == idx):
+            # close overlay
+            self._log_internal(f"Thumbnail {idx} tapped while overlay active: closing overlay")
+            # remove overlay and highlight
+            self._clear_thumb_highlight()
+            self.preview.clear_overlay_texture()
+            self._overlay_active = False
+            self._overlay_thumb_index = None
+            # restore live view texture if present
+            if self._frame_texture is not None:
+                try:
+                    self.preview.set_texture(self._frame_texture)
+                except Exception:
+                    pass
             return True
 
-        # otherwise download and overlay
+        # Otherwise open overlay for this thumbnail
+        ccapi_path = self._thumb_paths[idx]
+        saved_path = self._thumb_saved_paths[idx] if idx < len(self._thumb_saved_paths) else None
+
+        # Highlight the tapped thumb
+        self._highlight_thumb(idx)
+
+        # Prefer to create preview texture from saved file so orientation is consistent
+        rot = getattr(self.preview, "preview_rotation", 0) if hasattr(self, "preview") else 0
+        if saved_path and os.path.exists(saved_path):
+            # create texture on main thread
+            tex = self._create_texture_from_jpeg_file(saved_path, rotate=rot, flip_vertical=True)
+            if tex:
+                # set overlay texture to cover exactly preview bounds
+                Clock.schedule_once(lambda *_: self._show_overlay_with_texture(tex, idx), 0)
+                # fetch full in background
+                threading.Thread(target=self._fetch_full_and_replace, args=(ccapi_path, idx), daemon=True).start()
+                return True
+
+        # fallback to in-memory texture
+        if idx < len(self._thumb_textures):
+            thumb_tex = self._thumb_textures[idx]
+            Clock.schedule_once(lambda *_: self._show_overlay_with_texture(thumb_tex, idx), 0)
+            threading.Thread(target=self._fetch_full_and_replace, args=(ccapi_path, idx), daemon=True).start()
+            return True
+
+        # otherwise download thumb then overlay
         threading.Thread(target=self._download_thumb_and_overlay, args=(ccapi_path, idx), daemon=True).start()
         return True
 
@@ -1501,46 +1612,30 @@ class VolumeToolkitApp(App):
         self._download_thumb_for_path(ccapi_path)
         if idx < len(self._thumb_textures):
             tex = self._thumb_textures[idx]
-            Clock.schedule_once(lambda *_: self._select_image_overlay(ccapi_path, tex, idx), 0)
+            Clock.schedule_once(lambda *_: self._show_overlay_with_texture(tex, idx), 0)
+            threading.Thread(target=self._fetch_full_and_replace, args=(ccapi_path, idx), daemon=True).start()
 
-    def _select_image_overlay(self, ccapi_path: str, preview_texture: Texture, thumb_index: int):
+    def _show_overlay_with_texture(self, texture: Texture, thumb_index: int):
         """
-        Show low-res preview_texture stretched to fill preview area and persist until user closes.
-        Start background full-res download; full-res texture will be created on main thread as rgb bytes are ready.
+        Put the low-res texture into the overlay Rectangle that exactly matches the preview bounds.
         """
+        if texture is None:
+            return
+        # Set overlay_active and remember index
         self._overlay_active = True
         self._overlay_thumb_index = thumb_index
-
-        # show close button and make preview fill the entire preview area so crop overlay lines line up
-        def _enter_overlay(_dt):
-            try:
-                self._overlay_close_btn.opacity = 1
-                self._overlay_close_btn.disabled = False
-            except Exception:
-                pass
-            try:
-                # Force the preview Image to stretch so overlays align with the displayed (stretched) image
-                self.preview.img.keep_ratio = False
-                self.preview.img.allow_stretch = True
-            except Exception:
-                pass
-            try:
-                self.preview.set_texture(preview_texture)
-            except Exception:
-                pass
-
-        Clock.schedule_once(_enter_overlay, 0)
-
-        # Background fetch full-res; decoding to rgb bytes happens in bg, but Texture creation happens on main thread
-        threading.Thread(target=self._fetch_full_and_replace, args=(ccapi_path, thumb_index), daemon=True).start()
+        # Set the overlay rectangle texture (this will be drawn to exactly the preview.bounds)
+        try:
+            self.preview.set_overlay_texture(texture)
+        except Exception as e:
+            self._log_internal(f"Failed to set overlay texture: {e}")
 
     def _fetch_full_and_replace(self, ccapi_path: str, thumb_index: int):
         """
-        Download full-res JPG in the background, decode to RGB bytes, then schedule
-        creation of the Kivy Texture on the main thread. Do NOT create Textures on bg threads.
+        Download full-res JPG (background), decode to RGB bytes, then schedule a Kivy Texture
+        creation on the main thread and update the overlay Rectangle with that texture.
         """
         full_url = f"https://{self.camera_ip}{ccapi_path}"
-        self._log_internal(f"Fetching full-res: {full_url}")
         try:
             resp = self._session.get(full_url, timeout=20.0, stream=True)
             if resp.status_code != 200 or not resp.content:
@@ -1551,7 +1646,7 @@ class VolumeToolkitApp(App):
             self._log_internal(f"Full image download err: {e}")
             return
 
-        # Decode + rotate in background to rgb bytes
+        # Decode and rotate in background
         try:
             arr = np.frombuffer(data, dtype=np.uint8)
             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -1574,49 +1669,28 @@ class VolumeToolkitApp(App):
             self._log_internal(f"Full image decode err (bg): {e}")
             return
 
-        # Schedule texture creation & UI updates on main thread
-        def _apply_full_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, thumb_index=thumb_index):
+        # Create Texture and apply on main thread
+        def _apply_full_on_main(_dt):
             tex = self._create_texture_from_rgb(rgb_bytes, w, h, flip_vertical=True)
             if not tex:
                 self._log_internal("Failed to create full-res texture on main thread")
                 return
             try:
-                self.preview.set_texture(tex)
+                # Update overlay rectangle's texture so it fills exact preview bounds
+                self.preview.set_overlay_texture(tex)
             except Exception:
                 pass
             try:
+                # Update thumbnail strip texture too (visual feedback)
                 if thumb_index < len(self._thumb_textures):
                     self._thumb_textures[thumb_index] = tex
                     if thumb_index < len(self._thumb_images):
                         self._thumb_images[thumb_index].texture = tex
             except Exception:
                 pass
-            self._log_internal("Full-res applied to preview (overlay remains until closed)")
+            self._log_internal("Full-res applied to overlay (still active until user taps the thumbnail to close)")
 
         Clock.schedule_once(_apply_full_on_main, 0)
-
-    def _close_overlay(self):
-        # Hide overlay; restore liveview behavior and preview keep_ratio
-        self._overlay_active = False
-        self._overlay_thumb_index = None
-        try:
-            self._overlay_close_btn.opacity = 0
-            self._overlay_close_btn.disabled = True
-        except Exception:
-            pass
-        try:
-            # restore letterbox behavior for live view
-            self.preview.img.keep_ratio = True
-            # keep allow_stretch True (Kivy deprecation warning aside) or set as desired
-            self.preview.img.allow_stretch = True
-        except Exception:
-            pass
-        # if we have a live frame available, show it immediately
-        if self._frame_texture is not None:
-            try:
-                self.preview.set_texture(self._frame_texture)
-            except Exception:
-                pass
 
     # ---------- contents / poller ----------
     def list_all_images(self):
@@ -1625,6 +1699,7 @@ class VolumeToolkitApp(App):
         self._log_internal(f"/ccapi/ver120/contents -> {status}")
         if not status.startswith("200") or not root or "path" not in root:
             return images
+
         for path in root["path"]:
             st_dir, dirs = self._json_call("GET", path, None, timeout=8.0)
             if not st_dir.startswith("200") or not dirs or "path" not in dirs:
@@ -1680,10 +1755,12 @@ class VolumeToolkitApp(App):
                                 new_items = jpgs[new_start_idx:]
                                 for path in new_items:
                                     self._log_internal(f"Poll (bg): New image detected: {path}")
+                                    # only download thumbnails by default
                                     threading.Thread(target=self._download_thumb_for_path, args=(path,), daemon=True).start()
                                     self._last_seen_image = path
             except Exception as e:
                 self._log_internal(f"Poll worker error: {e}")
+
             stop_event = self._poll_thread_stop
             stop_event.wait(self.poll_interval_s)
 
@@ -1698,6 +1775,12 @@ class VolumeToolkitApp(App):
         for line in j.splitlines():
             self._log_internal(line)
         self._log_internal("=== ccapi JSON END ===")
+
+    def _open_csv_filechooser(self):
+        if platform != 'android':
+            self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
+            return
+        return self._open_csv_saf()
 
     def on_stop(self):
         try:
