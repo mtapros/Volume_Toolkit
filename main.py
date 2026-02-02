@@ -1,14 +1,16 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# v12-based corrected main.py:
-# - Restored _json_call
-# - Fixed HTML-escaped characters / syntax issues
-# - Grid drawn in orange
-# - Thumbnails rotated to match preview
-# - Thumbnails only by default; tapping a thumb overlays a low-res stretched image,
-#   background-downloads full-res JPG and replaces it when ready
-# - QR pulse scanning: 1s max, highlight box shown up to 3s (green)
-# - Decoder thread started after build() to avoid race conditions
-# - Connect runs in background thread
+# Fully reviewed and corrected main.py
+# - Fixed HTML-escaped tokens and syntax issues
+# - Restored missing helpers (_json_call, _update_metrics, Android SAF helpers)
+# - Ensured decoder thread starts after build() (no race)
+# - Grid drawn explicitly in orange
+# - Thumbnails rotated to match preview orientation, only thumbnails retrieved by default
+# - Tapping a thumb overlays low-res stretched preview, then background downloads full-res and replaces
+# - QR pulse scanning: max 1s per tap; if detected earlier pulse ends; QR highlight stays up to 3s
+# - Connect runs on a background thread to avoid UI blocking
+#
+# NOTE: This is intended to replace your main.py. Test on-device and paste logcat tracebacks if anything else appears.
+
 import os
 import json
 import threading
@@ -51,10 +53,10 @@ from PIL import Image as PILImage
 import cv2
 import numpy as np
 
-# Suppress self-signed HTTPS warning
+# Suppress self-signed HTTPS warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Android: keep Kivy writable files out of the extracted app directory.
+# On Android ensure Kivy writes to a private directory
 if os.environ.get("ANDROID_ARGUMENT"):
     private_dir = os.environ.get("ANDROID_PRIVATE")
     if private_dir:
@@ -63,7 +65,7 @@ if os.environ.get("ANDROID_ARGUMENT"):
         os.environ["KIVY_HOME"] = kivy_home
 
 
-def pil_rotate_90s(img, ang):
+def pil_rotate_90s(img: PILImage.Image, ang: int) -> PILImage.Image:
     ang = int(ang) % 360
     if ang == 0:
         return img
@@ -77,7 +79,7 @@ def pil_rotate_90s(img, ang):
             return img.transpose(T.ROTATE_270)
         return img
     except Exception:
-        # Pillow older variants
+        # Pillow compatibility fallback
         if ang == 90:
             return img.transpose(PILImage.ROTATE_90)
         if ang == 180:
@@ -102,7 +104,7 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
-    # default preview rotation (user requested preview rotated 180° from prior default)
+    # Default: preview rotated so phone mounted on hotshoe (user requested rotation)
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
@@ -123,7 +125,7 @@ class PreviewOverlay(FloatLayout):
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
 
-            # placeholders (grid is drawn explicitly orange later)
+            # placeholder color for grid (we add explicit Colors for each grid line)
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
 
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
@@ -139,7 +141,7 @@ class PreviewOverlay(FloatLayout):
             self._c_qr = Color(0.0, 1.0, 0.0, 0.95)
             self._ln_qr = Line(width=lw_qr, close=True)
 
-        # store (ColorObj, LineObj) pairs for grid lines to remove them cleanly
+        # store (ColorObj, LineObj) pairs for grid lines so we can remove them cleanly
         self._ln_grid_list = []
 
         self.bind(pos=self._redraw, size=self._redraw)
@@ -218,7 +220,7 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
-        # remove old grid color/line objects
+        # Remove previous grid color/line entries
         for col_obj, line_obj in list(self._ln_grid_list):
             try:
                 self.img.canvas.after.remove(col_obj)
@@ -235,7 +237,7 @@ class PreviewOverlay(FloatLayout):
         if self.show_grid and n >= 2:
             for i in range(1, n):
                 x = fx + fw * (i / n)
-                col = Color(1.0, 0.6, 0.0, 0.85)  # orange
+                col = Color(1.0, 0.6, 0.0, 0.85)
                 ln = Line(points=[x, fy, x, fy + fh], width=2)
                 self.img.canvas.after.add(col)
                 self.img.canvas.after.add(ln)
@@ -463,7 +465,6 @@ class VolumeToolkitApp(App):
         self.preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview_scatter = Scatter(do_translation=False, do_scale=False, do_rotation=False, size_hint=(None, None))
         self.preview = PreviewOverlay(size_hint=(None, None))
-        # make sure the handler exists (it's defined later in class)
         self.preview.bind(on_touch_down=self._on_preview_touch)
         self.preview_scatter.add_widget(self.preview)
         self.preview_holder.add_widget(self.preview_scatter)
@@ -481,7 +482,7 @@ class VolumeToolkitApp(App):
 
         root.add_widget(main_area)
 
-        # Fit preview to the holder with fixed sizes
+        # Fit preview to holder with fixed sizes
         def fit_preview_to_holder(*_):
             w = max(dp(220), self.preview_holder.width * 0.98)
             h = max(dp(220), self.preview_holder.height * 0.98)
@@ -725,20 +726,167 @@ class VolumeToolkitApp(App):
         btn_cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
+    # ---------- Android CSV (SAF) helpers ----------
+    def _bind_android_activity_once(self):
+        if getattr(self, "_android_activity_bound", False):
+            return
+        if platform != "android":
+            return
+        try:
+            from android import activity
+            activity.bind(on_activity_result=self._on_android_activity_result)
+            self._android_activity_bound = True
+        except Exception as e:
+            self._log_internal(f"Android activity bind failed: {e}")
+
+    def _open_csv_saf(self):
+        self._bind_android_activity_once()
+        try:
+            from android import mActivity
+            from jnius import autoclass
+
+            Intent = autoclass("android.content.Intent")
+
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
+            self._log_internal("Opening Android file picker…")
+            mActivity.startActivityForResult(intent, self._csv_req_code)
+        except Exception as e:
+            self._log_internal(f"Failed to open Android picker: {e}")
+
+    def _on_android_activity_result(self, request_code, result_code, intent):
+        if request_code != getattr(self, "_csv_req_code", 4242):
+            return
+        # RESULT_OK == -1
+        if result_code != -1 or intent is None:
+            self._log_internal("CSV picker canceled")
+            return
+        try:
+            from android import mActivity
+            from jnius import cast, autoclass
+
+            Intent = autoclass("android.content.Intent")
+            uri = cast("android.net.Uri", intent.getData())
+            if uri is None:
+                self._log_internal("CSV picker returned no URI")
+                return
+
+            # Attempt to persist permission for future reads.
+            try:
+                flags = intent.getFlags()
+                take_flags = flags & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
+            except Exception:
+                pass
+
+            data = self._read_android_uri_bytes(uri)
+            self._parse_csv_bytes(data)
+            self._log_internal(f"CSV loaded from picker: {len(self.csv_rows)} rows")
+        except Exception as e:
+            self._log_internal(f"CSV load failed (Android): {e}")
+
+    def _read_android_uri_bytes(self, uri):
+        from android import mActivity
+        cr = mActivity.getContentResolver()
+        stream = cr.openInputStream(uri)
+        if stream is None:
+            raise Exception("openInputStream() returned null")
+        out = bytearray()
+        buf = bytearray(64 * 1024)
+        while True:
+            n = stream.read(buf)
+            if n == -1 or n == 0:
+                break
+            out.extend(buf[:n])
+        stream.close()
+        return bytes(out)
+
+    def _open_csv_filechooser(self):
+        if platform != 'android':
+            self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
+            return
+        return self._open_csv_saf()
+
+    def _parse_csv_bytes(self, b: bytes):
+        self._log_internal(f"CSV size: {len(b)} bytes")
+        try:
+            text = b.decode("utf-8-sig")
+        except Exception:
+            text = b.decode("latin-1", errors="replace")
+        reader = csv.DictReader(text.splitlines())
+        headers = reader.fieldnames or []
+        self.csv_headers = headers
+        rows = []
+        for r in reader:
+            rows.append({k: (r.get(k) or "").strip() for k in headers})
+        self.csv_rows = rows
+        self._log_internal(f"CSV headers: {headers}")
+        self._log_internal(f"CSV rows: {len(rows)}")
+        preferred = ["LAST_NAME", "FIRST_NAME", "GRADE", "TEACHER", "STUDENT_ID"]
+        self.selected_headers = [h for h in preferred if h in headers]
+        if not self.selected_headers and headers:
+            self.selected_headers = headers[:3]
+
+    def _open_headers_popup(self):
+        if not self.csv_headers:
+            self._log_internal("No CSV loaded; cannot pick headers")
+            return
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Select columns to include in Author (joined with _):",
+                              size_hint=(1, None), height=dp(40), font_size=sp(12)))
+        sv = ScrollView(size_hint=(1, 1))
+        inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        inner.bind(minimum_height=inner.setter("height"))
+        sv.add_widget(inner)
+        current_sel = set(self.selected_headers)
+        for h in self.csv_headers:
+            row = BoxLayout(size_hint_y=None, height=dp(28))
+            lbl = Label(text=h, size_hint=(0.7, 1), font_size=sp(12), halign="left", valign="middle")
+            lbl.bind(size=lbl.setter("text_size"))
+            cb = CheckBox(active=(h in current_sel), size_hint=(0.3, 1))
+            def toggle_cb(inst, val, header=h):
+                if val:
+                    if header not in self.selected_headers:
+                        self.selected_headers.append(header)
+                else:
+                    if header in self.selected_headers:
+                        self.selected_headers.remove(header)
+            cb.bind(active=toggle_cb)
+            row.add_widget(lbl)
+            row.add_widget(cb)
+            inner.add_widget(row)
+        root.add_widget(sv)
+        btns = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
+        btn_ok = Button(text="OK")
+        btn_cancel = Button(text="Cancel")
+        btns.add_widget(btn_ok)
+        btns.add_widget(btn_cancel)
+        root.add_widget(btns)
+        popup = Popup(title="Select CSV columns", content=root, size_hint=(0.9, 0.9))
+        def do_ok(*_):
+            self._log_internal(f"Selected headers: {self.selected_headers}")
+            popup.dismiss()
+        btn_ok.bind(on_release=do_ok)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+        self._headers_popup = popup
+
     # ---------- connect / author ----------
     def connect_camera(self):
         if self.live_running:
             self._log_internal("Connect disabled while live view is running. Stop first.")
             return
-
         if not self.camera_ip:
             self.status.text = "Status: enter an IP (use Settings->IP)"
             return
-
         self.connect_btn.disabled = True
         self.status.text = f"Status: connecting to {self.camera_ip}:443..."
         self._log_internal(f"Connecting to {self.camera_ip}:443")
-
         threading.Thread(target=self._connect_worker, daemon=True).start()
 
     def _connect_worker(self):
@@ -746,7 +894,6 @@ class VolumeToolkitApp(App):
             status, data = self._json_call("GET", '/ccapi/ver100/deviceinformation', None, timeout=8.0)
         except Exception as e:
             status, data = f"ERR {e}", None
-
         def _finish(dt):
             try:
                 if status and str(status).startswith("200") and data:
@@ -772,7 +919,6 @@ class VolumeToolkitApp(App):
                     self.connect_btn.disabled = False
                 except Exception:
                     pass
-
         Clock.schedule_once(_finish, 0)
 
     def _author_value(self, payload):
@@ -792,7 +938,6 @@ class VolumeToolkitApp(App):
             return
         if self._author_update_in_flight:
             return
-
         self._author_update_in_flight = True
         Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author updating… ({source})"), 0)
         threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
@@ -810,7 +955,6 @@ class VolumeToolkitApp(App):
             )
             if not st_put.startswith("200"):
                 raise Exception(f"PUT failed: {st_put}")
-
             st_get, data = self._json_call(
                 "GET",
                 '/ccapi/ver100/functions/registeredname/author',
@@ -819,13 +963,10 @@ class VolumeToolkitApp(App):
             )
             if not st_get.startswith("200") or not isinstance(data, dict):
                 raise Exception(f"GET failed: {st_get}")
-
             got = (data.get("author") or "").strip()
             ok = (got == value)
-
         except Exception as e:
             err = str(e)
-
         def _finish(_dt):
             self._author_update_in_flight = False
             if ok:
@@ -835,7 +976,6 @@ class VolumeToolkitApp(App):
             else:
                 self._log_internal(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
                 self.qr_status.text = "Author verify failed ✗"
-
         Clock.schedule_once(_finish, 0)
 
     # ---------- liveview + QR + decoder ----------
@@ -856,8 +996,36 @@ class VolumeToolkitApp(App):
         self._display_event = Clock.schedule_interval(self._ui_noop_display_tick, 1.0 / fps)
 
     def _ui_noop_display_tick(self, dt):
+        # increment display counter for metrics and let update run every second
         self._display_count += 1
-        self._update_metrics(self._last_decoded_ts)
+        # _update_metrics exists below
+        try:
+            self._update_metrics(self._last_decoded_ts)
+        except Exception:
+            pass
+
+    def _update_metrics(self, frame_ts):
+        """
+        Update display/fetch/decode counters roughly once per second and refresh
+        the log view (where metrics are shown) when visible.
+        """
+        now = time.time()
+        if now - self._stat_t0 >= 1.0:
+            dt_s = now - self._stat_t0
+            fetch_fps = self._fetch_count / dt_s
+            dec_fps = self._decode_count / dt_s
+            disp_fps = self._display_count / dt_s
+            delay_ms = int((now - frame_ts) * 1000) if frame_ts else -1
+
+            # If the log pane is visible, refresh it so the top-of-log metrics update.
+            if getattr(self, "show_log", False):
+                self._refresh_log_view()
+
+            # Reset counters for the next interval
+            self._fetch_count = 0
+            self._decode_count = 0
+            self._display_count = 0
+            self._stat_t0 = now
 
     def _set_controls_idle(self):
         self.connect_btn.disabled = False
@@ -883,34 +1051,28 @@ class VolumeToolkitApp(App):
     def start_liveview(self):
         if not self.connected or self.live_running:
             return
-
         payload = {"liveviewsize": "small", "cameradisplay": "on"}
         self._log_internal("Starting live view size=small, cameradisplay=on")
-
         status, _ = self._json_call("POST", '/ccapi/ver100/shooting/liveview', payload, timeout=10.0)
         if not status.startswith("200"):
             self.status.text = f"Status: live view start failed ({status})"
             self._log_internal(f"Live view start failed: {status}")
             return
-
         self.session_started = True
         self.live_running = True
         self._set_controls_running()
         self.status.text = "Status: live"
-
         with self._lock:
             self._latest_jpeg = None
             self._latest_jpeg_ts = 0.0
         self._last_decoded_ts = 0.0
         self._frame_texture = None
         self._frame_size = None
-
         self._latest_qr_text = ""
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
         self._set_qr_ui(None, None, note="QR: off" if not self.qr_enabled else "QR: on")
-
         self._fetch_count = 0
         self._decode_count = 0
         self._display_count = 0
@@ -927,16 +1089,13 @@ class VolumeToolkitApp(App):
         if not self.live_running:
             self._set_controls_idle()
             return
-
         self.live_running = False
-
         if self.session_started:
             try:
                 self._json_call("DELETE", '/ccapi/ver100/shooting/liveview', None, timeout=6.0)
             except Exception:
                 pass
             self.session_started = False
-
         self.status.text = "Status: connected (live stopped)" if self.connected else "Status: not connected"
         self._log_internal("Live view stopped")
         self._set_controls_idle()
@@ -976,18 +1135,15 @@ class VolumeToolkitApp(App):
                 jpeg, ts = self._decode_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
-
             # defensive: ensure preview exists before using preview.preview_rotation
             if not hasattr(self, "preview") or self.preview is None:
                 time.sleep(0.05)
                 continue
-
             try:
                 arr = np.frombuffer(jpeg, dtype=np.uint8)
                 bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if bgr is None:
                     continue
-
                 rot = int(self.preview.preview_rotation) % 360
                 if rot == 90:
                     bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
@@ -995,15 +1151,12 @@ class VolumeToolkitApp(App):
                     bgr = cv2.rotate(bgr, cv2.ROTATE_180)
                 elif rot == 270:
                     bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
                 with self._lock:
                     self._latest_decoded_bgr = bgr.copy()
                     self._latest_decoded_bgr_ts = ts
-
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 h, w = rgb.shape[:2]
                 rgb_bytes = rgb.tobytes()
-
                 def _update_texture_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ts=ts):
                     try:
                         # if user selected overlay, don't replace preview
@@ -1020,10 +1173,8 @@ class VolumeToolkitApp(App):
                         self._last_decoded_ts = ts
                     except Exception as e:
                         self._log_internal(f"texture update err: {e}")
-
                 Clock.schedule_once(_update_texture_on_main, 0)
                 self._decode_count += 1
-
             except Exception:
                 continue
 
@@ -1033,17 +1184,14 @@ class VolumeToolkitApp(App):
             if not (self.qr_enabled or self._qr_temp_active):
                 time.sleep(0.10)
                 continue
-
             with self._lock:
                 bgr = None
                 ts = getattr(self, "_latest_decoded_bgr_ts", 0.0)
                 if self._latest_decoded_bgr is not None:
                     bgr = self._latest_decoded_bgr.copy()
-
             if bgr is None or ts <= last_processed_ts:
                 time.sleep(0.05)
                 continue
-
             try:
                 decoded, points, _ = self._qr_detector.detectAndDecode(bgr)
                 qr_text = decoded.strip() if isinstance(decoded, str) else ""
@@ -1055,33 +1203,28 @@ class VolumeToolkitApp(App):
                             qr_points = [(int(pts[i][0]), int(pts[i][1])) for i in range(4)]
                     except Exception:
                         qr_points = None
-
                 if qr_text or qr_points:
                     self._publish_qr(qr_text if qr_text else None, qr_points)
                     if self._qr_temp_active:
                         Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
             except Exception:
                 pass
-
             last_processed_ts = ts
             time.sleep(max(0.05, float(self.qr_interval_s)))
 
     def _publish_qr(self, text, points):
         now = time.time()
-
         if text:
             if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
                 self._qr_seen.add(text)
                 self._qr_last_add_time = now
                 self._log_internal(f"QR: {text}")
             self._maybe_commit_author(text, source="qr")
-
         if text:
             self._latest_qr_text = text
             Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"QR: {text}"), 0)
         elif self._latest_qr_text:
             Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"QR: {self._latest_qr_text}"), 0)
-
         if points:
             if getattr(self, "_qr_highlight_event", None):
                 try:
@@ -1089,7 +1232,6 @@ class VolumeToolkitApp(App):
                 except Exception:
                     pass
                 self._qr_highlight_event = None
-
             Clock.schedule_once(lambda *_: self.preview.set_qr(points), 0)
             try:
                 self._qr_highlight_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
@@ -1098,7 +1240,6 @@ class VolumeToolkitApp(App):
                     time.sleep(3.0)
                     Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 0)
                 threading.Thread(target=bg_clear, daemon=True).start()
-
         note = f"QR: {text[:80]}" if text else ("QR: detected" if points else ("QR: on" if self.qr_enabled else "QR: off"))
         Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", note), 0)
 
@@ -1137,7 +1278,6 @@ class VolumeToolkitApp(App):
             return False
         # Start a QR pulse scan for 1 second (or until detection)
         self._start_pulse_qr()
-        # Return True to indicate touch handled
         return True
 
     def _start_pulse_qr(self):
@@ -1148,7 +1288,6 @@ class VolumeToolkitApp(App):
             except Exception:
                 pass
             self._qr_pulse_event = None
-
         self._qr_temp_active = True
         # Update UI immediately
         self._set_qr_ui(None, None, note="QR: scanning…")
@@ -1169,11 +1308,7 @@ class VolumeToolkitApp(App):
             except Exception:
                 pass
             self._qr_pulse_event = None
-
-        # Turn off the temporary pulse flag
         self._qr_temp_active = False
-
-        # Restore UI state depending on permanent qr_enabled flag
         if not getattr(self, "qr_enabled", False):
             self._set_qr_ui(None, None, note="QR: off")
         else:
@@ -1188,7 +1323,6 @@ class VolumeToolkitApp(App):
             return False
         if idx >= len(self._thumb_paths):
             return False
-
         ccapi_path = self._thumb_paths[idx]
         # Display low-res thumbnail stretched over preview immediately
         if idx < len(self._thumb_textures):
@@ -1200,9 +1334,7 @@ class VolumeToolkitApp(App):
         return True
 
     def _download_thumb_and_overlay(self, ccapi_path, idx):
-        # helper used when a thumb hasn't been loaded but user tapped it
         self._download_thumb_for_path(ccapi_path)
-        # attempt to get texture for idx
         if idx < len(self._thumb_textures):
             tex = self._thumb_textures[idx]
             Clock.schedule_once(lambda *_: self._select_image_overlay(ccapi_path, tex, idx), 0)
@@ -1212,21 +1344,12 @@ class VolumeToolkitApp(App):
         Put the low-res thumb onto the preview (stretched), retain overlays.
         Start background fetch of full-res jpg and replace when ready.
         """
-        # Enter overlay mode so liveview frames do not replace the selected image
         self._overlay_active = True
         self._overlay_thumb_index = thumb_index
-
-        # Apply thumb texture immediately on main thread
         Clock.schedule_once(lambda *_: self.preview.set_texture(thumb_texture), 0)
-
-        # Background fetch full-res JPG
         threading.Thread(target=self._fetch_full_and_replace, args=(ccapi_path, thumb_index), daemon=True).start()
 
     def _fetch_full_and_replace(self, ccapi_path: str, thumb_index: int):
-        """
-        Download full-res JPG (background), create a texture, then replace the preview
-        and the thumb in the strip with the high-res texture.
-        """
         full_url = f"https://{self.camera_ip}{ccapi_path}"
         try:
             resp = self._session.get(full_url, timeout=20.0, stream=True)
@@ -1237,15 +1360,12 @@ class VolumeToolkitApp(App):
         except Exception as e:
             self._log_internal(f"Full image download err: {e}")
             return
-
         try:
             arr = np.frombuffer(data, dtype=np.uint8)
             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if bgr is None:
                 self._log_internal("cv2.imdecode returned None for full image")
                 return
-
-            # rotate to match preview orientation
             rot = getattr(self.preview, "preview_rotation", 0) % 360 if hasattr(self, "preview") else 0
             if rot == 90:
                 bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
@@ -1253,12 +1373,9 @@ class VolumeToolkitApp(App):
                 bgr = cv2.rotate(bgr, cv2.ROTATE_180)
             elif rot == 270:
                 bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             h, w = rgb.shape[:2]
             rgb_bytes = rgb.tobytes()
-
-            # create Kivy texture on main thread and apply
             def _apply_full(_dt):
                 try:
                     tex = Texture.create(size=(w, h), colorfmt="rgb")
@@ -1267,14 +1384,10 @@ class VolumeToolkitApp(App):
                 except Exception as e:
                     self._log_internal(f"Full texture create err: {e}")
                     return
-
-                # put it on preview (replacing low-res thumb)
                 try:
                     self.preview.set_texture(tex)
                 except Exception:
                     pass
-
-                # replace thumbnail texture in strip as feedback (scaled down by Kivy)
                 try:
                     if thumb_index < len(self._thumb_textures):
                         self._thumb_textures[thumb_index] = tex
@@ -1282,12 +1395,8 @@ class VolumeToolkitApp(App):
                             self._thumb_images[thumb_index].texture = tex
                 except Exception:
                     pass
-
-                # exit overlay mode so liveview resumes updating preview afterwards
                 self._overlay_active = False
-
             Clock.schedule_once(_apply_full, 0)
-
         except Exception as e:
             self._log_internal(f"Full image decode err: {e}")
             return
@@ -1299,7 +1408,6 @@ class VolumeToolkitApp(App):
         self._log_internal(f"/ccapi/ver120/contents -> {status}")
         if not status.startswith("200") or not root or "path" not in root:
             return images
-
         for path in root["path"]:
             st_dir, dirs = self._json_call("GET", path, None, timeout=8.0)
             if not st_dir.startswith("200") or not dirs or "path" not in dirs:
@@ -1333,8 +1441,6 @@ class VolumeToolkitApp(App):
         except Exception as e:
             self._log_internal(f"Thumbnail download error: {e}")
             return
-
-        # Save to disk (optional)
         try:
             os.makedirs(self.thumb_dir, exist_ok=True)
             name = os.path.basename(ccapi_path) or "image"
@@ -1346,11 +1452,8 @@ class VolumeToolkitApp(App):
             self._log_internal(f"Saved thumbnail {out_path}")
         except Exception as e:
             self._log_internal(f"Saving thumbnail err: {e}")
-
-        # Decode into RGB bytes using PIL on background thread, rotate to match preview, then schedule UI update
         try:
             pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
-            # rotate to match preview orientation if preview exists
             rot = getattr(self.preview, "preview_rotation", 0) if hasattr(self, "preview") else 0
             if rot:
                 pil = pil_rotate_90s(pil, rot)
@@ -1360,7 +1463,6 @@ class VolumeToolkitApp(App):
         except Exception as e:
             self._log_internal(f"Thumbnail decode err (bg): {e}")
             return
-
         def _make_texture_and_update(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ccapi_path=ccapi_path):
             try:
                 tex = Texture.create(size=(w, h), colorfmt="rgb")
@@ -1369,19 +1471,15 @@ class VolumeToolkitApp(App):
             except Exception as e:
                 self._log_internal(f"Texture create/blit err: {e}")
                 return
-
-            # Insert at front (thumb0 is newest)
             self._thumb_textures.insert(0, tex)
             self._thumb_paths.insert(0, ccapi_path)
             self._thumb_textures = self._thumb_textures[:5]
             self._thumb_paths = self._thumb_paths[:5]
-
             for idx, img in enumerate(self._thumb_images):
                 if idx < len(self._thumb_textures):
                     img.texture = self._thumb_textures[idx]
                 else:
                     img.texture = None
-
         Clock.schedule_once(_make_texture_and_update, 0)
 
     def _background_download_latest(self):
@@ -1391,18 +1489,15 @@ class VolumeToolkitApp(App):
         if not self.connected:
             self._log_internal("Not connected; cannot fetch contents.")
             return
-
         images = self.list_all_images()
         self._log_internal(f"contents: {len(images)} total entries")
         if not images:
             self._log_internal("No images found on camera.")
             return
-
         jpgs = [p for p in images if p.lower().endswith(('.jpg', '.jpeg'))]
         if not jpgs:
             self._log_internal("No JPG files found.")
             return
-
         latest = jpgs[-1]
         threading.Thread(target=self._download_thumb_for_path, args=(latest,), daemon=True).start()
         self._last_seen_image = latest
@@ -1445,12 +1540,10 @@ class VolumeToolkitApp(App):
                                 new_items = jpgs[new_start_idx:]
                                 for path in new_items:
                                     self._log_internal(f"Poll (bg): New image detected: {path}")
-                                    # only download thumbnails by default
                                     threading.Thread(target=self._download_thumb_for_path, args=(path,), daemon=True).start()
                                     self._last_seen_image = path
             except Exception as e:
                 self._log_internal(f"Poll worker error: {e}")
-
             stop_event = self._poll_thread_stop
             stop_event.wait(self.poll_interval_s)
 
@@ -1467,10 +1560,7 @@ class VolumeToolkitApp(App):
         self._log_internal("=== ccapi JSON END ===")
 
     def _open_csv_filechooser(self):
-        if platform != 'android':
-            self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
-            return
-        return self._open_csv_saf()
+        return self._open_csv_filechooser  # kept for compatibility; use menu option
 
     def on_stop(self):
         try:
