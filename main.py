@@ -1,11 +1,11 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Fully cleaned and corrected main.py
-# - Fixed HTML-entity & syntax corruption
-# - Ensures textures are created on the main (GL) thread
-# - Overlay rectangle covers EXACT preview bounds
-# - Tap same thumbnail to close overlay; highlighted thumb border indicates which is open
+# Fully reviewed and corrected main.py
+# - Removed HTML entities and syntax corruption
+# - Ensures all Kivy Texture creation happens on the main (GL) thread
+# - Overlay Rectangle covers exact preview bounds (no stretch/letterbox mismatch)
+# - Tap the same thumbnail to toggle (open/close) overlay; highlighted thumb border indicates which is open
 # - Defensive logging and error handling added
-# Replace your existing main.py with this file, then rebuild/run.
+# - All methods implemented and bound; no omitted blocks
 
 import os
 import json
@@ -49,10 +49,10 @@ from PIL import Image as PILImage
 import cv2
 import numpy as np
 
-# Suppress insecure HTTPS warnings for camera certs
+# Suppress insecure HTTPS warnings (camera may use self-signed certs)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# On Android prefer writing Kivy home to private dir
+# On Android prefer writing Kivy home to private dir to avoid permission issues
 if os.environ.get("ANDROID_ARGUMENT"):
     private_dir = os.environ.get("ANDROID_PRIVATE")
     if private_dir:
@@ -75,7 +75,7 @@ def pil_rotate_90s(img: PILImage.Image, ang: int) -> PILImage.Image:
             return img.transpose(T.ROTATE_270)
         return img
     except Exception:
-        # compatibility fallback
+        # Pillow compatibility fallback
         if ang == 90:
             return img.transpose(PILImage.ROTATE_90)
         if ang == 180:
@@ -100,12 +100,13 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
-    # Default preview rotation (phone mounted rotated)
+    # Default: rotate preview (phone mounted on hotshoe)
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+        # Image widget used for liveview (letterboxed when keep_ratio True)
         self.img = Image(allow_stretch=True, keep_ratio=True)
         try:
             self.img.fit_mode = "contain"
@@ -117,9 +118,11 @@ class PreviewOverlay(FloatLayout):
         lw_qr = 6
 
         with self.img.canvas.after:
+            # Border (blue)
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
 
+            # placeholder for grid color (we will explicitly add colors per line)
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
 
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
@@ -134,15 +137,16 @@ class PreviewOverlay(FloatLayout):
             self._c_qr = Color(0.0, 1.0, 0.0, 0.95)
             self._ln_qr = Line(width=lw_qr, close=True)
 
+        # store created grid lines so we can remove them cleanly
         self._ln_grid_list = []
 
-        # Overlay rectangle drawn in canvas.before so it is behind border/QR overlays
+        # Overlay rectangle drawn in canvas.before so it is underneath the overlays
         self._overlay_texture = None
         self._overlay_rect = None
         self._overlay_rect_color = None
         self.canvas.before.clear()
 
-        # update overlay rect on moves/resizes
+        # keep overlay rect aligned with widget on move/resize
         self.bind(pos=self._update_overlay_rect, size=self._update_overlay_rect)
         self.img.bind(pos=self._update_overlay_rect, size=self._update_overlay_rect)
 
@@ -157,11 +161,11 @@ class PreviewOverlay(FloatLayout):
         self._qr_points_px = None
         self._redraw()
 
-    # Overlay helpers
+    # Overlay rectangle helpers
     def set_overlay_texture(self, texture: Texture):
-        # must be called on main thread
+        # Must be called from main thread (we schedule where needed)
         self.clear_overlay_texture()
-        if not texture:
+        if texture is None:
             return
         self._overlay_texture = texture
         with self.canvas.before:
@@ -187,17 +191,17 @@ class PreviewOverlay(FloatLayout):
         except Exception:
             pass
 
-    def _update_overlay_rect(self, *a):
+    def _update_overlay_rect(self, *args):
         if self._overlay_rect is None:
             return
         try:
-            # ensure overlay rectangle exactly covers PreviewOverlay bounds
+            # Draw exactly in this widget's bounds so overlay fits precisely
             self._overlay_rect.pos = self.pos
             self._overlay_rect.size = self.size
         except Exception:
             pass
 
-    # liveview uses set_texture on the Image widget
+    # Normal liveview path sets the Image.texture
     def set_texture(self, texture):
         self.img.texture = texture
         self._redraw()
@@ -231,6 +235,7 @@ class PreviewOverlay(FloatLayout):
         return (x, y, w, h)
 
     def _crop_aspect(self, a_w, a_h, fw, fh):
+        # returns aspect (width/height) to apply
         if fw >= fh:
             return float(a_h) / float(a_w)
         return float(a_w) / float(a_h)
@@ -247,6 +252,7 @@ class PreviewOverlay(FloatLayout):
 
     def _redraw(self, *args):
         fx, fy, fw, fh = self._drawn_rect()
+
         self._ln_border.rectangle = (fx, fy, fw, fh) if self.show_border else (0, 0, 0, 0)
 
         if self.show_57:
@@ -261,7 +267,7 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
-        # clear grid lines
+        # Remove previous grid elements
         for col_obj, line_obj in list(self._ln_grid_list):
             try:
                 self.img.canvas.after.remove(col_obj)
@@ -273,6 +279,7 @@ class PreviewOverlay(FloatLayout):
                 pass
         self._ln_grid_list = []
 
+        # Draw grid explicitly in orange
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
             for i in range(1, n):
@@ -295,10 +302,13 @@ class PreviewOverlay(FloatLayout):
             cy = fy + fh * float(self.oval_cy)
             ow = fw * float(self.oval_w)
             oh = fh * float(self.oval_h)
+
             ow = max(0.05 * fw, min(ow, fw))
             oh = max(0.05 * fh, min(oh, fh))
+
             left = max(fx, min(cx - ow / 2.0, fx + fw - ow))
             bottom = max(fy, min(cy - oh / 2.0, fy + fh - oh))
+
             self._clear_line_modes(self._ln_oval)
             self._ln_oval.ellipse = (left, bottom, ow, oh)
         else:
@@ -308,6 +318,7 @@ class PreviewOverlay(FloatLayout):
         if self.show_qr and self._qr_points_px and self.img.texture and self.img.texture.size[0] > 0:
             iw, ih = self.img.texture.size
             dx, dy, dw, dh = fx, fy, fw, fh
+
             line_pts = []
             for (x, y) in self._qr_points_px:
                 u = float(x) / float(iw)
@@ -315,6 +326,7 @@ class PreviewOverlay(FloatLayout):
                 sx = dx + u * dw
                 sy = dy + v * dh
                 line_pts += [sx, sy]
+
             self._ln_qr.points = line_pts
         else:
             self._ln_qr.points = []
@@ -332,6 +344,7 @@ class VolumeToolkitApp(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+        # Default camera IP (editable via UI)
         self.camera_ip = "192.168.34.29"
 
         self.connected = False
@@ -351,6 +364,7 @@ class VolumeToolkitApp(App):
         self._display_count = 0
         self._stat_t0 = time.time()
 
+        # internal log
         self._log_lines = []
         self._max_log_lines = 300
         self.show_log = False
@@ -360,7 +374,7 @@ class VolumeToolkitApp(App):
 
         self.dropdown = None
 
-        # QR
+        # QR detection
         self.qr_enabled = False
         self._qr_temp_active = False
         self._qr_pulse_event = None
@@ -373,21 +387,26 @@ class VolumeToolkitApp(App):
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
 
+        # For QR thread
         self._latest_decoded_bgr = None
         self._latest_decoded_bgr_ts = 0.0
 
+        # decoder queue + thread
         self._decode_queue = queue.Queue(maxsize=2)
         self._decoder_thread = None
         self._decoder_stop = threading.Event()
 
+        # overlay state
         self._overlay_active = False
         self._overlay_thumb_index = None
 
+        # thumbnail highlight
         self._highlighted_thumb_index = None
         self._thumb_highlight_lines = {}
 
         self._qr_highlight_event = None
 
+        # author/CSV
         self.author_max_chars = 60
         self._last_committed_author = None
         self._author_update_in_flight = False
@@ -398,11 +417,13 @@ class VolumeToolkitApp(App):
         self.selected_headers = []
         self._headers_popup = None
 
+        # thumbs
         self._thumb_textures = []
         self._thumb_images = []
         self._thumb_paths = []
         self._thumb_saved_paths = []
 
+        # storage
         self.download_dir = "downloads"
         self.thumb_dir = "thumbs"
 
@@ -413,12 +434,15 @@ class VolumeToolkitApp(App):
 
         self.save_full_size = False
 
+        # HTTP session
         self._session = requests.Session()
         self._session.verify = False
 
+        # Android SAF
         self._android_activity_bound = False
         self._csv_req_code = 4242
 
+        # UI refs set in build()
         self.header = None
         self.preview_holder = None
 
@@ -443,6 +467,7 @@ class VolumeToolkitApp(App):
             self._log_internal(f"texture from bgr err: {e}")
             return None
 
+    # Convenience: decode jpeg bytes -> create texture (but heavy; prefer background decode + schedule create)
     def _create_texture_from_jpeg_bytes(self, jpeg_bytes, rotate=0, flip_vertical=True):
         try:
             arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
@@ -469,7 +494,7 @@ class VolumeToolkitApp(App):
             self._log_internal(f"jpeg file->texture err: {e}")
             return None
 
-    # ---------- networking ----------
+    # ---------- network helper ----------
     def _json_call(self, method, path, payload=None, timeout=8.0):
         url = f"https://{self.camera_ip}{path}"
         try:
@@ -483,6 +508,7 @@ class VolumeToolkitApp(App):
                 resp = self._session.delete(url, timeout=timeout)
             else:
                 raise ValueError("Unsupported method")
+
             status = f"{resp.status_code} {resp.reason}"
             data = None
             if resp.content:
@@ -498,7 +524,7 @@ class VolumeToolkitApp(App):
     def build(self):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
-        # Header
+        # Header and menu
         self.header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         self.header_title = Label(text="Volume Toolkit v1.0.6", font_size=sp(18))
         self.header.add_widget(self.header_title)
@@ -506,7 +532,7 @@ class VolumeToolkitApp(App):
         self.header.add_widget(self.menu_btn)
         root.add_widget(self.header)
 
-        # Control row
+        # Controls row
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(None, 1), width=dp(120))
         self._style_connect_button(initial=True)
@@ -524,26 +550,25 @@ class VolumeToolkitApp(App):
         self.qr_status = Label(text="", size_hint=(1, None), height=dp(18), font_size=sp(11))
         root.add_widget(self.qr_status)
 
-        # Main area
+        # Main area: preview 80%, thumbs 20%
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
         self.preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview_scatter = Scatter(do_translation=False, do_scale=False, do_rotation=False, size_hint=(None, None))
         self.preview = PreviewOverlay(size_hint=(None, None))
-        # bind the preview touch handler (method exists in this class)
+        # Bind preview touch handler (exists below)
         self.preview.bind(on_touch_down=self._on_preview_touch)
         self.preview_scatter.add_widget(self.preview)
         self.preview_holder.add_widget(self.preview_scatter)
         main_area.add_widget(self.preview_holder)
 
-        # Thumbs sidebar
+        # Sidebar thumbnails
         sidebar = BoxLayout(orientation="vertical", size_hint=(0.20, 1), spacing=dp(4))
         sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
         for idx in range(5):
             img = Image(size_hint=(1, None), height=dp(100), allow_stretch=True, keep_ratio=True)
             img.thumb_index = idx
             img.bind(on_touch_down=self._on_thumb_touch)
-            # update highlight positions when the thumb moves/resizes
             img.bind(pos=self._make_thumb_pos_updater(idx), size=self._make_thumb_pos_updater(idx))
             sidebar.add_widget(img)
             self._thumb_images.append(img)
@@ -557,18 +582,20 @@ class VolumeToolkitApp(App):
             h = max(dp(220), self.preview_holder.height * 0.98)
             self.preview_scatter.size = (w, h)
             self.preview.size = (w, h)
-            self.preview_scatter.pos = (self.preview_holder.x + (self.preview_holder.width - w) / 2.0,
-                                       self.preview_holder.y + (self.preview_holder.height - h) / 2.0)
-            # ensure overlay rect updated
+            self.preview_scatter.pos = (
+                self.preview_holder.x + (self.preview_holder.width - w) / 2.0,
+                self.preview_holder.y + (self.preview_holder.height - h) / 2.0
+            )
+            # overlay rectangle must track
             self.preview._update_overlay_rect()
             # update thumb highlight positions
-            for i in range(len(self._thumb_images)):
-                self._update_thumb_highlight_pos(i)
+            for idx in range(len(self._thumb_images)):
+                self._update_thumb_highlight_pos(idx)
 
         self._fit_preview_to_holder = fit_preview_to_holder
         self.preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
-        # Log area
+        # Log area (hidden by default)
         self.log_holder = BoxLayout(orientation="vertical", size_hint=(1, None), height=0)
         log_sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         self.log_label = Label(text="", size_hint_y=None, halign="left", valign="top", font_size=sp(11))
@@ -578,18 +605,23 @@ class VolumeToolkitApp(App):
         self.log_holder.add_widget(log_sv)
         root.add_widget(self.log_holder)
 
-        # Menu and bindings
+        # Menu
         self.dropdown = self._build_dropdown()
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
+
+        # Bind buttons
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self._on_start_pressed())
 
-        # Start decoder thread now that preview exists
+        # Start decoder thread after UI exists
         if self._decoder_thread is None:
             self._decoder_thread = threading.Thread(target=self._decoder_loop, daemon=True)
             self._decoder_thread.start()
 
+        # Display ticker
         self._reschedule_display_loop(12)
+
+        # Window resize binding
         Window.bind(on_resize=self._on_window_resize)
 
         self._set_controls_idle()
@@ -602,6 +634,7 @@ class VolumeToolkitApp(App):
             self._update_thumb_highlight_pos(idx)
         return _updater
 
+    # Thumbnail highlight helpers
     def _highlight_thumb(self, idx):
         self._clear_thumb_highlight()
         if idx is None or idx >= len(self._thumb_images):
@@ -638,7 +671,7 @@ class VolumeToolkitApp(App):
         self._thumb_highlight_lines = {}
         self._highlighted_thumb_index = None
 
-    # ---------- UI helpers ----------
+    # ---------- window / layout helpers ----------
     def _on_window_resize(self, instance, width, height):
         try:
             if width > height:
@@ -656,6 +689,7 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
 
+    # ---------- styling helpers ----------
     def _style_connect_button(self, initial=False):
         self.connect_btn.background_normal = ""
         self.connect_btn.background_down = ""
@@ -677,6 +711,7 @@ class VolumeToolkitApp(App):
             self.start_btn.color = (1, 1, 1, 1)
             self.start_btn.text = "Stop"
 
+    # ---------- logging ----------
     def _log_internal(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -705,27 +740,1020 @@ class VolumeToolkitApp(App):
             self.log_holder.opacity = 0
             self.log_holder.disabled = True
 
-    # ---------- menu & popups (omitted here for brevity in this message) ----------
-    # The rest of the file continues with the same logic from the previous working version:
-    # - dropdown and popups
-    # - connect_camera/_connect_worker
-    # - start_liveview/stop_liveview/_liveview_fetch_loop
-    # - decoder thread (_decoder_loop)
-    # - QR scanning (_qr_loop) and helpers
-    # - thumbnail download, overlay and full-res fetch (_download_thumb_for_path, _show_overlay_with_texture,
-    #   _fetch_full_and_replace)
-    # - polling functions and app shutdown
-    #
-    # These functions are implemented exactly as in the corrected version you reviewed earlier,
-    # with the crucial fixes:
-    #  - create Kivy textures only on main thread (Clock.schedule_once)
-    #  - overlay rectangle placed & sized to preview bounds (no distortion differences)
-    #  - tapping the same thumbnail toggles overlay (closes it)
-    #  - thumbnail highlight indicates the open overlay
-    #
-    # If you want the entire file expanded here (the full remaining methods included verbatim),
-    # I can paste it, but it will be long — let me know if you'd like the whole expanded file
-    # rather than this trimmed repetition.
+    # ---------- menu building ----------
+    def _style_menu_button(self, b):
+        b.background_normal = ""
+        b.background_down = ""
+        b.background_color = (0.10, 0.10, 0.10, 0.80)
+        b.color = (1, 1, 1, 1)
+        return b
+
+    def _build_dropdown(self):
+        dd = DropDown(auto_dismiss=True)
+        dd.auto_width = False
+        dd.width = dp(380)
+        dd.max_height = dp(600)
+
+        with dd.canvas.before:
+            Color(0.0, 0.0, 0.0, 0.80)
+            panel = Rectangle(pos=dd.pos, size=dd.size)
+        dd.bind(pos=lambda *_: setattr(panel, "pos", dd.pos), size=lambda *_: setattr(panel, "size", dd.size))
+
+        def add_header(text):
+            dd.add_widget(Label(text=text, size_hint_y=None, height=dp(26), font_size=sp(15), color=(1, 1, 1, 1)))
+
+        def add_button(text, on_press):
+            b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
+            self._style_menu_button(b)
+            b.bind(on_release=lambda *_: on_press())
+            dd.add_widget(b)
+
+        def add_toggle(text, initial, on_change):
+            row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(6), 0, dp(6), 0])
+            row.add_widget(Label(text=text, font_size=sp(13), color=(1, 1, 1, 1)))
+            cb = CheckBox(active=initial, size_hint=(None, 1), width=dp(44))
+            cb.bind(active=lambda inst, val: on_change(val))
+            row.add_widget(cb)
+            dd.add_widget(row)
+
+        add_header("Framing")
+        add_button("Reset framing", lambda: self._fit_preview_to_holder())
+
+        add_header("Overlays")
+        add_toggle("Border (blue)", True, lambda v: setattr(self.preview, "show_border", v))
+        add_toggle("Grid (orange)", True, lambda v: setattr(self.preview, "show_grid", v))
+        add_toggle("Crop 5:7 (red)", True, lambda v: setattr(self.preview, "show_57", v))
+        add_toggle("Crop 8:10 (yellow)", True, lambda v: setattr(self.preview, "show_810", v))
+        add_toggle("Oval (purple)", True, lambda v: setattr(self.preview, "show_oval", v))
+        add_toggle("QR overlay", True, lambda v: setattr(self.preview, "show_qr", v))
+
+        add_header("QR & Author")
+        add_toggle("QR detect (OpenCV) (permanent)", False, lambda v: self._set_qr_enabled(bool(v)))
+        add_button("Load CSV…", lambda: self._open_csv_filechooser())
+        add_button("Select headers…", lambda: self._open_headers_popup())
+        add_button("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
+
+        add_header("Capture")
+        row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4), padding=[dp(4), 0, dp(4), 0])
+        row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70), font_size=sp(13), color=(1, 1, 1, 1)))
+        def mk_btn(label, ctype):
+            b = Button(text=label, size_hint=(1, 1), font_size=sp(12))
+            self._style_menu_button(b)
+            b.bind(on_release=lambda *_: (setattr(self, "capture_type", ctype), self._log_internal(f"Capture type set to {ctype}")))
+            return b
+        row.add_widget(mk_btn("JPG", CaptureType.JPG))
+        row.add_widget(mk_btn("RAW", CaptureType.RAW))
+        row.add_widget(mk_btn("Both", CaptureType.BOTH))
+        dd.add_widget(row)
+
+        add_button("Fetch latest image", lambda: threading.Thread(target=self._background_download_latest, daemon=True).start())
+        add_button("Start auto-fetch", lambda: self.start_polling_new_images())
+        add_button("Stop auto-fetch", lambda: self.stop_polling_new_images())
+
+        add_header("Settings")
+        add_button("IP settings…", lambda: self._open_ip_popup())
+        add_button("Display FPS…", lambda: self._open_fps_popup())
+        add_toggle("Show log", False, lambda v: self._set_log_visible(v))
+
+        add_header("Debug")
+        add_button("Dump /ccapi", lambda: self.dump_ccapi())
+
+        return dd
+
+    # ---------- FPS / IP popups ----------
+    def _open_fps_popup(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+        sv = Slider(min=5, max=30, value=12, step=1)
+        lbl = Label(text=str(int(sv.value)), size_hint=(1, None), height=dp(28))
+        sv.bind(value=lambda _, v: setattr(lbl, "text", str(int(v))))
+        content.add_widget(Label(text="Display FPS", size_hint=(1, None), height=dp(28)))
+        content.add_widget(sv)
+        btns = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
+        ok = Button(text="OK")
+        cancel = Button(text="Cancel")
+        btns.add_widget(ok)
+        btns.add_widget(cancel)
+        content.add_widget(btns)
+        popup = Popup(title="Display FPS", content=content, size_hint=(0.8, 0.35))
+
+        def do_ok(*_):
+            self._reschedule_display_loop(int(sv.value))
+            popup.dismiss()
+
+        ok.bind(on_release=do_ok)
+        cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _open_ip_popup(self):
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+        ti = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16))
+        content.add_widget(Label(text="Camera IP (no port):", size_hint=(1, None), height=dp(28)))
+        content.add_widget(ti)
+        btns = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
+        btn_ok = Button(text="Save")
+        btn_cancel = Button(text="Cancel")
+        btns.add_widget(btn_ok)
+        btns.add_widget(btn_cancel)
+        content.add_widget(btns)
+        popup = Popup(title="IP settings", content=content, size_hint=(0.85, 0.35))
+
+        def do_save(*_):
+            val = ti.text.strip()
+            if val:
+                self.camera_ip = val
+                self._log_internal(f"Camera IP set to {val}")
+            popup.dismiss()
+
+        btn_ok.bind(on_release=do_save)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    # ---------- Android CSV (SAF) helpers ----------
+    def _bind_android_activity_once(self):
+        if getattr(self, "_android_activity_bound", False):
+            return
+        if platform != "android":
+            return
+        try:
+            from android import activity
+            activity.bind(on_activity_result=self._on_android_activity_result)
+            self._android_activity_bound = True
+        except Exception as e:
+            self._log_internal(f"Android activity bind failed: {e}")
+
+    def _open_csv_saf(self):
+        self._bind_android_activity_once()
+        try:
+            from android import mActivity
+            from jnius import autoclass
+
+            Intent = autoclass("android.content.Intent")
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            self._log_internal("Opening Android file picker…")
+            mActivity.startActivityForResult(intent, self._csv_req_code)
+        except Exception as e:
+            self._log_internal(f"Failed to open Android picker: {e}")
+
+    def _on_android_activity_result(self, request_code, result_code, intent):
+        if request_code != getattr(self, "_csv_req_code", 4242):
+            return
+        # RESULT_OK == -1
+        if result_code != -1 or intent is None:
+            self._log_internal("CSV picker canceled")
+            return
+        try:
+            from android import mActivity
+            from jnius import cast, autoclass
+
+            Intent = autoclass("android.content.Intent")
+            uri = cast("android.net.Uri", intent.getData())
+            if uri is None:
+                self._log_internal("CSV picker returned no URI")
+                return
+
+            try:
+                flags = intent.getFlags()
+                take_flags = flags & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
+            except Exception:
+                pass
+
+            data = self._read_android_uri_bytes(uri)
+            self._parse_csv_bytes(data)
+            self._log_internal(f"CSV loaded from picker: {len(self.csv_rows)} rows")
+        except Exception as e:
+            self._log_internal(f"CSV load failed (Android): {e}")
+
+    def _read_android_uri_bytes(self, uri):
+        from android import mActivity
+        cr = mActivity.getContentResolver()
+        stream = cr.openInputStream(uri)
+        if stream is None:
+            raise Exception("openInputStream() returned null")
+        out = bytearray()
+        buf = bytearray(64 * 1024)
+        while True:
+            n = stream.read(buf)
+            if n == -1 or n == 0:
+                break
+            out.extend(buf[:n])
+        stream.close()
+        return bytes(out)
+
+    def _open_csv_filechooser(self):
+        if platform != 'android':
+            self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
+            return
+        return self._open_csv_saf()
+
+    def _parse_csv_bytes(self, b: bytes):
+        self._log_internal(f"CSV size: {len(b)} bytes")
+        try:
+            text = b.decode("utf-8-sig")
+        except Exception:
+            text = b.decode("latin-1", errors="replace")
+        reader = csv.DictReader(text.splitlines())
+        headers = reader.fieldnames or []
+        self.csv_headers = headers
+        rows = []
+        for r in reader:
+            rows.append({k: (r.get(k) or "").strip() for k in headers})
+        self.csv_rows = rows
+        self._log_internal(f"CSV headers: {headers}")
+        self._log_internal(f"CSV rows: {len(rows)}")
+        preferred = ["LAST_NAME", "FIRST_NAME", "GRADE", "TEACHER", "STUDENT_ID"]
+        self.selected_headers = [h for h in preferred if h in headers]
+        if not self.selected_headers and headers:
+            self.selected_headers = headers[:3]
+
+    def _open_headers_popup(self):
+        if not self.csv_headers:
+            self._log_internal("No CSV loaded; cannot pick headers")
+            return
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Select columns to include in Author (joined with _):",
+                              size_hint=(1, None), height=dp(40), font_size=sp(12)))
+        sv = ScrollView(size_hint=(1, 1))
+        inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        inner.bind(minimum_height=inner.setter("height"))
+        sv.add_widget(inner)
+        current_sel = set(self.selected_headers)
+        for h in self.csv_headers:
+            row = BoxLayout(size_hint_y=None, height=dp(28))
+            lbl = Label(text=h, size_hint=(0.7, 1), font_size=sp(12), halign="left", valign="middle")
+            lbl.bind(size=lbl.setter("text_size"))
+            cb = CheckBox(active=(h in current_sel), size_hint=(0.3, 1))
+            def toggle_cb(inst, val, header=h):
+                if val:
+                    if header not in self.selected_headers:
+                        self.selected_headers.append(header)
+                else:
+                    if header in self.selected_headers:
+                        self.selected_headers.remove(header)
+            cb.bind(active=toggle_cb)
+            row.add_widget(lbl)
+            row.add_widget(cb)
+            inner.add_widget(row)
+        root.add_widget(sv)
+        btns = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
+        btn_ok = Button(text="OK")
+        btn_cancel = Button(text="Cancel")
+        btns.add_widget(btn_ok)
+        btns.add_widget(btn_cancel)
+        root.add_widget(btns)
+        popup = Popup(title="Select CSV columns", content=root, size_hint=(0.9, 0.9))
+        def do_ok(*_):
+            self._log_internal(f"Selected headers: {self.selected_headers}")
+            popup.dismiss()
+        btn_ok.bind(on_release=do_ok)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+        self._headers_popup = popup
+
+    # ---------- connect / author ----------
+    def connect_camera(self):
+        if self.live_running:
+            self._log_internal("Connect disabled while live view is running. Stop first.")
+            return
+        if not self.camera_ip:
+            self.status.text = "Status: enter an IP (use Settings->IP)"
+            return
+        self.connect_btn.disabled = True
+        self.status.text = f"Status: connecting to {self.camera_ip}:443..."
+        self._log_internal(f"Connecting to {self.camera_ip}:443")
+        threading.Thread(target=self._connect_worker, daemon=True).start()
+
+    def _connect_worker(self):
+        try:
+            status, data = self._json_call("GET", '/ccapi/ver100/deviceinformation', None, timeout=8.0)
+        except Exception as e:
+            status, data = f"ERR {e}", None
+        def _finish(dt):
+            try:
+                if status and str(status).startswith("200") and data:
+                    self.connected = True
+                    self.status.text = f"Status: connected ({data.get('productname', 'camera')})"
+                    self._log_internal("Connected OK")
+                    try:
+                        self.connect_btn.color = (1, 1, 0, 1)
+                    except Exception:
+                        pass
+                    self.start_btn.disabled = False
+                else:
+                    self.connected = False
+                    self.status.text = f"Status: connect failed ({status})"
+                    self._log_internal(f"Connect failed: {status}")
+                    try:
+                        self.connect_btn.color = (1, 1, 1, 1)
+                    except Exception:
+                        pass
+                    self.start_btn.disabled = True
+            finally:
+                try:
+                    self.connect_btn.disabled = False
+                except Exception:
+                    pass
+        Clock.schedule_once(_finish, 0)
+
+    def _author_value(self, payload):
+        s = (payload or "").strip()
+        if not s:
+            return ""
+        return s[: int(self.author_max_chars)]
+
+    def _maybe_commit_author(self, payload: str, source="qr"):
+        value = self._author_value(payload)
+        if not value:
+            return
+        if not self.connected:
+            self._log_internal(f"Author update skipped ({source}): not connected")
+            return
+        if self._last_committed_author == value:
+            return
+        if self._author_update_in_flight:
+            return
+        self._author_update_in_flight = True
+        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Author updating… ({source})"), 0)
+        threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
+
+    def _commit_author_worker(self, value: str, source: str):
+        ok = False
+        got = None
+        err = None
+        try:
+            st_put, _ = self._json_call(
+                "PUT",
+                '/ccapi/ver100/functions/registeredname/author',
+                {"author": value},
+                timeout=8.0
+            )
+            if not st_put.startswith("200"):
+                raise Exception(f"PUT failed: {st_put}")
+            st_get, data = self._json_call(
+                "GET",
+                '/ccapi/ver100/functions/registeredname/author',
+                None,
+                timeout=8.0
+            )
+            if not st_get.startswith("200") or not isinstance(data, dict):
+                raise Exception(f"GET failed: {st_get}")
+            got = (data.get("author") or "").strip()
+            ok = (got == value)
+        except Exception as e:
+            err = str(e)
+        def _finish(_dt):
+            self._author_update_in_flight = False
+            if ok:
+                self._last_committed_author = value
+                self._log_internal(f"Author updated+verified ({source}): '{value}'")
+                self.qr_status.text = "Author updated ✓"
+            else:
+                self._log_internal(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
+                self.qr_status.text = "Author verify failed ✗"
+        Clock.schedule_once(_finish, 0)
+
+    # ---------- liveview + decoder + QR ----------
+    def _set_qr_enabled(self, enabled: bool):
+        self.qr_enabled = bool(enabled)
+        if not self.qr_enabled and not self._qr_temp_active:
+            self._set_qr_ui(None, None, note="QR: off")
+        elif self.qr_enabled:
+            self._set_qr_ui(None, None, note="QR: on")
+
+    def _reschedule_display_loop(self, fps):
+        if self._display_event is not None:
+            try:
+                self._display_event.cancel()
+            except Exception:
+                pass
+        fps = max(1, int(fps))
+        self._display_event = Clock.schedule_interval(self._ui_noop_display_tick, 1.0 / fps)
+
+    def _ui_noop_display_tick(self, dt):
+        self._display_count += 1
+        try:
+            self._update_metrics(self._last_decoded_ts)
+        except Exception:
+            pass
+
+    def _update_metrics(self, frame_ts):
+        now = time.time()
+        if now - self._stat_t0 >= 1.0:
+            dt_s = now - self._stat_t0
+            # refresh log view if visible
+            if getattr(self, "show_log", False):
+                self._refresh_log_view()
+            # reset counters
+            self._fetch_count = 0
+            self._decode_count = 0
+            self._display_count = 0
+            self._stat_t0 = now
+
+    def _set_controls_idle(self):
+        self.connect_btn.disabled = False
+        self._style_connect_button()
+        self._style_start_button(stopped=True)
+
+    def _set_controls_running(self):
+        self.connect_btn.disabled = True
+        self._style_connect_button()
+        self._style_start_button(stopped=False)
+
+    def _on_start_pressed(self):
+        if not self.live_running:
+            if not self.connected:
+                self._log_internal("Cannot start live: not connected")
+                return
+            self.start_liveview()
+            self._set_controls_running()
+        else:
+            self.stop_liveview()
+            self._set_controls_idle()
+
+    def start_liveview(self):
+        if not self.connected or self.live_running:
+            return
+        payload = {"liveviewsize": "small", "cameradisplay": "on"}
+        self._log_internal("Starting live view size=small, cameradisplay=on")
+        status, _ = self._json_call("POST", '/ccapi/ver100/shooting/liveview', payload, timeout=10.0)
+        if not status.startswith("200"):
+            self.status.text = f"Status: live view start failed ({status})"
+            self._log_internal(f"Live view start failed: {status}")
+            return
+        self.session_started = True
+        self.live_running = True
+        self._set_controls_running()
+        self.status.text = "Status: live"
+        with self._lock:
+            self._latest_jpeg = None
+            self._latest_jpeg_ts = 0.0
+        self._last_decoded_ts = 0.0
+        self._frame_texture = None
+        self._frame_size = None
+        self._latest_qr_text = ""
+        self._latest_qr_points = None
+        self._qr_seen = set()
+        self._qr_last_add_time = 0.0
+        self._set_qr_ui(None, None, note="QR: off" if not self.qr_enabled else "QR: on")
+        self._fetch_count = 0
+        self._decode_count = 0
+        self._display_count = 0
+        self._stat_t0 = time.time()
+
+        # start fetch + QR threads
+        self._fetch_thread = threading.Thread(target=self._liveview_fetch_loop, daemon=True)
+        self._fetch_thread.start()
+        self._qr_thread = threading.Thread(target=self._qr_loop, daemon=True)
+        self._qr_thread.start()
+
+    def stop_liveview(self):
+        if not self.live_running:
+            self._set_controls_idle()
+            return
+        self.live_running = False
+        if self.session_started:
+            try:
+                self._json_call("DELETE", '/ccapi/ver100/shooting/liveview', None, timeout=6.0)
+            except Exception:
+                pass
+            self.session_started = False
+        self.status.text = "Status: connected (live stopped)" if self.connected else "Status: not connected"
+        self._log_internal("Live view stopped")
+        self._set_controls_idle()
+
+    def _liveview_fetch_loop(self):
+        url = f"https://{self.camera_ip}/ccapi/ver100/shooting/liveview/flip"
+        while self.live_running:
+            try:
+                resp = self._session.get(url, timeout=5.0)
+                if resp.status_code == 200 and resp.content:
+                    jpeg = resp.content
+                    ts = time.time()
+                    with self._lock:
+                        self._latest_jpeg = jpeg
+                        self._latest_jpeg_ts = ts
+                    self._fetch_count += 1
+                    try:
+                        self._decode_queue.put_nowait((jpeg, ts))
+                    except queue.Full:
+                        try:
+                            _ = self._decode_queue.get_nowait()
+                        except Exception:
+                            pass
+                        try:
+                            self._decode_queue.put_nowait((jpeg, ts))
+                        except Exception:
+                            pass
+                else:
+                    time.sleep(0.03)
+            except Exception as e:
+                self._log_internal(f"liveview fetch error: {e}")
+                time.sleep(0.10)
+
+    def _decoder_loop(self):
+        while not self._decoder_stop.is_set():
+            try:
+                jpeg, ts = self._decode_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            # ensure preview exists
+            if not hasattr(self, "preview") or self.preview is None:
+                time.sleep(0.05)
+                continue
+            try:
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    continue
+                rot = int(self.preview.preview_rotation) % 360
+                if rot == 90:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+                elif rot == 180:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+                elif rot == 270:
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                with self._lock:
+                    self._latest_decoded_bgr = bgr.copy()
+                    self._latest_decoded_bgr_ts = ts
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                h, w = rgb.shape[:2]
+                rgb_bytes = rgb.tobytes()
+                def _update_texture_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ts=ts):
+                    try:
+                        if getattr(self, "_overlay_active", False):
+                            return
+                        if self._frame_texture is None or self._frame_size != (w, h):
+                            tex = Texture.create(size=(w, h), colorfmt="rgb")
+                            tex.flip_vertical()
+                            self._frame_texture = tex
+                            self._frame_size = (w, h)
+                            self._log_internal(f"texture init size={w}x{h}")
+                        self._frame_texture.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
+                        self.preview.set_texture(self._frame_texture)
+                        self._last_decoded_ts = ts
+                    except Exception as e:
+                        self._log_internal(f"texture update err: {e}")
+                Clock.schedule_once(_update_texture_on_main, 0)
+                self._decode_count += 1
+            except Exception:
+                continue
+
+    def _qr_loop(self):
+        last_processed_ts = 0.0
+        while self.live_running:
+            if not (self.qr_enabled or self._qr_temp_active):
+                time.sleep(0.10)
+                continue
+            with self._lock:
+                bgr = None
+                ts = getattr(self, "_latest_decoded_bgr_ts", 0.0)
+                if self._latest_decoded_bgr is not None:
+                    bgr = self._latest_decoded_bgr.copy()
+            if bgr is None or ts <= last_processed_ts:
+                time.sleep(0.05)
+                continue
+            try:
+                decoded, points, _ = self._qr_detector.detectAndDecode(bgr)
+                qr_text = decoded.strip() if isinstance(decoded, str) else ""
+                qr_points = None
+                if points is not None:
+                    try:
+                        pts = points.astype(int).reshape(-1, 2)
+                        if len(pts) >= 4:
+                            qr_points = [(int(pts[i][0]), int(pts[i][1])) for i in range(4)]
+                    except Exception:
+                        qr_points = None
+                if qr_text or qr_points:
+                    self._publish_qr(qr_text if qr_text else None, qr_points)
+                    if self._qr_temp_active:
+                        Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
+            except Exception:
+                pass
+            last_processed_ts = ts
+            time.sleep(max(0.05, float(self.qr_interval_s)))
+
+    def _publish_qr(self, text, points):
+        now = time.time()
+        if text:
+            if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
+                self._qr_seen.add(text)
+                self._qr_last_add_time = now
+                self._log_internal(f"QR: {text}")
+            self._maybe_commit_author(text, source="qr")
+        if text:
+            self._latest_qr_text = text
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"QR: {text}"), 0)
+        elif self._latest_qr_text:
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"QR: {self._latest_qr_text}"), 0)
+        if points:
+            if getattr(self, "_qr_highlight_event", None):
+                try:
+                    self._qr_highlight_event.cancel()
+                except Exception:
+                    pass
+                self._qr_highlight_event = None
+            Clock.schedule_once(lambda *_: self.preview.set_qr(points), 0)
+            try:
+                self._qr_highlight_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
+            except Exception:
+                def bg_clear():
+                    time.sleep(3.0)
+                    Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 0)
+                threading.Thread(target=bg_clear, daemon=True).start()
+        note = f"QR: {text[:80]}" if text else ("QR: detected" if points else ("QR: on" if self.qr_enabled else "QR: off"))
+        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", note), 0)
+
+    def _clear_qr_overlay(self):
+        try:
+            self.preview.set_qr(None)
+        except Exception:
+            pass
+        self._latest_qr_points = None
+        if getattr(self, "_qr_highlight_event", None):
+            try:
+                self._qr_highlight_event.cancel()
+            except Exception:
+                pass
+            self._qr_highlight_event = None
+
+    def _set_qr_ui(self, text, points, note="QR: none"):
+        if text:
+            self._latest_qr_text = text
+            self.qr_last_label.text = f"QR: {text}"
+        if points:
+            self._latest_qr_points = points
+            self.preview.set_qr(points)
+            if getattr(self, "_qr_highlight_event", None):
+                try:
+                    self._qr_highlight_event.cancel()
+                except Exception:
+                    pass
+            self._qr_highlight_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
+        self.qr_status.text = note
+
+    # ---------- preview tap handling for QR pulse ----------
+    def _on_preview_touch(self, instance, touch):
+        # only respond to taps inside the PreviewOverlay region
+        if not instance.collide_point(*touch.pos):
+            return False
+        # Start a temporary QR pulse scan for 1 second (or until detection)
+        self._start_pulse_qr()
+        return True
+
+    def _start_pulse_qr(self):
+        if getattr(self, "_qr_pulse_event", None):
+            try:
+                self._qr_pulse_event.cancel()
+            except Exception:
+                pass
+            self._qr_pulse_event = None
+        self._qr_temp_active = True
+        self._set_qr_ui(None, None, note="QR: scanning…")
+        try:
+            self._qr_pulse_event = Clock.schedule_once(lambda *_: self._end_pulse_qr(), 1.0)
+        except Exception:
+            def _bg_end():
+                time.sleep(1.0)
+                Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
+            threading.Thread(target=_bg_end, daemon=True).start()
+
+    def _end_pulse_qr(self, *args):
+        if getattr(self, "_qr_pulse_event", None):
+            try:
+                self._qr_pulse_event.cancel()
+            except Exception:
+                pass
+            self._qr_pulse_event = None
+        self._qr_temp_active = False
+        if not getattr(self, "qr_enabled", False):
+            self._set_qr_ui(None, None, note="QR: off")
+        else:
+            self._set_qr_ui(None, None, note="QR: on")
+
+    # ---------- thumbnails, overlay, and full-res swap ----------
+    def _download_thumb_for_path(self, ccapi_path: str):
+        """
+        Download thumbnail bytes (bg), save to disk, decode/rotate in bg,
+        then create Kivy Texture on main thread and update the strip.
+        """
+        thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
+        self._log_internal(f"Downloading thumbnail (bg): {thumb_url}")
+        try:
+            resp = self._session.get(thumb_url, stream=True, timeout=10.0)
+            self._log_internal(f"thumb status={resp.status_code} {resp.reason}")
+            if resp.status_code != 200:
+                return
+            thumb_bytes = resp.content
+        except Exception as e:
+            self._log_internal(f"Thumbnail download error: {e}")
+            return
+
+        # save thumbnail
+        out_path = None
+        try:
+            os.makedirs(self.thumb_dir, exist_ok=True)
+            name = os.path.basename(ccapi_path) or "image"
+            if not name.lower().endswith(('.jpg', '.jpeg')):
+                name = name + '.jpg'
+            out_path = os.path.join(self.thumb_dir, name)
+            with open(out_path, "wb") as f:
+                f.write(thumb_bytes)
+            self._log_internal(f"Saved thumbnail {out_path}")
+        except Exception as e:
+            self._log_internal(f"Saving thumbnail err: {e}")
+            out_path = None
+
+        # decode and rotate using PIL
+        try:
+            pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
+            rot = getattr(self.preview, "preview_rotation", 0) if hasattr(self, "preview") else 0
+            if rot:
+                pil = pil_rotate_90s(pil, rot)
+            pil.thumbnail((200, 200))
+            w, h = pil.size
+            rgb_bytes = pil.tobytes()
+        except Exception as e:
+            self._log_internal(f"Thumbnail decode err (bg): {e}")
+            return
+
+        def _make_texture_and_update(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ccapi_path=ccapi_path, out_path=out_path):
+            try:
+                tex = self._create_texture_from_rgb(rgb_bytes, w, h, flip_vertical=True)
+                if tex is None:
+                    return
+            except Exception as e:
+                self._log_internal(f"Texture create/blit err: {e}")
+                return
+
+            # insert at front (most recent first)
+            self._thumb_textures.insert(0, tex)
+            self._thumb_paths.insert(0, ccapi_path)
+            self._thumb_saved_paths.insert(0, out_path if out_path else "")
+            self._thumb_textures = self._thumb_textures[:5]
+            self._thumb_paths = self._thumb_paths[:5]
+            self._thumb_saved_paths = self._thumb_saved_paths[:5]
+
+            for idx, img in enumerate(self._thumb_images):
+                if idx < len(self._thumb_textures):
+                    img.texture = self._thumb_textures[idx]
+                else:
+                    img.texture = None
+
+        Clock.schedule_once(_make_texture_and_update, 0)
+
+    def _background_download_latest(self):
+        self.download_and_thumbnail_latest()
+
+    def download_and_thumbnail_latest(self):
+        if not self.connected:
+            self._log_internal("Not connected; cannot fetch contents.")
+            return
+        images = self.list_all_images()
+        self._log_internal(f"contents: {len(images)} total entries")
+        if not images:
+            self._log_internal("No images found on camera.")
+            return
+        jpgs = [p for p in images if p.lower().endswith(('.jpg', '.jpeg'))]
+        if not jpgs:
+            self._log_internal("No JPG files found.")
+            return
+        latest = jpgs[-1]
+        threading.Thread(target=self._download_thumb_for_path, args=(latest,), daemon=True).start()
+        self._last_seen_image = latest
+
+    def _on_thumb_touch(self, image_widget, touch):
+        if not image_widget.collide_point(*touch.pos):
+            return False
+        idx = getattr(image_widget, "thumb_index", None)
+        if idx is None:
+            return False
+        if idx >= len(self._thumb_paths):
+            return False
+
+        # If overlay active and same thumb tapped, close overlay
+        if self._overlay_active and (self._overlay_thumb_index == idx):
+            self._log_internal(f"Thumbnail {idx} tapped while overlay active: closing overlay")
+            self._clear_thumb_highlight()
+            try:
+                self.preview.clear_overlay_texture()
+            except Exception:
+                pass
+            self._overlay_active = False
+            self._overlay_thumb_index = None
+            # restore live frame if available
+            if self._frame_texture is not None:
+                try:
+                    self.preview.set_texture(self._frame_texture)
+                except Exception:
+                    pass
+            return True
+
+        # Otherwise open overlay for this thumb
+        ccapi_path = self._thumb_paths[idx]
+        saved_path = self._thumb_saved_paths[idx] if idx < len(self._thumb_saved_paths) else None
+        rot = getattr(self.preview, "preview_rotation", 0) if hasattr(self, "preview") else 0
+
+        # Highlight thumb
+        self._highlight_thumb(idx)
+
+        # Prefer building preview texture from saved file (consistent orientation)
+        if saved_path and os.path.exists(saved_path):
+            tex = self._create_texture_from_jpeg_file(saved_path, rotate=rot, flip_vertical=True)
+            if tex:
+                Clock.schedule_once(lambda *_: self._show_overlay_with_texture(tex, idx), 0)
+                threading.Thread(target=self._fetch_full_and_replace, args=(ccapi_path, idx), daemon=True).start()
+                return True
+
+        # fallback to in-memory thumb texture
+        if idx < len(self._thumb_textures):
+            thumb_tex = self._thumb_textures[idx]
+            Clock.schedule_once(lambda *_: self._show_overlay_with_texture(thumb_tex, idx), 0)
+            threading.Thread(target=self._fetch_full_and_replace, args=(ccapi_path, idx), daemon=True).start()
+            return True
+
+        # else download thumb then overlay
+        threading.Thread(target=self._download_thumb_and_overlay, args=(ccapi_path, idx), daemon=True).start()
+        return True
+
+    def _download_thumb_and_overlay(self, ccapi_path, idx):
+        self._download_thumb_for_path(ccapi_path)
+        if idx < len(self._thumb_textures):
+            tex = self._thumb_textures[idx]
+            Clock.schedule_once(lambda *_: self._show_overlay_with_texture(tex, idx), 0)
+            threading.Thread(target=self._fetch_full_and_replace, args=(ccapi_path, idx), daemon=True).start()
+
+    def _show_overlay_with_texture(self, texture: Texture, thumb_index: int):
+        if texture is None:
+            return
+        self._overlay_active = True
+        self._overlay_thumb_index = thumb_index
+        # set overlay texture into rectangle that matches preview bounds exactly
+        try:
+            self.preview.set_overlay_texture(texture)
+        except Exception as e:
+            self._log_internal(f"Failed to set overlay texture: {e}")
+
+    def _fetch_full_and_replace(self, ccapi_path: str, thumb_index: int):
+        """
+        Download full-res JPG in background, decode and rotate to RGB bytes, then schedule
+        creation of Kivy Texture on main thread and update overlay rectangle.
+        """
+        full_url = f"https://{self.camera_ip}{ccapi_path}"
+        self._log_internal(f"Fetching full-res: {full_url}")
+        try:
+            resp = self._session.get(full_url, timeout=20.0, stream=True)
+            if resp.status_code != 200 or not resp.content:
+                self._log_internal(f"Full image download failed: {resp.status_code}")
+                return
+            data = resp.content
+        except Exception as e:
+            self._log_internal(f"Full image download err: {e}")
+            return
+
+        # Decode + rotate in background
+        try:
+            arr = np.frombuffer(data, dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is None:
+                self._log_internal("cv2.imdecode returned None for full image")
+                return
+            rot = getattr(self.preview, "preview_rotation", 0) % 360 if hasattr(self, "preview") else 0
+            if rot == 90:
+                bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+            elif rot == 180:
+                bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+            elif rot == 270:
+                bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            rgb_bytes = rgb.tobytes()
+        except Exception as e:
+            self._log_internal(f"Full image decode err (bg): {e}")
+            return
+
+        # Create Texture and apply on main thread
+        def _apply_full_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, thumb_index=thumb_index):
+            tex = self._create_texture_from_rgb(rgb_bytes, w, h, flip_vertical=True)
+            if not tex:
+                self._log_internal("Failed to create full-res texture on main thread")
+                return
+            try:
+                self.preview.set_overlay_texture(tex)
+            except Exception:
+                pass
+            try:
+                if thumb_index < len(self._thumb_textures):
+                    self._thumb_textures[thumb_index] = tex
+                    if thumb_index < len(self._thumb_images):
+                        self._thumb_images[thumb_index].texture = tex
+            except Exception:
+                pass
+            self._log_internal("Full-res applied to overlay (overlay remains until user taps thumb again to close)")
+
+        Clock.schedule_once(_apply_full_on_main, 0)
+
+    # ---------- contents / poller ----------
+    def list_all_images(self):
+        images = []
+        status, root = self._json_call("GET", '/ccapi/ver120/contents', None, timeout=8.0)
+        self._log_internal(f"/ccapi/ver120/contents -> {status}")
+        if not status.startswith("200") or not root or "path" not in root:
+            return images
+        for path in root["path"]:
+            st_dir, dirs = self._json_call("GET", path, None, timeout=8.0)
+            if not st_dir.startswith("200") or not dirs or "path" not in dirs:
+                continue
+            for d in dirs["path"]:
+                st_num, num = self._json_call("GET", d + "?kind=number", None, timeout=8.0)
+                if not st_num.startswith("200") or not num or "pagenumber" not in num:
+                    continue
+                pages = int(num["pagenumber"])
+                for page in range(1, pages + 1):
+                    st_files, f_data = self._json_call("GET", d + f"?page={page}", None, timeout=8.0)
+                    if not st_files.startswith("200") or not f_data or "path" not in f_data:
+                        continue
+                    for f in f_data["path"]:
+                        images.append(f)
+        return images
+
+    def start_polling_new_images(self):
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return
+        self._log_internal(f"Starting image poller every {self.poll_interval_s}s (background thread)")
+        self._poll_thread_stop.clear()
+        self._poll_thread = threading.Thread(target=self._poll_worker, daemon=True)
+        self._poll_thread.start()
+
+    def stop_polling_new_images(self):
+        if self._poll_thread is None:
+            return
+        self._log_internal("Stopping image poller (background thread)")
+        self._poll_thread_stop.set()
+        self._poll_thread = None
+
+    def _poll_worker(self):
+        while not self._poll_thread_stop.is_set():
+            try:
+                images = self.list_all_images()
+                if images:
+                    jpgs = [p for p in images if p.lower().endswith(('.jpg', '.jpeg'))]
+                    if jpgs:
+                        if self._last_seen_image is None:
+                            self._last_seen_image = jpgs[-1]
+                            self._log_internal(f"Poll (bg): baseline set to {self._last_seen_image}")
+                        else:
+                            new_start_idx = None
+                            for idx, path in enumerate(jpgs):
+                                if path == self._last_seen_image:
+                                    new_start_idx = idx + 1
+                                    break
+                            if new_start_idx is None:
+                                self._log_internal("Poll (bg): last_seen not found, resetting baseline")
+                                self._last_seen_image = jpgs[-1]
+                            else:
+                                new_items = jpgs[new_start_idx:]
+                                for path in new_items:
+                                    self._log_internal(f"Poll (bg): New image detected: {path}")
+                                    threading.Thread(target=self._download_thumb_for_path, args=(path,), daemon=True).start()
+                                    self._last_seen_image = path
+            except Exception as e:
+                self._log_internal(f"Poll worker error: {e}")
+            stop_event = self._poll_thread_stop
+            stop_event.wait(self.poll_interval_s)
+
+    def dump_ccapi(self):
+        status, data = self._json_call("GET", '/ccapi', None, timeout=10.0)
+        self._log_internal(f"/ccapi status={status}")
+        try:
+            j = json.dumps(data, indent=2)
+        except Exception:
+            j = str(data)
+        self._log_internal("=== ccapi JSON START ===")
+        for line in j.splitlines():
+            self._log_internal(line)
+        self._log_internal("=== ccapi JSON END ===")
+
+    def _open_csv_filechooser(self):
+        return self._open_csv_saf()
+
+    def on_stop(self):
+        try:
+            self.stop_liveview()
+        except Exception:
+            pass
+        try:
+            self.stop_polling_new_images()
+        except Exception:
+            pass
+        try:
+            self._decoder_stop.set()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     VolumeToolkitApp().run()
