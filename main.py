@@ -1,13 +1,10 @@
 # Volume Toolkit - main.py
-# Complete, self-contained main.py
-# - Centralized _set_exif_payload(...) to atomically set payload + source and update UI
-# - No QR overlay drawing (removed to reduce latency)
-# - QR detection still runs in background and updates Exif Payload when decoded
-# - In-app persistent metrics label showing Fetch/Decode/Display counts and last-decode age
-# - _log_internal echoes to stdout so adb logcat sees messages
-# - Throttled, informative logs in fetch/decoder/qr loops to help debug pipeline
-# - Defensive threading and main-thread UI updates via Clock.schedule_once
-# - Ready to drop into the repo (replace existing main.py)
+# Merged edits: ensure QR detection is controlled only by the QR On/Off toggle (no pulse mode).
+# - Uses main-thread UI/Texture updates via Clock.schedule_once.
+# - QR detection runs in background QR thread while live_running and qr_enabled is True.
+# - When QR points are available we draw a polygon in the preview (letterboxed coords).
+# - When QR text decoded we set Exif payload and optionally commit to camera.
+# - Defensive threading and logging as before.
 
 import os
 import json
@@ -97,7 +94,7 @@ class PreviewOverlay(FloatLayout):
     show_57 = BooleanProperty(True)
     show_810 = BooleanProperty(True)
     show_oval = BooleanProperty(True)
-    show_qr = BooleanProperty(False)  # keep false, overlay removed
+    show_qr = BooleanProperty(False)  # user can enable if they want polygon overlay
 
     grid_n = NumericProperty(3)
 
@@ -121,6 +118,7 @@ class PreviewOverlay(FloatLayout):
         self.add_widget(self.img)
 
         lw = 2
+        lw_qr = 6
 
         with self.img.canvas.after:
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
@@ -137,10 +135,16 @@ class PreviewOverlay(FloatLayout):
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
             self._ln_oval = Line(width=lw)
 
+            # QR polygon (draws on top of image+overlays)
+            self._c_qr = Color(0.0, 1.0, 0.0, 0.95)
+            self._ln_qr = Line(width=lw_qr, close=True)
+
         self._ln_grid_list = []
         self._overlay_texture = None
         self._overlay_rect = None
         self._overlay_rect_color = None
+
+        self._qr_points_px = None
 
         self.bind(pos=self._update_overlay_rect, size=self._update_overlay_rect)
         self.img.bind(pos=self._update_overlay_rect, size=self._update_overlay_rect)
@@ -148,7 +152,7 @@ class PreviewOverlay(FloatLayout):
         self.bind(
             pos=self._redraw, size=self._redraw,
             show_border=self._redraw, show_grid=self._redraw, show_57=self._redraw,
-            show_810=self._redraw, show_oval=self._redraw,
+            show_810=self._redraw, show_oval=self._redraw, show_qr=self._redraw,
             grid_n=self._redraw,
             oval_cx=self._redraw, oval_cy=self._redraw, oval_w=self._redraw, oval_h=self._redraw
         )
@@ -213,6 +217,11 @@ class PreviewOverlay(FloatLayout):
 
     def set_texture(self, texture):
         self.img.texture = texture
+        self._redraw()
+
+    def set_qr(self, points_px):
+        # points_px: list of (x,y) in image pixel coords (image texture space)
+        self._qr_points_px = points_px
         self._redraw()
 
     def _drawn_rect(self):
@@ -316,6 +325,24 @@ class PreviewOverlay(FloatLayout):
             self._clear_line_modes(self._ln_oval)
             self._ln_oval.ellipse = (0, 0, 0, 0)
 
+        # QR polygon drawing: convert image-pixel points into displayed (letterboxed) coords
+        if self.show_qr and self._qr_points_px and self.img.texture and self.img.texture.size[0] > 0:
+            iw, ih = self.img.texture.size
+            dx, dy, dw, dh = fx, fy, fw, fh
+
+            line_pts = []
+            for (x, y) in self._qr_points_px:
+                # x,y are in texture pixel coords; convert to normalized then to drawn rect
+                u = float(x) / float(iw)
+                v = float(y) / float(ih)
+                sx = dx + u * dw
+                sy = dy + v * dh
+                line_pts += [sx, sy]
+
+            self._ln_qr.points = line_pts
+        else:
+            self._ln_qr.points = []
+
 
 class CaptureType:
     JPG = "JPG"
@@ -380,7 +407,7 @@ class VolumeToolkitApp(App):
         self._decoder_thread = None
         self._decoder_stop = threading.Event()
 
-        # overlay state (no QR overlay usage now)
+        # overlay state (no QR overlay usage now by default)
         self._overlay_active = False
         self._overlay_thumb_index = None
 
@@ -787,6 +814,7 @@ class VolumeToolkitApp(App):
 
     def _on_qr_pressed(self):
         try:
+            # Toggle the persistent QR-enabled flag — this is the sole control for detection.
             self.qr_enabled = not bool(self.qr_enabled)
             # reset any transient QR-detected visual
             if getattr(self, "_qr_detected_event", None):
@@ -800,6 +828,7 @@ class VolumeToolkitApp(App):
             # If toggled off, reset payload source if none
             if not self.qr_enabled and not self._latest_qr_text and not self._selected_author_payload:
                 self._set_exif_payload("", "none")
+            # ensure preview.show_qr reflects user preference (we keep default off)
         except Exception as e:
             self._log_internal(f"_on_qr_pressed error: {e}")
 
@@ -1198,7 +1227,7 @@ class VolumeToolkitApp(App):
         mk_toggle("Crop 5:7 (red)", "show_57", self.preview.show_57)
         mk_toggle("Crop 8:10 (yellow)", "show_810", self.preview.show_810)
         mk_toggle("Oval (purple)", "show_oval", self.preview.show_oval)
-        # QR overlay removed from user control (no overlay)
+        mk_toggle("QR polygon overlay", "show_qr", self.preview.show_qr)
         btn_close = Button(text="Close", size_hint=(1, None), height=dp(40))
         content.add_widget(btn_close)
         popup = Popup(title="Overlays", content=content, size_hint=(0.6, 0.6))
@@ -1759,6 +1788,7 @@ class VolumeToolkitApp(App):
                 continue
 
     def _qr_loop(self):
+        # Only permanent mode: detection runs only when self.qr_enabled == True.
         last_processed_ts = 0.0
         while self.live_running:
             if not self.qr_enabled:
@@ -1776,17 +1806,27 @@ class VolumeToolkitApp(App):
                 continue
 
             try:
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                decoded, points, _ = self._qr_detector.detectAndDecode(gray)
+                # try grayscale first (faster) then fallback
+                try:
+                    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                    decoded, points, _ = self._qr_detector.detectAndDecode(gray)
+                except Exception:
+                    decoded, points, _ = self._qr_detector.detectAndDecode(bgr)
+
                 qr_text = decoded.strip() if isinstance(decoded, str) else ""
+                qr_points = None
+                if points is not None:
+                    try:
+                        pts = np.array(points).astype(int).reshape(-1, 2)
+                        if len(pts) >= 4:
+                            qr_points = [(int(pts[i][0]), int(pts[i][1])) for i in range(4)]
+                    except Exception:
+                        qr_points = None
 
-                if not qr_text:
-                    decoded_c, points_c, _ = self._qr_detector.detectAndDecode(bgr)
-                    if isinstance(decoded_c, str) and decoded_c.strip():
-                        qr_text = decoded_c.strip()
+                if qr_text or qr_points:
+                    # publish with both text and points when available
+                    self._publish_qr(qr_text if qr_text else None, qr_points if qr_points else None)
 
-                if qr_text:
-                    self._publish_qr(qr_text, None)
             except Exception:
                 pass
 
@@ -1794,40 +1834,41 @@ class VolumeToolkitApp(App):
             time.sleep(max(0.05, float(self.qr_interval_s)))
 
     def _on_preview_touch(self, instance, touch):
+        # No pulse mode: preview taps do not start temporary scans.
         return False
 
     def _publish_qr(self, text, points):
         """
         Called from QR worker when QR detected/decoded.
-        Does NOT draw overlay polygons. Instead:
-         - make QR authoritative via _set_exif_payload(text, "QR")
-         - visually indicate detection on the qr_btn (turns green and shows 'QR Detected' briefly)
+        - set authoritative Exif payload (text) via _set_exif_payload
+        - show polygon overlay (points) if present
+        - visual QR-detected indicator on the qr_btn (short-lived)
+        - optionally commit author to camera
         """
         now = time.time()
-        if not text:
-            return
 
-        # Avoid flooding: gate new seen entries for logging, but always set payload
-        if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
-            self._qr_seen.add(text)
-            self._qr_last_add_time = now
-            self._log_internal(f"QR: {text}")
+        # Set text (if any): de-dup/logging/gating and commit to camera
+        if text:
+            if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
+                self._qr_seen.add(text)
+                self._qr_last_add_time = now
+                self._log_internal(f"QR: {text}")
+            try:
+                self._set_exif_payload(text, "QR")
+            except Exception:
+                pass
+            try:
+                self._maybe_commit_author(text, source="qr")
+            except Exception:
+                pass
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"QR: {text}"), 0)
+        elif self._latest_qr_text:
+            # if no new text but we had a previous one, make sure label reflects it
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"QR: {self._latest_qr_text}"), 0)
 
-        # Update authoritative payload synchronously via helper
-        try:
-            self._set_exif_payload(text, "QR")
-        except Exception:
-            pass
-
-        # Optionally auto-commit to camera
-        try:
-            self._maybe_commit_author(text, source="qr")
-        except Exception:
-            pass
-
-        # Visual QR-detected indicator: change qr_btn to green and show "QR Detected"
-        try:
-            # cancel any previous pending revert
+        # Points: display polygon overlay briefly (on main thread)
+        if points:
+            # cancel any existing clear timer
             if getattr(self, "_qr_detected_event", None):
                 try:
                     self._qr_detected_event.cancel()
@@ -1835,7 +1876,30 @@ class VolumeToolkitApp(App):
                     pass
                 self._qr_detected_event = None
 
-            # set qr_btn to detected state immediately on main thread
+            # set polygon on preview (main thread)
+            def _set_points(_dt):
+                try:
+                    self.preview.set_qr(points)
+                except Exception:
+                    pass
+            Clock.schedule_once(_set_points, 0)
+
+            # schedule clear after ~3s
+            try:
+                self._qr_detected_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
+            except Exception:
+                # fallback in case Clock scheduling fails
+                def bg_clear():
+                    time.sleep(3.0)
+                    Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 0)
+                threading.Thread(target=bg_clear, daemon=True).start()
+
+        # UI button pulse: set qr_btn to "QR Detected" briefly then revert (main-thread-safe)
+        try:
+            if getattr(self, "_qr_detected_event", None):
+                # keep existing event; already scheduled to clear overlay
+                pass
+
             def _set_detected(_dt):
                 try:
                     self.qr_btn.background_normal = ""
@@ -1845,7 +1909,6 @@ class VolumeToolkitApp(App):
                     self.qr_btn.color = (1, 1, 1, 1)
                 except Exception:
                     pass
-
             Clock.schedule_once(_set_detected, 0)
 
             # schedule revert after a short time (2 seconds)
@@ -1858,31 +1921,44 @@ class VolumeToolkitApp(App):
                         self.qr_btn.background_color = (0.45, 0.45, 0.45, 1.0)
                         self.qr_btn.text = "QR Detect Off"
                     self.qr_btn.color = (1, 1, 1, 1)
-                    self._qr_detected_event = None
                 except Exception:
                     pass
-
-            self._qr_detected_event = Clock.schedule_once(_revert_qr_btn, 2.0)
+            Clock.schedule_once(_revert_qr_btn, 2.0)
         except Exception:
             pass
 
     def _clear_qr_overlay(self):
-        # overlays removed -> nothing to clear
-        return
+        try:
+            self.preview.set_qr(None)
+        except Exception:
+            pass
+        self._latest_qr_points = None
+        if getattr(self, "_qr_detected_event", None):
+            try:
+                self._qr_detected_event.cancel()
+            except Exception:
+                pass
+            self._qr_detected_event = None
 
     def _set_qr_ui(self, text, points, note="Exif Payload: none"):
-        # Keep behavior limited: update status text and payload via helper if provided
+        # limited behavior: update status text and payload via helper if provided
         if text:
             self._set_exif_payload(text, "QR")
         if points:
-            # overlay removed; ignore
-            pass
+            self._latest_qr_points = points
+            self.preview.set_qr(points)
+            if getattr(self, "_qr_detected_event", None):
+                try:
+                    self._qr_detected_event.cancel()
+                except Exception:
+                    pass
+            self._qr_detected_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
         try:
             self.qr_status.text = note
         except Exception:
             pass
 
-    # ---------- thumbnails / overlay / full-res ----------
+    # ---------- thumbnails / overlay / full-res (unchanged) ----------
     def _download_thumb_for_path(self, ccapi_path: str):
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         self._log_internal(f"Downloading thumbnail (bg): {thumb_url}")
