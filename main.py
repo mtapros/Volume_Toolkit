@@ -1,14 +1,14 @@
 # Volume Toolkit - main.py
-# - Cleaned and double-checked single-file application
-# - Adds "QR Detect" toggle in the control row (Connect / Start / Autofetch / QR Detect)
-# - Makes the four control buttons equal width (each 1/4 of the row)
-# - QR decoding runs continuously only when QR Detect is enabled
-# - Preview tap no longer triggers a temporary QR pulse (QR controlled by button)
-# - Convex-hull ordering for QR overlay to avoid weird polygons
-# - "Force Update" renamed to "Push Update" and pushes current Data Update payload
-# - Menu: removed CSV tools and Push payload items (CSV and Push handled by footer)
-# - Button colors: gray when off; Connect turns blue when connected; others green when ON
-# - Defensive error handling throughout; no HTML entities
+# Full, cleaned, double-checked main.py
+# - QR Detect toggle (top control row)
+# - 4 equal-width control buttons (Connect/Start/Autofetch/QR Detect)
+# - Button color scheme: gray=off, blue=connected (Connect), green=on (Start, Autofetch, QR)
+# - CSV footer button opens a CSV popup: Load CSV / Select Headers / Select Students
+# - Push Update footer button pushes the current "Data Update" payload (QR > CSV > manual)
+# - QR detection uses grayscale frames and convex hull for polygon overlay (avoids crossed polygons)
+# - QR decoded text immediately updates the "Data Update:" label and clears CSV selection
+# - Defensive error handling and attribute checks to avoid AttributeError
+# - No HTML entities, ready to drop into the repo
 
 import os
 import json
@@ -318,7 +318,6 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
-        # remove previous grid elements
         for col_obj, line_obj in list(self._ln_grid_list):
             try:
                 self.img.canvas.after.remove(col_obj)
@@ -330,7 +329,6 @@ class PreviewOverlay(FloatLayout):
                 pass
         self._ln_grid_list = []
 
-        # draw grid lines explicitly
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
             for i in range(1, n):
@@ -372,7 +370,6 @@ class PreviewOverlay(FloatLayout):
 
             line_pts = []
             for (x, y) in self._qr_points_px:
-                # map texture pixel coords into displayed rect
                 u = float(x) / float(iw) if iw else 0.0
                 v = float(y) / float(ih) if ih else 0.0
                 sx = dx + u * dw
@@ -428,7 +425,7 @@ class VolumeToolkitApp(App):
         self.dropdown = None
 
         # QR state
-        self.qr_enabled = False                         # controlled by QR Detect button
+        self.qr_enabled = False
         self.qr_interval_s = 0.15
         self.qr_new_gate_s = 0.70
         self._qr_detector = cv2.QRCodeDetector()
@@ -465,7 +462,6 @@ class VolumeToolkitApp(App):
 
         self.csv_headers = []
         self.csv_rows = []
-        # selected_headers doubles as the order/selection for author assembly
         self.selected_headers = []
         self._headers_popup = None
 
@@ -476,7 +472,6 @@ class VolumeToolkitApp(App):
         self._thumb_saved_paths = []
 
         # track pending full-res fetches to avoid stale-applying results
-        # maps thumb_index -> request_id (float)
         self._pending_full_fetches = {}
 
         # storage
@@ -503,15 +498,15 @@ class VolumeToolkitApp(App):
         self.preview_holder = None
 
         # CSV selection UI state
-        self._column_filters = {}      # header -> filter string
-        self._column_sorts = {}        # header -> None | 'asc' | 'desc' (single-column sort supported)
-        self._selected_csv_row = None  # dict row selected by user
-        self._selected_author_payload = None  # last assembled payload from CSV selection
+        self._column_filters = {}
+        self._column_sorts = {}
+        self._selected_csv_row = None
+        self._selected_author_payload = None
 
-        # Autofetch state (toggle on main UI)
+        # Autofetch state
         self.autofetch_running = False
 
-    # ---------- utility ----------
+    # ---------- utility/log ----------
     def _log_internal(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -523,12 +518,15 @@ class VolumeToolkitApp(App):
 
     def _refresh_log_view(self):
         metrics_line = self._get_metrics_text()
-        self.log_label.text = metrics_line + "\n\n" + "\n".join(self._log_lines)
+        try:
+            self.log_label.text = metrics_line + "\n\n" + "\n".join(self._log_lines)
+        except Exception:
+            pass
 
     def _get_metrics_text(self):
         return f"Delay: -- ms | Fetch: {self._fetch_count} | Decode: {self._decode_count} | Display: {self._display_count}"
 
-    # ---------- texture helpers (main-thread creation) ----------
+    # ---------- texture helpers ----------
     def _create_texture_from_rgb(self, rgb_bytes, w, h, flip_vertical=True):
         try:
             tex = Texture.create(size=(w, h), colorfmt="rgb")
@@ -614,7 +612,6 @@ class VolumeToolkitApp(App):
 
         # Control row: Connect / Start live / Autofetch toggle / QR Detect toggle
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
-        # Make each button occupy 1/4 of the row so it fits narrow screens
         self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(0.25, 1))
         self._style_connect_button(initial=True)
         self.start_btn = Button(text="Start", disabled=True, font_size=sp(16), size_hint=(0.25, 1))
@@ -629,7 +626,7 @@ class VolumeToolkitApp(App):
         row2.add_widget(self.qr_btn)
         root.add_widget(row2)
 
-        # Data Update / status labels (renamed from QR to Data Update)
+        # Data Update / status labels
         self.qr_last_label = Label(text="Data Update: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.qr_last_label)
         self.status = Label(text="Status: not connected", size_hint=(1, None), height=dp(22), font_size=sp(13))
@@ -637,7 +634,7 @@ class VolumeToolkitApp(App):
         self.qr_status = Label(text="", size_hint=(1, None), height=dp(18), font_size=sp(11))
         root.add_widget(self.qr_status)
 
-        # Main area: preview (80%) + thumbs (20%)
+        # Main area
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
         # Preview holder and overlay layer
@@ -665,7 +662,7 @@ class VolumeToolkitApp(App):
 
         root.add_widget(main_area)
 
-        # Footer: CSV button and Push update button (renamed from Force update)
+        # Footer: CSV button and Push update button
         footer = BoxLayout(orientation="horizontal", size_hint=(1, None), height=dp(48), spacing=dp(6))
         footer.add_widget(Label())  # spacer to push buttons to the right side
         self.csv_btn = Button(text="CSV", size_hint=(None, 1), width=dp(140))
@@ -709,8 +706,8 @@ class VolumeToolkitApp(App):
 
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self._on_start_pressed())
-        self.autofetch_btn.bind(on_press=lambda *_: self._on_autofetch_pressed())
-        self.qr_btn.bind(on_press=lambda *_: self._on_qr_pressed())
+        self.autofetch_btn.bind(on_press=lambda *_: (self._on_autofetch_pressed(), self._style_autofetch_button(self.autofetch_running)))
+        self.qr_btn.bind(on_press=lambda *_: (self._on_qr_pressed(), self._style_qr_button(self.qr_enabled)))
         self.csv_btn.bind(on_release=lambda *_: self._open_csv_menu())
         self.push_update_btn.bind(on_release=lambda *_: self._push_update())
 
@@ -745,7 +742,7 @@ class VolumeToolkitApp(App):
         try:
             self.connect_btn.background_normal = ""
             self.connect_btn.background_down = ""
-            if self.connected:
+            if getattr(self, "connected", False):
                 self.connect_btn.background_color = (0.06, 0.45, 0.75, 1.0)  # blue
                 self.connect_btn.color = (1, 1, 1, 1)
                 self.connect_btn.text = "Connected"
@@ -777,10 +774,10 @@ class VolumeToolkitApp(App):
             self.autofetch_btn.background_normal = ""
             self.autofetch_btn.background_down = ""
             if running:
-                self.autofetch_btn.background_color = (0.05, 0.6, 0.05, 1.0)  # green
+                self.autofetch_btn.background_color = (0.05, 0.6, 0.05, 1.0)
                 self.autofetch_btn.text = "Autofetch On"
             else:
-                self.autofetch_btn.background_color = (0.45, 0.45, 0.45, 1.0)  # gray
+                self.autofetch_btn.background_color = (0.45, 0.45, 0.45, 1.0)
                 self.autofetch_btn.text = "Autofetch Off"
             self.autofetch_btn.color = (1, 1, 1, 1)
         except Exception:
@@ -802,10 +799,10 @@ class VolumeToolkitApp(App):
 
     def _on_qr_pressed(self):
         try:
-            new_state = not bool(self.qr_enabled)
-            self._set_qr_enabled(new_state)
-            self._style_qr_button(running=new_state)
-            self._log_internal(f"QR detection set to {new_state}")
+            # toggle and update ui/state; QR loop reads self.qr_enabled
+            self.qr_enabled = not bool(self.qr_enabled)
+            self._style_qr_button(self.qr_enabled)
+            self._log_internal(f"QR detection set to {self.qr_enabled}")
         except Exception as e:
             self._log_internal(f"_on_qr_pressed error: {e}")
 
@@ -818,6 +815,11 @@ class VolumeToolkitApp(App):
             self._style_autofetch_button(self.autofetch_running)
         except Exception as e:
             self._log_internal(f"_on_autofetch_pressed error: {e}")
+
+    def _log_internal_and_refresh(self, msg):
+        self._log_internal(msg)
+        if getattr(self, "show_log", False):
+            self._refresh_log_view()
 
     # ---------- helper to create per-thumb pos updaters ----------
     def _make_thumb_pos_updater(self, idx):
@@ -865,20 +867,26 @@ class VolumeToolkitApp(App):
         self._thumb_highlight_lines = {}
         self._highlighted_thumb_index = None
 
-    # ---------- CSV menu (footer CSV button) ----------
+    # ---------- CSV footer menu ----------
     def _open_csv_menu(self):
-        # CSV handling is via CSV footer button and selection popup; for Android we open SAF picker
-        if platform != 'android':
-            # On non-Android show a help popup
-            popup = Popup(title="CSV",
-                          content=Label(text="CSV load is Android-only (SAF). Run on device to pick a CSV."),
-                          size_hint=(0.6, 0.3))
-            popup.open()
-            return
-        # On Android open SAF
-        self._open_csv_saf()
+        # Show a small popup with the three CSV actions: Load CSV, Select Headers, Select Students
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+        b_load = Button(text="Load CSV (Android SAF)", size_hint=(1, None), height=dp(44))
+        b_headers = Button(text="Select Headers", size_hint=(1, None), height=dp(44))
+        b_select = Button(text="Select Students", size_hint=(1, None), height=dp(44))
+        b_close = Button(text="Close", size_hint=(1, None), height=dp(44))
+        content.add_widget(b_load)
+        content.add_widget(b_headers)
+        content.add_widget(b_select)
+        content.add_widget(b_close)
+        popup = Popup(title="CSV", content=content, size_hint=(0.6, 0.45))
+        b_load.bind(on_release=lambda *_: (popup.dismiss(), self._open_csv_filechooser()))
+        b_headers.bind(on_release=lambda *_: (popup.dismiss(), self._open_headers_popup()))
+        b_select.bind(on_release=lambda *_: (popup.dismiss(), self._open_student_selector_popup()))
+        b_close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
 
-    # ---------- CSV selector popup implementation ----------
+    # ---------- CSV selector popup ----------
     def _open_student_selector_popup(self):
         if not self.csv_rows or not self.csv_headers:
             popup = Popup(title="No CSV",
@@ -1101,6 +1109,7 @@ class VolumeToolkitApp(App):
         refresh_student_list()
         popup.open()
 
+    # ---------- Push Update ----------
     def _push_update(self):
         """
         Push whatever is currently shown in the 'Data Update' label to the camera author.
@@ -1159,7 +1168,7 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
 
-    # ---------- dropdown (main menu): CSV & Push removed (handled in footer) ----------
+    # ---------- dropdown (main menu) ----------
     def _build_dropdown(self):
         dd = DropDown(auto_dismiss=True)
         dd.auto_width = False
@@ -1180,7 +1189,6 @@ class VolumeToolkitApp(App):
             b.bind(on_release=lambda *_: (fn(), dd.dismiss()))
             dd.add_widget(b)
 
-        # Keep framing / overlays / capture / settings / debug only
         add_header("Framing")
         add_button_to_dd("Reset framing", lambda: self._fit_preview_to_holder())
 
@@ -1194,7 +1202,7 @@ class VolumeToolkitApp(App):
 
         return dd
 
-    # Overlays popup
+    # ---------- overlays, capture, settings (unchanged) ----------
     def _open_overlays_popup(self):
         content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
         content.add_widget(Label(text="Overlays", size_hint=(1, None), height=dp(28)))
@@ -1218,7 +1226,6 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # Capture popup
     def _open_capture_popup(self):
         content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
         content.add_widget(Label(text="Capture", size_hint=(1, None), height=dp(28)))
@@ -1238,7 +1245,6 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # Settings popup
     def _open_settings_popup(self):
         content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
         content.add_widget(Label(text="Settings", size_hint=(1, None), height=dp(28)))
@@ -1261,7 +1267,6 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # FPS / IP popups (unchanged)
     def _open_fps_popup(self):
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         sv = Slider(min=5, max=30, value=12, step=1)
@@ -1636,7 +1641,6 @@ class VolumeToolkitApp(App):
         self._fetch_thread = threading.Thread(target=self._liveview_fetch_loop, daemon=True)
         self._fetch_thread.start()
 
-        # ensure qr thread exists
         if self._qr_thread is None or not self._qr_thread.is_alive():
             self._qr_thread = threading.Thread(target=self._qr_loop, daemon=True)
             self._qr_thread.start()
@@ -1769,6 +1773,13 @@ class VolumeToolkitApp(App):
                 qr_text = decoded.strip() if isinstance(decoded, str) else ""
                 qr_points = None
 
+                # color fallback if grayscale didn't decode text
+                if not qr_text:
+                    decoded_c, points_c, _ = self._qr_detector.detectAndDecode(bgr)
+                    if isinstance(decoded_c, str) and decoded_c.strip():
+                        qr_text = decoded_c.strip()
+                        points = points_c
+
                 if points is not None:
                     try:
                         arr = np.array(points, dtype=np.float32)
@@ -1796,7 +1807,7 @@ class VolumeToolkitApp(App):
             last_processed_ts = ts
             time.sleep(max(0.05, float(self.qr_interval_s)))
 
-    # Preview touch is a no-op for QR detection (QR controlled via QR Detect button)
+    # Preview touch is a no-op; QR controlled via button
     def _on_preview_touch(self, instance, touch):
         return False
 
@@ -1822,7 +1833,13 @@ class VolumeToolkitApp(App):
 
             # Update authoritative Data Update label
             self._latest_qr_text = text
-            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {text}"[:200]), 0)
+            try:
+                Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {text}"[:200]), 0)
+            except Exception:
+                try:
+                    self.qr_last_label.text = f"Data Update: {text}"[:200]
+                except Exception:
+                    pass
 
         # Show overlay polygon for points (ordered by convex hull earlier)
         if points:
@@ -2229,6 +2246,18 @@ class VolumeToolkitApp(App):
 
     def _open_csv_filechooser(self):
         return self._open_csv_saf()
+
+    def _set_log_visible(self, visible: bool):
+        self.show_log = bool(visible)
+        if self.show_log:
+            self.log_holder.height = dp(150)
+            self.log_holder.opacity = 1
+            self.log_holder.disabled = False
+            self._refresh_log_view()
+        else:
+            self.log_holder.height = 0
+            self.log_holder.opacity = 0
+            self.log_holder.disabled = True
 
     def on_stop(self):
         try:
