@@ -215,6 +215,7 @@ class PreviewOverlay(FloatLayout):
         dy = wy + (wh - ih) / 2.0
         return (dx, dy, iw, ih)
 
+    @staticmethod
     def _center_crop_rect(frame_x, frame_y, frame_w, frame_h, aspect):
         frame_aspect = frame_w / frame_h
         if frame_aspect >= aspect:
@@ -291,10 +292,13 @@ class PreviewOverlay(FloatLayout):
             cy = fy + fh * float(self.oval_cy)
             ow = fw * float(self.oval_w)
             oh = fh * float(self.oval_h)
+
             ow = max(0.05 * fw, min(ow, fw))
             oh = max(0.05 * fh, min(oh, fh))
+
             left = max(fx, min(cx - ow / 2.0, fx + fw - ow))
             bottom = max(fy, min(cy - oh / 2.0, fy + fh - oh))
+
             self._clear_line_modes(self._ln_oval)
             self._ln_oval.ellipse = (left, bottom, ow, oh)
         else:
@@ -1192,9 +1196,11 @@ class VolumeToolkitApp(App):
         btns.add_widget(cancel)
         content.add_widget(btns)
         popup = Popup(title="Display FPS", content=content, size_hint=(0.8, 0.35))
+
         def do_ok(*_):
             self._reschedule_display_loop(int(sv.value))
             popup.dismiss()
+
         ok.bind(on_release=do_ok)
         cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
@@ -1211,12 +1217,14 @@ class VolumeToolkitApp(App):
         btns.add_widget(btn_cancel)
         content.add_widget(btns)
         popup = Popup(title="IP settings", content=content, size_hint=(0.85, 0.35))
+
         def do_save(*_):
             val = ti.text.strip()
             if val:
                 self.camera_ip = val
                 self._log_internal(f"Camera IP set to {val}")
             popup.dismiss()
+
         btn_ok.bind(on_release=do_save)
         btn_cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
