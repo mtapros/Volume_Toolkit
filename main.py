@@ -1,13 +1,14 @@
 # Volume Toolkit - main.py
-# Complete drop-in file.
-# Implements a QR Find button (toggle) that scans indefinitely until a QR is found
-# or the user cancels by pressing QR Find again. When a QR is found it is placed
-# into "QR Payload" displayed under "Exif Payload".
+# Full drop-in file implementing:
+# - live view fetching + background decoder thread
+# - thumbnail strip and full-res overlay
+# - a "QR Find" toggle button (in the control row) that scans indefinitely until a QR is found
+#   or the user cancels by pressing the button again. Found QR is stored in "QR Payload"
+#   and displayed under "Exif Payload".
+# - All UI/Texture creation happens on the main (GL) thread via Clock.schedule_once.
+# - Defensive checks to avoid attribute races and missing-method errors.
 #
-# All UI/texture operations run on the main thread via Clock.schedule_once.
-# Frame handoff between threads is protected by self._lock.
-#
-# Note: this file is self-contained. Double-check camera IP and permissions when deploying.
+# NOTE: adjust camera_ip default and Android SAF functions as needed for your environment.
 
 import os
 import json
@@ -94,24 +95,23 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
-    # Default rotation: device mounted rotated
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # Image widget used by live view (letterboxed when keep_ratio True)
         self.img = Image(allow_stretch=True, keep_ratio=True)
         try:
+            # newer Kivy addition; safe to ignore if not present
             self.img.fit_mode = "contain"
         except Exception:
             pass
+
         self.add_widget(self.img)
 
         lw = 2
         lw_qr = 6
 
-        # Draw overlay lines into img.canvas.after so they appear above the image texture
         with self.img.canvas.after:
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
@@ -127,7 +127,6 @@ class PreviewOverlay(FloatLayout):
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
             self._ln_oval = Line(width=lw)
 
-            # QR polygon (draws on top of image+overlays)
             self._c_qr = Color(0.0, 1.0, 0.0, 0.95)
             self._ln_qr = Line(width=lw_qr, close=True)
 
@@ -135,7 +134,6 @@ class PreviewOverlay(FloatLayout):
         self._overlay_texture = None
         self._overlay_rect = None
         self._overlay_rect_color = None
-
         self._qr_points_px = None
 
         self.bind(pos=self._update_overlay_rect, size=self._update_overlay_rect)
@@ -152,13 +150,11 @@ class PreviewOverlay(FloatLayout):
         self._redraw()
 
     def set_overlay_texture(self, texture: Texture):
-        # Remove any previous overlay
         self.clear_overlay_texture()
         if texture is None:
             return
         dx, dy, iw, ih = self._drawn_rect()
         self._overlay_texture = texture
-
         try:
             with self.img.canvas.after:
                 self._overlay_rect_color = Color(1.0, 1.0, 1.0, 1.0)
@@ -344,13 +340,12 @@ class CaptureType:
 class VolumeToolkitApp(App):
     capture_type = StringProperty(CaptureType.JPG)
 
-    # QR finder configuration
-    QR_FIND_POLL_S = 0.12      # polling interval while searching
+    QR_FIND_POLL_S = 0.12  # poll interval while scanning
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # Default IP (editable in UI)
+        # default config
         self.camera_ip = "192.168.34.29"
 
         self.connected = False
@@ -370,42 +365,35 @@ class VolumeToolkitApp(App):
         self._display_count = 0
         self._stat_t0 = time.time()
 
-        # internal logging
         self._log_lines = []
         self._max_log_lines = 300
         self.show_log = False
 
-        # frame texture currently used for liveview
         self._frame_texture = None
         self._frame_size = None
 
         self.dropdown = None
 
-        # QR finder (from scratch)
+        # QR finder state (from-scratch)
         self._qr_detector = cv2.QRCodeDetector()
         self._qr_finder_thread = None
         self._qr_finder_stop = threading.Event()
-        self._qr_found_text = ""          # last found QR text
-        self._qr_payload = ""             # placeholder for "QR Payload"
+        self._qr_found_text = ""
+        self._qr_payload = ""
 
-        # latest decoded BGR for any background tool (protected by _lock)
         self._latest_decoded_bgr = None
         self._latest_decoded_bgr_ts = 0.0
 
-        # decoder queue + thread
         self._decode_queue = queue.Queue(maxsize=2)
         self._decoder_thread = None
         self._decoder_stop = threading.Event()
 
-        # overlay state
         self._overlay_active = False
         self._overlay_thumb_index = None
 
-        # thumbnail highlight
         self._highlighted_thumb_index = None
         self._thumb_highlight_lines = {}
 
-        # author / CSV
         self.author_max_chars = 60
         self._last_committed_author = None
         self._author_update_in_flight = False
@@ -416,19 +404,15 @@ class VolumeToolkitApp(App):
         self.selected_headers = []
         self._headers_popup = None
 
-        # payload source tracking: "QR", "CSV", "MANUAL", "none"
         self._payload_source = "none"
 
-        # thumbnails
         self._thumb_textures = []
         self._thumb_images = []
         self._thumb_paths = []
         self._thumb_saved_paths = []
 
-        # track pending full-res fetches to avoid stale-applying results
         self._pending_full_fetches = {}
 
-        # storage
         self.download_dir = "downloads"
         self.thumb_dir = "thumbs"
         os.makedirs(self.download_dir, exist_ok=True)
@@ -441,28 +425,23 @@ class VolumeToolkitApp(App):
 
         self.save_full_size = False
 
-        # HTTP session (insecure certs allowed for camera)
         self._session = requests.Session()
         self._session.verify = False
 
-        # Android SAF
         self._android_activity_bound = False
         self._csv_req_code = 4242
 
-        # UI refs (populated in build)
         self.header = None
         self.preview_holder = None
 
-        # CSV selection UI state
         self._column_filters = {}
         self._column_sorts = {}
         self._selected_csv_row = None
         self._selected_author_payload = None
 
-        # Autofetch state
         self.autofetch_running = False
 
-    # ---------- utility/log ----------
+    # ---------- logging ----------
     def _log_internal(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -486,7 +465,7 @@ class VolumeToolkitApp(App):
     def _get_metrics_text(self):
         return f"Delay: -- ms | Fetch: {self._fetch_count} | Decode: {self._decode_count} | Display: {self._display_count}"
 
-    # ---------- centralized Exif payload setter ----------
+    # ---------- Exif payload ----------
     def _set_exif_payload(self, payload: str, source: str):
         try:
             payload = (payload or "").strip()
@@ -509,20 +488,18 @@ class VolumeToolkitApp(App):
             self._payload_source = source
 
             def _update_on_main(_dt):
-                if payload:
-                    label_text = f"Exif Payload ({self._payload_source}): {payload}"
-                    status_text = f"Exif Payload ({self._payload_source}): {payload[:80]}"
-                else:
-                    label_text = "Exif Payload (none): none"
-                    status_text = ("Exif Payload: on" if getattr(self, "live_running", False) else "Exif Payload: none")
                 try:
+                    if payload:
+                        label_text = f"Exif Payload ({self._payload_source}): {payload}"
+                        status_text = f"Exif Payload ({self._payload_source}): {payload[:80]}"
+                    else:
+                        label_text = "Exif Payload (none): none"
+                        status_text = ("Exif Payload: on" if getattr(self, "live_running", False) else "Exif Payload: none")
                     self.qr_last_label.text = label_text[:200]
-                except Exception:
-                    pass
-                try:
                     self.qr_status.text = status_text
                 except Exception:
                     pass
+
             Clock.schedule_once(_update_on_main, 0)
         except Exception as e:
             try:
@@ -530,10 +507,10 @@ class VolumeToolkitApp(App):
             except Exception:
                 pass
 
-    # ---------- QR Find (runs until found or canceled) ----------
+    # ---------- QR Find (toggle until found or canceled) ----------
     def _on_qr_find_pressed(self):
-        # Toggle behavior: if running, cancel; otherwise start a run that scans until found or canceled.
         if self._qr_finder_thread is not None and self._qr_finder_thread.is_alive():
+            # cancel
             self._log_internal("QR Finder: user requested cancel")
             self._qr_finder_stop.set()
             try:
@@ -543,9 +520,7 @@ class VolumeToolkitApp(App):
             return
 
         self._log_internal("QR Finder: starting (will run until found or cancelled)")
-        # Clear previous QR payload shown
         self._set_qr_payload("", source="none")
-
         try:
             self.qr_find_btn.text = "Stop Find"
             self.qr_find_btn.disabled = False
@@ -581,7 +556,6 @@ class VolumeToolkitApp(App):
                     bgr = self._latest_decoded_bgr.copy()
 
             if bgr is None:
-                # wait and allow cancellation
                 if self._qr_finder_stop.wait(self.QR_FIND_POLL_S):
                     break
                 continue
@@ -658,7 +632,7 @@ class VolumeToolkitApp(App):
         self._qr_finder_stop.clear()
         Clock.schedule_once(_finish_ui, 0)
 
-    # ---------- texture helpers ----------
+    # ---------- texture helpers (main-thread creation) ----------
     def _create_texture_from_rgb(self, rgb_bytes, w, h, flip_vertical=True):
         try:
             tex = Texture.create(size=(w, h), colorfmt="rgb")
@@ -742,47 +716,41 @@ class VolumeToolkitApp(App):
         self.header.add_widget(self.menu_btn)
         root.add_widget(self.header)
 
-        # Connect / Start / Autofetch / QR Find row
+        # Control row - equally sized buttons so they fit on small screens
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
-        self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(None, 1), width=dp(120))
+        self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(1, 1))
         self._style_connect_button(initial=True)
-        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16), size_hint=(None, 1), width=dp(140))
+        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16), size_hint=(1, 1))
         self._style_start_button(stopped=True)
-        self.autofetch_btn = Button(text="Autofetch Off", font_size=sp(14), size_hint=(None, 1), width=dp(140))
+        self.autofetch_btn = Button(text="Autofetch Off", font_size=sp(14), size_hint=(1, 1))
         self._style_autofetch_button(running=False)
-        self.qr_find_btn = Button(text="QR Find", font_size=sp(14), size_hint=(None, 1), width=dp(120))
+        self.qr_find_btn = Button(text="QR Find", font_size=sp(14), size_hint=(1, 1))
         row2.add_widget(self.connect_btn)
         row2.add_widget(self.start_btn)
         row2.add_widget(self.autofetch_btn)
         row2.add_widget(self.qr_find_btn)
         root.add_widget(row2)
 
-        # Exif Payload / QR Payload / status labels
+        # Exif / QR payload labels
         self.qr_last_label = Label(text="Exif Payload (none): none", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.qr_last_label)
-
-        # NEW: QR Payload placeholder displayed under Exif Payload
         self.qr_payload_label = Label(text="QR Payload: none", size_hint=(1, None), height=dp(20), font_size=sp(12))
         root.add_widget(self.qr_payload_label)
-
         self.status = Label(text="Status: not connected", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.status)
         self.qr_status = Label(text="", size_hint=(1, None), height=dp(18), font_size=sp(11))
         root.add_widget(self.qr_status)
 
-        # Main area: preview (80%) + thumbs (20%)
+        # Main area
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
-
-        # Preview holder and overlay layer
         self.preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview_scatter = Scatter(do_translation=False, do_scale=False, do_rotation=False, size_hint=(None, None))
         self.preview = PreviewOverlay(size_hint=(None, None))
         self.preview_scatter.add_widget(self.preview)
         self.preview_holder.add_widget(self.preview_scatter)
-
         main_area.add_widget(self.preview_holder)
 
-        # Thumbnails sidebar
+        # Thumbnail sidebar
         sidebar = BoxLayout(orientation="vertical", size_hint=(0.20, 1), spacing=dp(4))
         sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
         for idx in range(5):
@@ -793,10 +761,9 @@ class VolumeToolkitApp(App):
             sidebar.add_widget(img)
             self._thumb_images.append(img)
         main_area.add_widget(sidebar)
-
         root.add_widget(main_area)
 
-        # Footer: CSV + Push Update
+        # Footer
         footer = BoxLayout(orientation="horizontal", size_hint=(1, None), height=dp(48), spacing=dp(6))
         footer.add_widget(Label())
         self.csv_btn = Button(text="CSV", size_hint=(None, 1), width=dp(140))
@@ -805,7 +772,7 @@ class VolumeToolkitApp(App):
         footer.add_widget(self.push_update_btn)
         root.add_widget(footer)
 
-        # Fit preview
+        # Fit preview helper
         def fit_preview_to_holder(*_):
             w = max(dp(220), self.preview_holder.width * 0.98)
             h = max(dp(220), self.preview_holder.height * 0.98)
@@ -822,7 +789,7 @@ class VolumeToolkitApp(App):
         self._fit_preview_to_holder = fit_preview_to_holder
         self.preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
-        # Log area hidden by default
+        # Log area
         self.log_holder = BoxLayout(orientation="vertical", size_hint=(1, None), height=0)
         log_sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         self.log_label = Label(text="", size_hint_y=None, halign="left", valign="top", font_size=sp(11))
@@ -832,7 +799,7 @@ class VolumeToolkitApp(App):
         self.log_holder.add_widget(log_sv)
         root.add_widget(self.log_holder)
 
-        # Menu and bindings
+        # menu and bindings
         self.dropdown = self._build_dropdown()
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
@@ -840,25 +807,25 @@ class VolumeToolkitApp(App):
         self.start_btn.bind(on_press=lambda *_: self._on_start_pressed())
         self.autofetch_btn.bind(on_press=lambda *_: (self._on_autofetch_pressed(), self._style_autofetch_button(self.autofetch_running)))
         self.qr_find_btn.bind(on_press=lambda *_: self._on_qr_find_pressed())
-        self.csv_btn.bind(on_release=lambda *_: self._open_csv_menu())
+        self.csv_btn.bind(on_release=lambda *_: self._open_csv_filechooser())
         self.push_update_btn.bind(on_release=lambda *_: self._push_update())
 
-        # Start decoder thread now that preview exists (avoid race)
+        # start decoder thread
         if self._decoder_thread is None:
             self._decoder_thread = threading.Thread(target=self._decoder_loop, daemon=True)
             self._decoder_thread.start()
 
-        # Display ticker
+        # display ticker
         self._reschedule_display_loop(12)
 
-        # React to rotation/resize
+        # window resize
         Window.bind(on_resize=self._on_window_resize)
 
         self._set_controls_idle()
         self._log_internal("UI ready")
         return root
 
-    # ---------- helper & thumbnail functions ----------
+    # ---------- convenience methods ----------
     def _make_thumb_pos_updater(self, idx):
         def _updater(instance, value):
             try:
@@ -867,6 +834,14 @@ class VolumeToolkitApp(App):
                 pass
         return _updater
 
+    def _push_update(self):
+        # push manual_payload as author if present
+        try:
+            self._maybe_commit_author(self.manual_payload, source="manual")
+        except Exception:
+            pass
+
+    # ---------- thumbnail highlight helpers ----------
     def _highlight_thumb(self, idx):
         self._clear_thumb_highlight()
         if idx is None or idx >= len(self._thumb_images):
@@ -903,7 +878,7 @@ class VolumeToolkitApp(App):
         self._thumb_highlight_lines = {}
         self._highlighted_thumb_index = None
 
-    # ---------- window/rotation handling ----------
+    # ---------- window/rotation ----------
     def _on_window_resize(self, instance, width, height):
         try:
             if width > height:
@@ -1087,7 +1062,7 @@ class VolumeToolkitApp(App):
         btn_cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # ---------- Android CSV (SAF) helpers ----------
+    # ---------- Android CSV helpers ----------
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
             return
@@ -1099,6 +1074,12 @@ class VolumeToolkitApp(App):
             self._android_activity_bound = True
         except Exception as e:
             self._log_internal(f"Android activity bind failed: {e}")
+
+    def _open_csv_filechooser(self):
+        if platform != 'android':
+            self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
+            return
+        return self._open_csv_saf()
 
     def _open_csv_saf(self):
         self._bind_android_activity_once()
@@ -1132,14 +1113,12 @@ class VolumeToolkitApp(App):
             if uri is None:
                 self._log_internal("CSV picker returned no URI")
                 return
-
             try:
                 flags = intent.getFlags()
                 take_flags = flags & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
                 mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
             except Exception:
                 pass
-
             data = self._read_android_uri_bytes(uri)
             self._parse_csv_bytes(data)
             self._log_internal(f"CSV loaded from picker: {len(self.csv_rows)} rows")
@@ -1278,7 +1257,7 @@ class VolumeToolkitApp(App):
                 self.qr_status.text = "Author verify failed ✗"
         Clock.schedule_once(_finish, 0)
 
-    # ---------- liveview / decoder (unchanged) ----------
+    # ---------- liveview / decoder ----------
     def _reschedule_display_loop(self, fps):
         if self._display_event is not None:
             try:
@@ -1351,7 +1330,6 @@ class VolumeToolkitApp(App):
         self._display_count = 0
         self._stat_t0 = time.time()
 
-        # start fetch thread
         self._fetch_thread = threading.Thread(target=self._liveview_fetch_loop, daemon=True)
         self._fetch_thread.start()
 
@@ -1454,7 +1432,7 @@ class VolumeToolkitApp(App):
             except Exception:
                 continue
 
-    # ---------- thumbnails, overlay, and full-res swap (unchanged) ----------
+    # ---------- thumbnails, overlay, full-res (unchanged) ----------
     def _download_thumb_for_path(self, ccapi_path: str):
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         self._log_internal(f"Downloading thumbnail (bg): {thumb_url}")
@@ -1786,12 +1764,6 @@ class VolumeToolkitApp(App):
         for line in j.splitlines():
             self._log_internal(line)
         self._log_internal("=== ccapi JSON END ===")
-
-    def _open_csv_filechooser(self):
-        if platform != 'android':
-            self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
-            return
-        return self._open_csv_saf()
 
     def _set_log_visible(self, visible: bool):
         self.show_log = bool(visible)
