@@ -4,8 +4,11 @@
 # - Makes the four control buttons equal width (each 1/4 of the row)
 # - QR decoding runs continuously only when QR Detect is enabled
 # - Preview tap no longer triggers a temporary QR pulse (QR controlled by button)
-# - All referenced helpers are present to avoid AttributeError
-# - No HTML entities, defensive error handling throughout
+# - Convex-hull ordering for QR overlay to avoid weird polygons
+# - "Force Update" renamed to "Push Update" and pushes current Data Update payload
+# - Menu: removed CSV tools and Push payload items (CSV and Push handled by footer)
+# - Button colors: gray when off; Connect turns blue when connected; others green when ON
+# - Defensive error handling throughout; no HTML entities
 
 import os
 import json
@@ -169,7 +172,6 @@ class PreviewOverlay(FloatLayout):
         if texture is None:
             return
 
-        # compute image drawn rect (x,y,w,h) where the Image actually displays its texture
         dx, dy, iw, ih = self._drawn_rect()
         self._overlay_texture = texture
 
@@ -255,6 +257,8 @@ class PreviewOverlay(FloatLayout):
         self._redraw()
 
     def set_qr(self, points_px):
+        # points_px expected as list of (x,y) in image pixel coordinates relative to texture size
+        # We store them and redraw overlay lines to show polygon
         self._qr_points_px = points_px
         self._redraw()
 
@@ -314,6 +318,7 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
+        # remove previous grid elements
         for col_obj, line_obj in list(self._ln_grid_list):
             try:
                 self.img.canvas.after.remove(col_obj)
@@ -325,6 +330,7 @@ class PreviewOverlay(FloatLayout):
                 pass
         self._ln_grid_list = []
 
+        # draw grid lines explicitly
         n = int(self.grid_n)
         if self.show_grid and n >= 2:
             for i in range(1, n):
@@ -366,8 +372,9 @@ class PreviewOverlay(FloatLayout):
 
             line_pts = []
             for (x, y) in self._qr_points_px:
-                u = float(x) / float(iw)
-                v = float(y) / float(ih)
+                # map texture pixel coords into displayed rect
+                u = float(x) / float(iw) if iw else 0.0
+                v = float(y) / float(ih) if ih else 0.0
                 sx = dx + u * dw
                 sy = dy + v * dh
                 line_pts += [sx, sy]
@@ -504,6 +511,23 @@ class VolumeToolkitApp(App):
         # Autofetch state (toggle on main UI)
         self.autofetch_running = False
 
+    # ---------- utility ----------
+    def _log_internal(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self._log_lines.append(line)
+        if len(self._log_lines) > self._max_log_lines:
+            self._log_lines = self._log_lines[-self._max_log_lines:]
+        if getattr(self, "show_log", False):
+            self._refresh_log_view()
+
+    def _refresh_log_view(self):
+        metrics_line = self._get_metrics_text()
+        self.log_label.text = metrics_line + "\n\n" + "\n".join(self._log_lines)
+
+    def _get_metrics_text(self):
+        return f"Delay: -- ms | Fetch: {self._fetch_count} | Decode: {self._decode_count} | Display: {self._display_count}"
+
     # ---------- texture helpers (main-thread creation) ----------
     def _create_texture_from_rgb(self, rgb_bytes, w, h, flip_vertical=True):
         try:
@@ -526,11 +550,6 @@ class VolumeToolkitApp(App):
             return None
 
     def _create_texture_from_jpeg_bytes(self, jpeg_bytes, rotate=0, flip_vertical=True):
-        """
-        Decode JPEG bytes (on the main thread) and create a Texture.
-        Use sparingly; preferred path decodes in background then schedules this function
-        to create the texture from RGB bytes.
-        """
         try:
             arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -646,13 +665,13 @@ class VolumeToolkitApp(App):
 
         root.add_widget(main_area)
 
-        # Footer: CSV button and Force update button
+        # Footer: CSV button and Push update button (renamed from Force update)
         footer = BoxLayout(orientation="horizontal", size_hint=(1, None), height=dp(48), spacing=dp(6))
         footer.add_widget(Label())  # spacer to push buttons to the right side
         self.csv_btn = Button(text="CSV", size_hint=(None, 1), width=dp(140))
-        self.force_update_btn = Button(text="Force update", size_hint=(None, 1), width=dp(140))
+        self.push_update_btn = Button(text="Push Update", size_hint=(None, 1), width=dp(140))
         footer.add_widget(self.csv_btn)
-        footer.add_widget(self.force_update_btn)
+        footer.add_widget(self.push_update_btn)
         root.add_widget(footer)
 
         # Fit preview to holder
@@ -693,7 +712,7 @@ class VolumeToolkitApp(App):
         self.autofetch_btn.bind(on_press=lambda *_: self._on_autofetch_pressed())
         self.qr_btn.bind(on_press=lambda *_: self._on_qr_pressed())
         self.csv_btn.bind(on_release=lambda *_: self._open_csv_menu())
-        self.force_update_btn.bind(on_release=lambda *_: self._force_update_from_selection())
+        self.push_update_btn.bind(on_release=lambda *_: self._push_update())
 
         # Start decoder thread now that preview exists (avoid race)
         if self._decoder_thread is None:
@@ -722,36 +741,48 @@ class VolumeToolkitApp(App):
         return b
 
     def _style_connect_button(self, initial=False):
-        self.connect_btn.background_normal = ""
-        self.connect_btn.background_down = ""
-        self.connect_btn.background_color = (0.06, 0.45, 0.75, 1.0)  # blue
-        if initial or not self.connected:
-            self.connect_btn.color = (1, 1, 1, 1)
-        else:
-            self.connect_btn.color = (1, 1, 0, 1)
+        # gray when disconnected, blue when connected
+        try:
+            self.connect_btn.background_normal = ""
+            self.connect_btn.background_down = ""
+            if self.connected:
+                self.connect_btn.background_color = (0.06, 0.45, 0.75, 1.0)  # blue
+                self.connect_btn.color = (1, 1, 1, 1)
+                self.connect_btn.text = "Connected"
+            else:
+                self.connect_btn.background_color = (0.45, 0.45, 0.45, 1.0)  # gray
+                self.connect_btn.color = (1, 1, 1, 1)
+                self.connect_btn.text = "Connect"
+        except Exception:
+            pass
 
     def _style_start_button(self, stopped=True):
-        self.start_btn.background_normal = ""
-        self.start_btn.background_down = ""
-        if stopped:
-            self.start_btn.background_color = (0.0, 0.6, 0.0, 1.0)
-            self.start_btn.color = (1, 1, 1, 1)
-            self.start_btn.text = "Start"
-        else:
-            self.start_btn.background_color = (0.8, 0.0, 0.0, 1.0)
-            self.start_btn.color = (1, 1, 1, 1)
-            self.start_btn.text = "Stop"
+        # gray when stopped, green when running
+        try:
+            self.start_btn.background_normal = ""
+            self.start_btn.background_down = ""
+            if stopped:
+                self.start_btn.background_color = (0.45, 0.45, 0.45, 1.0)  # gray
+                self.start_btn.color = (1, 1, 1, 1)
+                self.start_btn.text = "Start"
+            else:
+                self.start_btn.background_color = (0.05, 0.6, 0.05, 1.0)  # green
+                self.start_btn.color = (1, 1, 1, 1)
+                self.start_btn.text = "Stop"
+        except Exception:
+            pass
 
     def _style_autofetch_button(self, running=False):
         try:
             self.autofetch_btn.background_normal = ""
             self.autofetch_btn.background_down = ""
             if running:
-                self.autofetch_btn.background_color = (0.1, 0.6, 0.1, 1.0)
+                self.autofetch_btn.background_color = (0.05, 0.6, 0.05, 1.0)  # green
                 self.autofetch_btn.text = "Autofetch On"
             else:
-                self.autofetch_btn.background_color = (0.4, 0.4, 0.4, 1.0)
+                self.autofetch_btn.background_color = (0.45, 0.45, 0.45, 1.0)  # gray
                 self.autofetch_btn.text = "Autofetch Off"
+            self.autofetch_btn.color = (1, 1, 1, 1)
         except Exception:
             pass
 
@@ -760,11 +791,12 @@ class VolumeToolkitApp(App):
             self.qr_btn.background_normal = ""
             self.qr_btn.background_down = ""
             if running:
-                self.qr_btn.background_color = (0.05, 0.45, 0.05, 1.0)
+                self.qr_btn.background_color = (0.05, 0.6, 0.05, 1.0)  # green
                 self.qr_btn.text = "QR Detect On"
             else:
-                self.qr_btn.background_color = (0.4, 0.4, 0.4, 1.0)
+                self.qr_btn.background_color = (0.45, 0.45, 0.45, 1.0)  # gray
                 self.qr_btn.text = "QR Detect Off"
+            self.qr_btn.color = (1, 1, 1, 1)
         except Exception:
             pass
 
@@ -783,36 +815,9 @@ class VolumeToolkitApp(App):
                 self.start_polling_new_images()
             else:
                 self.stop_polling_new_images()
+            self._style_autofetch_button(self.autofetch_running)
         except Exception as e:
             self._log_internal(f"_on_autofetch_pressed error: {e}")
-
-    def _log_internal(self, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        self._log_lines.append(line)
-        if len(self._log_lines) > self._max_log_lines:
-            self._log_lines = self._log_lines[-self._max_log_lines:]
-        if getattr(self, "show_log", False):
-            self._refresh_log_view()
-
-    def _refresh_log_view(self):
-        metrics_line = self._get_metrics_text()
-        self.log_label.text = metrics_line + "\n\n" + "\n".join(self._log_lines)
-
-    def _get_metrics_text(self):
-        return f"Delay: -- ms | Fetch: {self._fetch_count} | Decode: {self._decode_count} | Display: {self._display_count}"
-
-    def _set_log_visible(self, visible: bool):
-        self.show_log = bool(visible)
-        if self.show_log:
-            self.log_holder.height = dp(150)
-            self.log_holder.opacity = 1
-            self.log_holder.disabled = False
-            self._refresh_log_view()
-        else:
-            self.log_holder.height = 0
-            self.log_holder.opacity = 0
-            self.log_holder.disabled = True
 
     # ---------- helper to create per-thumb pos updaters ----------
     def _make_thumb_pos_updater(self, idx):
@@ -862,21 +867,16 @@ class VolumeToolkitApp(App):
 
     # ---------- CSV menu (footer CSV button) ----------
     def _open_csv_menu(self):
-        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
-        b_load = Button(text="Load CSV (Android SAF)", size_hint=(1, None), height=dp(44))
-        b_select = Button(text="Select Students", size_hint=(1, None), height=dp(44))
-        b_headers = Button(text="Select Headers", size_hint=(1, None), height=dp(44))
-        b_close = Button(text="Close", size_hint=(1, None), height=dp(44))
-        content.add_widget(b_load)
-        content.add_widget(b_select)
-        content.add_widget(b_headers)
-        content.add_widget(b_close)
-        popup = Popup(title="CSV", content=content, size_hint=(0.6, 0.5))
-        b_load.bind(on_release=lambda *_: (popup.dismiss(), self._open_csv_filechooser()))
-        b_select.bind(on_release=lambda *_: (popup.dismiss(), self._open_student_selector_popup()))
-        b_headers.bind(on_release=lambda *_: (popup.dismiss(), self._open_headers_popup()))
-        b_close.bind(on_release=lambda *_: popup.dismiss())
-        popup.open()
+        # CSV handling is via CSV footer button and selection popup; for Android we open SAF picker
+        if platform != 'android':
+            # On non-Android show a help popup
+            popup = Popup(title="CSV",
+                          content=Label(text="CSV load is Android-only (SAF). Run on device to pick a CSV."),
+                          size_hint=(0.6, 0.3))
+            popup.open()
+            return
+        # On Android open SAF
+        self._open_csv_saf()
 
     # ---------- CSV selector popup implementation ----------
     def _open_student_selector_popup(self):
@@ -1042,14 +1042,18 @@ class VolumeToolkitApp(App):
                 displayed_row_buttons.append(btn)
 
         def _on_row_selected(row, widget):
+            # selecting a CSV row should set CSV selection and display it in Data Update label
             self._selected_csv_row = row
             parts = []
             for h in self.selected_headers:
                 parts.append(str(row.get(h, "")).strip())
             payload = "_".join([p for p in parts if p])
             self._selected_author_payload = payload
+            # clear any QR selection override state
             self._latest_qr_text = ""
+            # show CSV payload
             Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {payload}"[:200]), 0)
+            # highlight selected button
             for b in displayed_row_buttons:
                 try:
                     b.background_color = (1, 1, 1, 1)
@@ -1060,6 +1064,7 @@ class VolumeToolkitApp(App):
             except Exception:
                 pass
 
+        # Footer buttons for popup
         popup_btns = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         btn_select = Button(text="Confirm selection")
         btn_force = Button(text="Force update")
@@ -1096,14 +1101,45 @@ class VolumeToolkitApp(App):
         refresh_student_list()
         popup.open()
 
-    def _force_update_from_selection(self):
-        if not self._selected_author_payload:
-            self._log_internal("Force update requested but no CSV selection available")
-            notice = Popup(title="No selection", content=Label(text="No student selected. Use 'CSV' first."), size_hint=(0.6, 0.3))
+    def _push_update(self):
+        """
+        Push whatever is currently shown in the 'Data Update' label to the camera author.
+        Priority:
+         - latest decoded QR text (if any)
+         - selected CSV payload (if any)
+         - manual_payload (if set)
+         - fallback: parse qr_last_label text (last resort)
+        """
+        payload = ""
+        if getattr(self, "_latest_qr_text", None):
+            payload = self._latest_qr_text
+        elif getattr(self, "_selected_author_payload", None):
+            payload = self._selected_author_payload
+        elif getattr(self, "manual_payload", ""):
+            payload = self.manual_payload
+        else:
+            # Last resort: try to parse label text "Data Update: ..."
+            try:
+                txt = getattr(self, "qr_last_label", None)
+                if txt and hasattr(txt, "text"):
+                    val = txt.text
+                    if val.startswith("Data Update:"):
+                        payload = val.split("Data Update:", 1)[1].strip()
+            except Exception:
+                payload = ""
+
+        if not payload:
+            self._log_internal("Push Update requested but no Data Update payload available")
+            notice = Popup(title="No payload", content=Label(text="No Data Update payload to push"), size_hint=(0.6, 0.3))
             notice.open()
             return
-        self._log_internal(f"Forcing update with CSV payload: {self._selected_author_payload}")
-        self._maybe_commit_author(self._selected_author_payload, source="manual-csv")
+
+        self._log_internal(f"Pushing Update payload: {payload}")
+        self._maybe_commit_author(payload, source="push")
+
+    def _force_update_from_selection(self):
+        # backward-compat: if some code still calls this, map to push_update behavior
+        return self._push_update()
 
     # ---------- window/rotation handling ----------
     def _on_window_resize(self, instance, width, height):
@@ -1123,7 +1159,7 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
 
-    # ---------- dropdown + sub-popups ----------
+    # ---------- dropdown (main menu): CSV & Push removed (handled in footer) ----------
     def _build_dropdown(self):
         dd = DropDown(auto_dismiss=True)
         dd.auto_width = False
@@ -1144,6 +1180,7 @@ class VolumeToolkitApp(App):
             b.bind(on_release=lambda *_: (fn(), dd.dismiss()))
             dd.add_widget(b)
 
+        # Keep framing / overlays / capture / settings / debug only
         add_header("Framing")
         add_button_to_dd("Reset framing", lambda: self._fit_preview_to_holder())
 
@@ -1152,17 +1189,12 @@ class VolumeToolkitApp(App):
         add_button_to_dd("Capture...", lambda: self._open_capture_popup())
         add_button_to_dd("Settings...", lambda: self._open_settings_popup())
 
-        add_header("CSV")
-        add_button_to_dd("CSV tools...", lambda: self._open_csv_menu())
-
-        add_header("QR & Author")
-        add_button_to_dd("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
-
         add_header("Debug")
         add_button_to_dd("Dump /ccapi", lambda: self.dump_ccapi())
 
         return dd
 
+    # Overlays popup
     def _open_overlays_popup(self):
         content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
         content.add_widget(Label(text="Overlays", size_hint=(1, None), height=dp(28)))
@@ -1186,6 +1218,7 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
+    # Capture popup
     def _open_capture_popup(self):
         content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
         content.add_widget(Label(text="Capture", size_hint=(1, None), height=dp(28)))
@@ -1205,6 +1238,7 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
+    # Settings popup
     def _open_settings_popup(self):
         content = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(6))
         content.add_widget(Label(text="Settings", size_hint=(1, None), height=dp(28)))
@@ -1227,6 +1261,7 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
+    # FPS / IP popups (unchanged)
     def _open_fps_popup(self):
         content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
         sv = Slider(min=5, max=30, value=12, step=1)
@@ -1349,12 +1384,6 @@ class VolumeToolkitApp(App):
         stream.close()
         return bytes(out)
 
-    def _open_csv_filechooser(self):
-        if platform != 'android':
-            self._log_internal("CSV load is Android-only (SAF). Please run on-device to load CSV.")
-            return
-        return self._open_csv_saf()
-
     def _parse_csv_bytes(self, b: bytes):
         self._log_internal(f"CSV size: {len(b)} bytes")
         try:
@@ -1443,19 +1472,13 @@ class VolumeToolkitApp(App):
                     self.connected = True
                     self.status.text = f"Status: connected ({data.get('productname', 'camera')})"
                     self._log_internal("Connected OK")
-                    try:
-                        self.connect_btn.color = (1, 1, 0, 1)
-                    except Exception:
-                        pass
+                    self._style_connect_button()
                     self.start_btn.disabled = False
                 else:
                     self.connected = False
                     self.status.text = f"Status: connect failed ({status})"
                     self._log_internal(f"Connect failed: {status}")
-                    try:
-                        self.connect_btn.color = (1, 1, 1, 1)
-                    except Exception:
-                        pass
+                    self._style_connect_button()
                     self.start_btn.disabled = True
             finally:
                 try:
@@ -1572,9 +1595,11 @@ class VolumeToolkitApp(App):
                 return
             self.start_liveview()
             self._set_controls_running()
+            self._style_start_button(stopped=False)
         else:
             self.stop_liveview()
             self._set_controls_idle()
+            self._style_start_button(stopped=True)
 
     def start_liveview(self):
         if not self.connected or self.live_running:
@@ -1589,6 +1614,7 @@ class VolumeToolkitApp(App):
         self.session_started = True
         self.live_running = True
         self._set_controls_running()
+        self._style_start_button(stopped=False)
         self.status.text = "Status: live"
         with self._lock:
             self._latest_jpeg = None
@@ -1610,7 +1636,7 @@ class VolumeToolkitApp(App):
         self._fetch_thread = threading.Thread(target=self._liveview_fetch_loop, daemon=True)
         self._fetch_thread.start()
 
-        # ensure qr thread always exists and runs while live_running (it checks qr_enabled)
+        # ensure qr thread exists
         if self._qr_thread is None or not self._qr_thread.is_alive():
             self._qr_thread = threading.Thread(target=self._qr_loop, daemon=True)
             self._qr_thread.start()
@@ -1629,6 +1655,7 @@ class VolumeToolkitApp(App):
         self.status.text = "Status: connected (live stopped)" if self.connected else "Status: not connected"
         self._log_internal("Live view stopped")
         self._set_controls_idle()
+        self._style_start_button(stopped=True)
 
     def _liveview_fetch_loop(self):
         url = f"https://{self.camera_ip}/ccapi/ver100/shooting/liveview/flip"
@@ -1715,9 +1742,13 @@ class VolumeToolkitApp(App):
                 continue
 
     def _qr_loop(self):
+        """
+        Process latest decoded frames for QR detection while live_running.
+        Uses grayscale frames and computes a convex hull for overlay polygons to avoid
+        crossing lines and weird shapes.
+        """
         last_processed_ts = 0.0
         while self.live_running:
-            # Only run QR detection work when enabled
             if not self.qr_enabled:
                 time.sleep(0.10)
                 continue
@@ -1733,17 +1764,27 @@ class VolumeToolkitApp(App):
                 continue
 
             try:
-                # use grayscale for more robust detection
                 gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
                 decoded, points, _ = self._qr_detector.detectAndDecode(gray)
                 qr_text = decoded.strip() if isinstance(decoded, str) else ""
                 qr_points = None
+
                 if points is not None:
                     try:
-                        arr = np.array(points)
+                        arr = np.array(points, dtype=np.float32)
                         pts = arr.reshape(-1, 2)
-                        if len(pts) >= 4:
-                            qr_points = [(int(pts[i][0]), int(pts[i][1])) for i in range(4)]
+                        if len(pts) >= 3:
+                            hull = cv2.convexHull(pts)
+                            hull_pts = np.squeeze(hull)
+                            if hull_pts.ndim == 1 and hull_pts.size == 2:
+                                hull_pts = hull_pts.reshape((1, 2))
+                            qr_points = [(int(round(p[0])), int(round(p[1]))) for p in hull_pts]
+                        else:
+                            xs = pts[:, 0]
+                            ys = pts[:, 1]
+                            minx, maxx = int(xs.min()), int(xs.max())
+                            miny, maxy = int(ys.min()), int(ys.max())
+                            qr_points = [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]
                     except Exception:
                         qr_points = None
 
@@ -1760,28 +1801,30 @@ class VolumeToolkitApp(App):
         return False
 
     def _publish_qr(self, text, points):
+        """
+        When QR text is available, clear CSV selection and update Data Update label.
+        When only points available, show overlay polygon but do not override Data Update text.
+        """
         now = time.time()
 
-        # When a QR is read, it should override any CSV selection currently displayed.
-        # Clear CSV selection state so the QR becomes the active Data Update source.
         if text:
+            # Clear CSV selection so QR becomes authoritative
             self._selected_csv_row = None
             self._selected_author_payload = None
 
-        if text:
             if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
                 self._qr_seen.add(text)
                 self._qr_last_add_time = now
                 self._log_internal(f"QR: {text}")
-            # auto-commit from QR if desired
+
+            # auto-commit if desired
             self._maybe_commit_author(text, source="qr")
 
-        if text:
+            # Update authoritative Data Update label
             self._latest_qr_text = text
             Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {text}"[:200]), 0)
-        elif self._latest_qr_text:
-            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {self._latest_qr_text}"[:200]), 0)
 
+        # Show overlay polygon for points (ordered by convex hull earlier)
         if points:
             if getattr(self, "_qr_highlight_event", None):
                 try:
@@ -1799,8 +1842,14 @@ class VolumeToolkitApp(App):
                     Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 0)
                 threading.Thread(target=bg_clear, daemon=True).start()
 
-        note = f"Data Update: {text[:80]}" if text else ("QR: detected" if points else ("Data Update: on" if self.qr_enabled else "Data Update: none"))
-        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", note), 0)
+        # Short status
+        if text:
+            status_note = f"Data Update: {text[:80]}"
+        elif points:
+            status_note = "QR: detected"
+        else:
+            status_note = ("Data Update: on" if self.qr_enabled else "Data Update: none")
+        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", status_note), 0)
 
     def _clear_qr_overlay(self):
         try:
@@ -1817,7 +1866,6 @@ class VolumeToolkitApp(App):
 
     def _set_qr_ui(self, text, points, note="Data Update: none"):
         if text:
-            # QR becomes the visible Data Update and clears any CSV selection
             self._selected_csv_row = None
             self._selected_author_payload = None
             self._latest_qr_text = text
