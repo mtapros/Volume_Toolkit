@@ -1,14 +1,13 @@
 # Volume Toolkit - main.py
-# Full, cleaned, double-checked main.py
-# - QR Detect toggle (top control row)
-# - 4 equal-width control buttons (Connect/Start/Autofetch/QR Detect)
-# - Button color scheme: gray=off, blue=connected (Connect), green=on (Start, Autofetch, QR)
-# - CSV footer button opens a CSV popup: Load CSV / Select Headers / Select Students
-# - Push Update footer button pushes the current "Data Update" payload (QR > CSV > manual)
-# - QR detection uses grayscale frames and convex hull for polygon overlay (avoids crossed polygons)
-# - QR decoded text immediately updates the "Data Update:" label and clears CSV selection
-# - Defensive error handling and attribute checks to avoid AttributeError
-# - No HTML entities, ready to drop into the repo
+# Full patched file implementing:
+# - QR overlay convex-hull ordering to avoid crossed polygons
+# - QR decoded text always updates the Exif Payload label (and clears CSV selection)
+# - CSV footer menu with Load CSV / Select Headers / Select Students
+# - Push Update footer button pushes the shown Exif payload (prefers QR then CSV then manual)
+# - Label shows source: "Exif Payload (QR): ..." or "Exif Payload (CSV): ..." or "Exif Payload (none): none"
+# - Top control buttons styled: gray/off, blue=Connected, green=On
+# - Defensive scheduling of UI updates to main thread
+# - Cleaned spelling and removed HTML entity artifacts
 
 import os
 import json
@@ -465,6 +464,10 @@ class VolumeToolkitApp(App):
         self.selected_headers = []
         self._headers_popup = None
 
+        # store which source is currently shown in the Exif Payload label:
+        # "QR", "CSV", "MANUAL", or "none"
+        self._payload_source = "none"
+
         # thumbnails
         self._thumb_textures = []
         self._thumb_images = []
@@ -626,15 +629,15 @@ class VolumeToolkitApp(App):
         row2.add_widget(self.qr_btn)
         root.add_widget(row2)
 
-        # Data Update / status labels
-        self.qr_last_label = Label(text="Data Update: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
+        # Exif Payload / status labels
+        self.qr_last_label = Label(text="Exif Payload (none): none", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.qr_last_label)
         self.status = Label(text="Status: not connected", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.status)
         self.qr_status = Label(text="", size_hint=(1, None), height=dp(18), font_size=sp(11))
         root.add_widget(self.qr_status)
 
-        # Main area
+        # Main area: preview (80%) + thumbs (20%)
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
         # Preview holder and overlay layer
@@ -1050,17 +1053,22 @@ class VolumeToolkitApp(App):
                 displayed_row_buttons.append(btn)
 
         def _on_row_selected(row, widget):
-            # selecting a CSV row should set CSV selection and display it in Data Update label
+            # selecting a CSV row should set CSV selection and display it in Exif Payload label
             self._selected_csv_row = row
             parts = []
             for h in self.selected_headers:
                 parts.append(str(row.get(h, "")).strip())
             payload = "_".join([p for p in parts if p])
             self._selected_author_payload = payload
-            # clear any QR selection override state
+
+            # mark source as CSV and clear QR override
+            self._payload_source = "CSV"
             self._latest_qr_text = ""
-            # show CSV payload
-            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {payload}"[:200]), 0)
+
+            # update UI on main thread
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Exif Payload ({self._payload_source}): {payload}"[:200]), 0)
+            Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Exif Payload ({self._payload_source}): {payload[:80]}"), 0)
+
             # highlight selected button
             for b in displayed_row_buttons:
                 try:
@@ -1092,6 +1100,8 @@ class VolumeToolkitApp(App):
                 notice = Popup(title="No selection", content=Label(text="Select a student row first."), size_hint=(0.6, 0.3))
                 notice.open()
                 return
+            # set payload source to CSV (defensive) and push
+            self._payload_source = "CSV"
             self._maybe_commit_author(self._selected_author_payload, source="csv")
             popup.dismiss()
 
@@ -1112,38 +1122,44 @@ class VolumeToolkitApp(App):
     # ---------- Push Update ----------
     def _push_update(self):
         """
-        Push whatever is currently shown in the 'Data Update' label to the camera author.
+        Push whatever is currently shown in the 'Exif Payload' label to the camera author.
         Priority:
-         - latest decoded QR text (if any)
-         - selected CSV payload (if any)
+         - latest decoded QR text (if payload source == QR)
+         - selected CSV payload (if payload source == CSV)
          - manual_payload (if set)
          - fallback: parse qr_last_label text (last resort)
         """
         payload = ""
-        if getattr(self, "_latest_qr_text", None):
+        if getattr(self, "_payload_source", "") == "QR" and getattr(self, "_latest_qr_text", None):
             payload = self._latest_qr_text
-        elif getattr(self, "_selected_author_payload", None):
+        elif getattr(self, "_payload_source", "") == "CSV" and getattr(self, "_selected_author_payload", None):
             payload = self._selected_author_payload
         elif getattr(self, "manual_payload", ""):
             payload = self.manual_payload
         else:
-            # Last resort: try to parse label text "Data Update: ..."
+            # Last resort: try to parse label text "Exif Payload (...): ..."
             try:
                 txt = getattr(self, "qr_last_label", None)
                 if txt and hasattr(txt, "text"):
                     val = txt.text
-                    if val.startswith("Data Update:"):
-                        payload = val.split("Data Update:", 1)[1].strip()
+                    if val.startswith("Exif Payload"):
+                        # split at ':'
+                        parts = val.split(":", 1)
+                        if len(parts) > 1:
+                            payload = parts[1].strip()
             except Exception:
                 payload = ""
 
         if not payload:
-            self._log_internal("Push Update requested but no Data Update payload available")
-            notice = Popup(title="No payload", content=Label(text="No Data Update payload to push"), size_hint=(0.6, 0.3))
+            self._log_internal("Push Update requested but no Exif Payload available")
+            notice = Popup(title="No payload", content=Label(text="No Exif Payload to push"), size_hint=(0.6, 0.3))
             notice.open()
             return
 
-        self._log_internal(f"Pushing Update payload: {payload}")
+        self._log_internal(f"Pushing Update payload: {payload} (source={self._payload_source})")
+        # Mark source as MANUAL if pushing manual payload
+        if self._payload_source not in ("QR", "CSV"):
+            self._payload_source = "MANUAL"
         self._maybe_commit_author(payload, source="push")
 
     def _force_update_from_selection(self):
@@ -1510,7 +1526,7 @@ class VolumeToolkitApp(App):
         if self._author_update_in_flight:
             return
         self._author_update_in_flight = True
-        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Data Update: updating… ({source})"), 0)
+        Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Exif Payload: updating… ({source})"), 0)
         threading.Thread(target=self._commit_author_worker, args=(value, source), daemon=True).start()
 
     def _commit_author_worker(self, value: str, source: str):
@@ -1543,19 +1559,19 @@ class VolumeToolkitApp(App):
             if ok:
                 self._last_committed_author = value
                 self._log_internal(f"Author updated+verified ({source}): '{value}'")
-                self.qr_status.text = "Data Update: updated ✓"
+                self.qr_status.text = "Exif Payload: updated ✓"
             else:
                 self._log_internal(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
-                self.qr_status.text = "Data Update: verify failed ✗"
+                self.qr_status.text = "Exif Payload: verify failed ✗"
         Clock.schedule_once(_finish, 0)
 
     # ---------- liveview / decoder / QR ----------
     def _set_qr_enabled(self, enabled: bool):
         self.qr_enabled = bool(enabled)
         if not self.qr_enabled:
-            self._set_qr_ui(None, None, note="Data Update: none")
+            self._set_qr_ui(None, None, note="Exif Payload: none")
         else:
-            self._set_qr_ui(None, None, note="Data Update: on")
+            self._set_qr_ui(None, None, note="Exif Payload: on")
 
     def _reschedule_display_loop(self, fps):
         if self._display_event is not None:
@@ -1631,7 +1647,9 @@ class VolumeToolkitApp(App):
         self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
-        self._set_qr_ui(None, None, note="Data Update: none")
+        # Start with no payload
+        self._payload_source = "none"
+        Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", "Exif Payload (none): none"), 0)
         self._fetch_count = 0
         self._decode_count = 0
         self._display_count = 0
@@ -1813,8 +1831,8 @@ class VolumeToolkitApp(App):
 
     def _publish_qr(self, text, points):
         """
-        When QR text is available, clear CSV selection and update Data Update label.
-        When only points available, show overlay polygon but do not override Data Update text.
+        When QR text is available, clear CSV selection and update Exif Payload label.
+        When only points available, show overlay polygon but do not override Exif Payload text.
         """
         now = time.time()
 
@@ -1823,21 +1841,29 @@ class VolumeToolkitApp(App):
             self._selected_csv_row = None
             self._selected_author_payload = None
 
+            # mark payload source as QR
+            self._payload_source = "QR"
+
             if (text not in self._qr_seen) and (now - self._qr_last_add_time >= self.qr_new_gate_s):
                 self._qr_seen.add(text)
                 self._qr_last_add_time = now
                 self._log_internal(f"QR: {text}")
 
-            # auto-commit if desired
-            self._maybe_commit_author(text, source="qr")
+            # auto-commit if desired (this will attempt to push to camera if connected)
+            try:
+                self._maybe_commit_author(text, source="qr")
+            except Exception:
+                pass
 
-            # Update authoritative Data Update label
+            # Update authoritative Exif Payload label (main thread)
             self._latest_qr_text = text
             try:
-                Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {text}"[:200]), 0)
+                Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Exif Payload ({self._payload_source}): {text}"[:200]), 0)
+                Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", f"Exif Payload ({self._payload_source}): {text[:80]}"), 0)
             except Exception:
                 try:
-                    self.qr_last_label.text = f"Data Update: {text}"[:200]
+                    self.qr_last_label.text = f"Exif Payload ({self._payload_source}): {text}"[:200]
+                    self.qr_status.text = f"Exif Payload ({self._payload_source}): {text[:80]}"
                 except Exception:
                     pass
 
@@ -1850,7 +1876,14 @@ class VolumeToolkitApp(App):
                     pass
                 self._qr_highlight_event = None
 
-            Clock.schedule_once(lambda *_: self.preview.set_qr(points), 0)
+            try:
+                Clock.schedule_once(lambda *_: self.preview.set_qr(points), 0)
+            except Exception:
+                try:
+                    self.preview.set_qr(points)
+                except Exception:
+                    pass
+
             try:
                 self._qr_highlight_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
             except Exception:
@@ -1861,11 +1894,11 @@ class VolumeToolkitApp(App):
 
         # Short status
         if text:
-            status_note = f"Data Update: {text[:80]}"
+            status_note = f"Exif Payload ({self._payload_source}): {text[:80]}"
         elif points:
             status_note = "QR: detected"
         else:
-            status_note = ("Data Update: on" if self.qr_enabled else "Data Update: none")
+            status_note = ("Exif Payload: on" if self.qr_enabled else "Exif Payload: none")
         Clock.schedule_once(lambda *_: setattr(self.qr_status, "text", status_note), 0)
 
     def _clear_qr_overlay(self):
@@ -1881,12 +1914,13 @@ class VolumeToolkitApp(App):
                 pass
             self._qr_highlight_event = None
 
-    def _set_qr_ui(self, text, points, note="Data Update: none"):
+    def _set_qr_ui(self, text, points, note="Exif Payload: none"):
         if text:
             self._selected_csv_row = None
             self._selected_author_payload = None
             self._latest_qr_text = text
-            self.qr_last_label.text = f"Data Update: {text}"
+            self._payload_source = "QR"
+            self.qr_last_label.text = f"Exif Payload ({self._payload_source}): {text}"
         if points:
             self._latest_qr_points = points
             self.preview.set_qr(points)
