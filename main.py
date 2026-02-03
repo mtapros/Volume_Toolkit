@@ -1,17 +1,14 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Cleaned, complete main.py:
-# - HTML/entity encodings removed
-# - KIVY_HOME set early (before importing kivy) to avoid icon-copy permission failures on Android
+# Full corrected main.py (cleaned, double-checked)
+# - All HTML/entity encodings removed
+# - KIVY_HOME set early before importing kivy
 # - pil_rotate_90s signature corrected
-# - _style_menu_button implemented
-# - _on_autofetch_pressed implemented
-# - CSV UI fully integrated (CSV footer button opens CSV menu with Load/Select/Headers)
-# - CSV selector supports reorder/filter/sort, scrolling, selection -> Data Update label
-# - QR overrides CSV selection (QR clears CSV selection and writes Data Update)
-# - Autofetch button toggles background polling
+# - Missing helpers implemented: _style_menu_button, _on_autofetch_pressed, _make_thumb_pos_updater
+# - CSV/QR selection logic: QR always overrides CSV selection and updates Data Update row
+# - Autofetch (poller) toggle implemented and defensive
 # - Stale full-res fetch prevention via request ids
-# - All Kivy Texture creation happens on the main (GL) thread via Clock.schedule_once
-# - Defensive error handling and logging throughout
+# - Texture creation scheduled on main thread where required
+# - Defensive error handling and logging kept
 
 import os
 import json
@@ -168,7 +165,7 @@ class PreviewOverlay(FloatLayout):
         self._qr_points_px = None
         self._redraw()
 
-    # ---------- overlay rectangle helpers (drawn into img.canvas.after and sized to drawn rect) ----------
+    # ---------- overlay rectangle helpers ----------
     def set_overlay_texture(self, texture: Texture):
         """
         Draw the given texture into a Rectangle that matches the drawn image bounds
@@ -301,8 +298,6 @@ class PreviewOverlay(FloatLayout):
         else:
             w = frame_w
             h = w / aspect
-        x = frame_x + (frame_framed if False else (frame_w - w) / 2.0)  # safe fallback handled below
-        # Above line is defensive; compute center normally:
         x = frame_x + (frame_w - w) / 2.0
         y = frame_y + (frame_h - h) / 2.0
         return (x, y, w, h)
@@ -823,6 +818,346 @@ class VolumeToolkitApp(App):
             self.log_holder.height = 0
             self.log_holder.opacity = 0
             self.log_holder.disabled = True
+
+    # ---------- helper to create per-thumb pos updaters ----------
+    def _make_thumb_pos_updater(self, idx):
+        """
+        Return a callback that updates the thumb highlight rectangle position when a thumbnail's
+        pos/size changes. Bound as: img.bind(pos=self._make_thumb_pos_updater(idx), size=...)
+        """
+        def _updater(instance, value):
+            try:
+                self._update_thumb_highlight_pos(idx)
+            except Exception:
+                pass
+        return _updater
+
+    # ---------- thumbnail highlight helpers ----------
+    def _highlight_thumb(self, idx):
+        self._clear_thumb_highlight()
+        if idx is None or idx >= len(self._thumb_images):
+            return
+        img = self._thumb_images[idx]
+        try:
+            with img.canvas.after:
+                col = Color(1.0, 0.8, 0.0, 1.0)  # yellow-ish
+                ln = Line(rectangle=(img.x, img.y, img.width, img.height), width=2)
+            self._thumb_highlight_lines[idx] = (col, ln)
+            self._highlighted_thumb_index = idx
+        except Exception:
+            self._thumb_highlight_lines = {}
+            self._highlighted_thumb_index = None
+
+    def _update_thumb_highlight_pos(self, idx):
+        if idx not in self._thumb_highlight_lines:
+            return
+        img = self._thumb_images[idx]
+        col, ln = self._thumb_highlight_lines[idx]
+        try:
+            ln.rectangle = (img.x, img.y, img.width, img.height)
+        except Exception:
+            pass
+
+    def _clear_thumb_highlight(self):
+        for k, (col, ln) in list(self._thumb_highlight_lines.items()):
+            try:
+                widget = self._thumb_images[k]
+                widget.canvas.after.remove(col)
+                widget.canvas.after.remove(ln)
+            except Exception:
+                pass
+        self._thumb_highlight_lines = {}
+        self._highlighted_thumb_index = None
+
+    # ---------- CSV menu (footer CSV button) ----------
+    def _open_csv_menu(self):
+        # Small popup with CSV actions
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+        b_load = Button(text="Load CSV (Android SAF)", size_hint=(1, None), height=dp(44))
+        b_select = Button(text="Select Students", size_hint=(1, None), height=dp(44))
+        b_headers = Button(text="Select Headers", size_hint=(1, None), height=dp(44))
+        b_close = Button(text="Close", size_hint=(1, None), height=dp(44))
+        content.add_widget(b_load)
+        content.add_widget(b_select)
+        content.add_widget(b_headers)
+        content.add_widget(b_close)
+        popup = Popup(title="CSV", content=content, size_hint=(0.6, 0.5))
+        b_load.bind(on_release=lambda *_: (popup.dismiss(), self._open_csv_filechooser()))
+        b_select.bind(on_release=lambda *_: (popup.dismiss(), self._open_student_selector_popup()))
+        b_headers.bind(on_release=lambda *_: (popup.dismiss(), self._open_headers_popup()))
+        b_close.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    # ---------- CSV selector popup implementation ----------
+    def _open_student_selector_popup(self):
+        """
+        Opens a popup that allows:
+        - reorder of selected_headers (up/down)
+        - filter per selected column
+        - single-column sort (toggle asc/desc/none)
+        - scrollable list of filtered rows
+        - selecting a row to set as the current Data Update payload
+        """
+        if not self.csv_rows or not self.csv_headers:
+            # No CSV loaded
+            popup = Popup(title="No CSV",
+                          content=Label(text="No CSV loaded. Load a CSV to select students."),
+                          size_hint=(0.6, 0.3))
+            popup.open()
+            return
+
+        # Ensure selected_headers has default if empty
+        if not self.selected_headers:
+            # default choose first 3 or all
+            self.selected_headers = self.csv_headers[:3] if len(self.csv_headers) >= 3 else list(self.csv_headers)
+
+        # local widgets and state
+        popup_root = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+
+        # Column controls (reorder, filter, sort) - vertical list
+        cols_area = ScrollView(size_hint=(1, None), height=dp(160))
+        cols_inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        cols_inner.bind(minimum_height=cols_inner.setter("height"))
+        cols_area.add_widget(cols_inner)
+
+        # Helper to refresh the student list
+        list_area = ScrollView(size_hint=(1, 1))
+        list_grid = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(2))
+        list_grid.bind(minimum_height=list_grid.setter("height"))
+        list_area.add_widget(list_grid)
+
+        # Create per-column controls
+        col_controls = {}
+        for h in list(self.selected_headers):
+            row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(4))
+            lbl = Label(text=h, size_hint=(0.28, 1), halign="left", valign="middle", font_size=sp(12))
+            lbl.bind(size=lbl.setter("text_size"))
+            up = Button(text="▲", size_hint=(None, 1), width=dp(34))
+            down = Button(text="▼", size_hint=(None, 1), width=dp(34))
+            filt = TextInput(text=self._column_filters.get(h, ""), multiline=False, size_hint=(0.4, 1), font_size=sp(12))
+            sort_b = Button(text="⋯", size_hint=(None, 1), width=dp(40))
+            row.add_widget(lbl)
+            row.add_widget(up)
+            row.add_widget(down)
+            row.add_widget(filt)
+            row.add_widget(sort_b)
+            cols_inner.add_widget(row)
+            col_controls[h] = {"label": lbl, "up": up, "down": down, "filter": filt, "sort": sort_b}
+
+        displayed_row_buttons = []
+
+        def reorder_column_up(header):
+            idx = self.selected_headers.index(header)
+            if idx > 0:
+                self.selected_headers[idx], self.selected_headers[idx - 1] = self.selected_headers[idx - 1], self.selected_headers[idx]
+                rebuild_column_controls()
+                refresh_student_list()
+
+        def reorder_column_down(header):
+            idx = self.selected_headers.index(header)
+            if idx < len(self.selected_headers) - 1:
+                self.selected_headers[idx], self.selected_headers[idx + 1] = self.selected_headers[idx + 1], self.selected_headers[idx]
+                rebuild_column_controls()
+                refresh_student_list()
+
+        def cycle_sort(header, btn):
+            cur = self._column_sorts.get(header)
+            if cur is None:
+                new = "asc"
+            elif cur == "asc":
+                new = "desc"
+            else:
+                new = None
+            # clear all
+            for k in list(self._column_sorts.keys()):
+                self._column_sorts[k] = None
+            if new:
+                self._column_sorts[header] = new
+            # update buttons
+            for h2, ctrls in col_controls.items():
+                txt = "⋯"
+                if self._column_sorts.get(h2) == "asc":
+                    txt = "↑"
+                elif self._column_sorts.get(h2) == "desc":
+                    txt = "↓"
+                ctrls["sort"].text = txt
+            refresh_student_list()
+
+        def rebuild_column_controls():
+            cols_inner.clear_widgets()
+            old_filters = dict(self._column_filters)
+            old_sorts = dict(self._column_sorts)
+            new_col_controls = {}
+            for h in self.selected_headers:
+                row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(4))
+                lbl = Label(text=h, size_hint=(0.28, 1), halign="left", valign="middle", font_size=sp(12))
+                lbl.bind(size=lbl.setter("text_size"))
+                up = Button(text="▲", size_hint=(None, 1), width=dp(34))
+                down = Button(text="▼", size_hint=(None, 1), width=dp(34))
+                filt = TextInput(text=old_filters.get(h, ""), multiline=False, size_hint=(0.4, 1), font_size=sp(12))
+                sort_b = Button(text="⋯", size_hint=(None, 1), width=dp(40))
+                st = old_sorts.get(h)
+                if st == "asc":
+                    sort_b.text = "↑"
+                elif st == "desc":
+                    sort_b.text = "↓"
+                row.add_widget(lbl)
+                row.add_widget(up)
+                row.add_widget(down)
+                row.add_widget(filt)
+                row.add_widget(sort_b)
+                cols_inner.add_widget(row)
+                new_col_controls[h] = {"label": lbl, "up": up, "down": down, "filter": filt, "sort": sort_b}
+            col_controls.clear()
+            col_controls.update(new_col_controls)
+            wire_column_control_callbacks()
+
+        def wire_column_control_callbacks():
+            for h, ctrls in col_controls.items():
+                try:
+                    ctrls["up"].unbind(on_release=None)
+                    ctrls["down"].unbind(on_release=None)
+                    ctrls["sort"].unbind(on_release=None)
+                    ctrls["filter"].unbind(text=None)
+                except Exception:
+                    pass
+                ctrls["up"].bind(on_release=lambda inst, header=h: reorder_column_up(header))
+                ctrls["down"].bind(on_release=lambda inst, header=h: reorder_column_down(header))
+                ctrls["sort"].bind(on_release=lambda inst, header=h, btn=ctrls["sort"]: cycle_sort(header, btn))
+                ctrls["filter"].bind(text=lambda inst, txt, header=h: _set_filter(header, txt))
+
+        def _set_filter(header, txt):
+            self._column_filters[header] = txt.strip()
+            refresh_student_list()
+
+        wire_column_control_callbacks()
+
+        def apply_filters_and_sort():
+            rows = list(self.csv_rows)
+            for h in list(self.selected_headers):
+                f = (self._column_filters.get(h) or "").strip()
+                if f:
+                    f_lower = f.lower()
+                    rows = [r for r in rows if f_lower in (str(r.get(h, "")).lower())]
+            sort_col = None
+            sort_dir = None
+            for h in self.selected_headers:
+                s = self._column_sorts.get(h)
+                if s in ("asc", "desc"):
+                    sort_col = h
+                    sort_dir = s
+                    break
+            if sort_col:
+                try:
+                    rows = sorted(rows, key=lambda r: (r.get(sort_col) or ""), reverse=(sort_dir == "desc"))
+                except Exception:
+                    pass
+            return rows
+
+        def refresh_student_list():
+            list_grid.clear_widgets()
+            displayed_row_buttons.clear()
+            rows = apply_filters_and_sort()
+            for ridx, r in enumerate(rows):
+                pieces = []
+                for h in self.selected_headers:
+                    pieces.append(str(r.get(h, "")))
+                display = " | ".join(pieces)
+                btn = Button(text=display, size_hint_y=None, height=dp(36), halign="left")
+                btn.bind(on_release=lambda inst, row=r, idx=ridx: _on_row_selected(row, inst))
+                list_grid.add_widget(btn)
+                displayed_row_buttons.append(btn)
+
+        def _on_row_selected(row, widget):
+            # selecting a CSV row should set CSV selection and display it in Data Update label
+            self._selected_csv_row = row
+            parts = []
+            for h in self.selected_headers:
+                parts.append(str(row.get(h, "")).strip())
+            payload = "_".join([p for p in parts if p])
+            self._selected_author_payload = payload
+            # clear any QR selection override state (QR should still override later, but CSV selection is active now)
+            self._latest_qr_text = ""
+            # show CSV payload
+            Clock.schedule_once(lambda *_: setattr(self.qr_last_label, "text", f"Data Update: {payload}"[:200]), 0)
+            # highlight selected button
+            for b in displayed_row_buttons:
+                try:
+                    b.background_color = (1, 1, 1, 1)
+                except Exception:
+                    pass
+            try:
+                widget.background_color = (0.9, 0.9, 0.5, 1)
+            except Exception:
+                pass
+
+        # Footer buttons for popup
+        popup_btns = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
+        btn_select = Button(text="Confirm selection")
+        btn_force = Button(text="Force update")
+        btn_close = Button(text="Close")
+        popup_btns.add_widget(btn_select)
+        popup_btns.add_widget(btn_force)
+        popup_btns.add_widget(btn_close)
+
+        def do_confirm(*_):
+            if self._selected_author_payload:
+                self._log_internal(f"CSV selection confirmed: {self._selected_author_payload}")
+            popup.dismiss()
+
+        def do_force(*_):
+            if not self._selected_author_payload:
+                self._log_internal("No CSV row selected to force update")
+                notice = Popup(title="No selection", content=Label(text="Select a student row first."), size_hint=(0.6, 0.3))
+                notice.open()
+                return
+            self._maybe_commit_author(self._selected_author_payload, source="csv")
+            popup.dismiss()
+
+        btn_select.bind(on_release=lambda *_: do_confirm())
+        btn_force.bind(on_release=lambda *_: do_force())
+        btn_close.bind(on_release=lambda *_: popup.dismiss())
+
+        popup_root.add_widget(Label(text="Columns (reorder / filter / sort):", size_hint=(1, None), height=dp(20)))
+        popup_root.add_widget(cols_area)
+        popup_root.add_widget(Label(text="Rows:", size_hint=(1, None), height=dp(18)))
+        popup_root.add_widget(list_area)
+        popup_root.add_widget(popup_btns)
+
+        popup = Popup(title="Select student from CSV", content=popup_root, size_hint=(0.95, 0.85))
+        refresh_student_list()
+        popup.open()
+
+    def _force_update_from_selection(self):
+        """
+        Force pushing the currently selected CSV-derived payload to camera author field.
+        If no CSV selection exists show user a notice.
+        """
+        if not self._selected_author_payload:
+            self._log_internal("Force update requested but no CSV selection available")
+            notice = Popup(title="No selection", content=Label(text="No student selected. Use 'CSV' first."), size_hint=(0.6, 0.3))
+            notice.open()
+            return
+        self._log_internal(f"Forcing update with CSV payload: {self._selected_author_payload}")
+        self._maybe_commit_author(self._selected_author_payload, source="manual-csv")
+
+    # ---------- window/rotation handling ----------
+    def _on_window_resize(self, instance, width, height):
+        try:
+            if width > height:
+                self.header.height = dp(40)
+                self.header_title.font_size = sp(18)
+                self.menu_btn.width = dp(90)
+            else:
+                self.header.height = dp(44)
+                self.header_title.font_size = sp(16)
+                self.menu_btn.width = dp(80)
+        except Exception:
+            pass
+        try:
+            self._fit_preview_to_holder()
+        except Exception:
+            pass
 
     # ---------- reorganized menu: Build dropdown (top-level) and sub-popups ----------
     def _build_dropdown(self):
@@ -1647,7 +1982,6 @@ class VolumeToolkitApp(App):
         Clock.schedule_once(_make_texture_and_update, 0)
 
     def _background_download_latest(self):
-        # removed direct menu action; kept for internal use
         self.download_and_thumbnail_latest()
 
     def download_and_thumbnail_latest(self):
