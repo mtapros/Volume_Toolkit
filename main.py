@@ -1,14 +1,15 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
-# Full corrected main.py (cleaned, double-checked)
-# - All HTML/entity encodings removed
+# Full corrected main.py — cleaned, double-checked:
+# - No HTML/entity encodings
 # - KIVY_HOME set early before importing kivy
-# - pil_rotate_90s signature corrected
-# - Missing helpers implemented: _style_menu_button, _on_autofetch_pressed, _make_thumb_pos_updater
-# - CSV/QR selection logic: QR always overrides CSV selection and updates Data Update row
-# - Autofetch (poller) toggle implemented and defensive
-# - Stale full-res fetch prevention via request ids
-# - Texture creation scheduled on main thread where required
-# - Defensive error handling and logging kept
+# - pil_rotate_90s signature correct
+# - Added QR Detect toggle button and removed tap-to-pulse behavior
+# - Implemented missing helpers: _style_menu_button, _style_qr_button,
+#   _on_autofetch_pressed, _on_qr_pressed, _make_thumb_pos_updater
+# - QR detection runs continuously only when QR Detect is ON
+# - QR detection uses grayscale input for better reliability
+# - Defensive error handling and logging throughout
+# - All functions referenced by UI are present in this file
 
 import os
 import json
@@ -22,7 +23,7 @@ import queue
 import requests
 import urllib3
 
-# Set KIVY_HOME early on Android so Kivy won't try to copy icons into the bundle dir
+# Set KIVY_HOME early on Android so Kivy won't try to copy icons into bundle dir
 if os.environ.get("ANDROID_ARGUMENT"):
     private_dir = os.environ.get("ANDROID_PRIVATE")
     if private_dir:
@@ -443,9 +444,7 @@ class VolumeToolkitApp(App):
         self.dropdown = None
 
         # QR state
-        self.qr_enabled = False
-        self._qr_temp_active = False
-        self._qr_pulse_event = None
+        self.qr_enabled = False                         # controlled by QR Detect button
         self.qr_interval_s = 0.15
         self.qr_new_gate_s = 0.70
         self._qr_detector = cv2.QRCodeDetector()
@@ -617,7 +616,7 @@ class VolumeToolkitApp(App):
         self.header.add_widget(self.menu_btn)
         root.add_widget(self.header)
 
-        # Control row: Connect / Start live / Autofetch toggle
+        # Control row: Connect / Start live / Autofetch toggle / QR Detect toggle
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(None, 1), width=dp(120))
         self._style_connect_button(initial=True)
@@ -625,13 +624,15 @@ class VolumeToolkitApp(App):
         self._style_start_button(stopped=True)
         self.autofetch_btn = Button(text="Autofetch Off", font_size=sp(14), size_hint=(None, 1), width=dp(140))
         self._style_autofetch_button(running=False)
+        self.qr_btn = Button(text="QR Detect Off", font_size=sp(14), size_hint=(None, 1), width=dp(140))
+        self._style_qr_button(running=False)
         row2.add_widget(self.connect_btn)
         row2.add_widget(self.start_btn)
         row2.add_widget(self.autofetch_btn)
+        row2.add_widget(self.qr_btn)
         root.add_widget(row2)
 
-        # Data Update / status labels (renamed from QR to Data Update)
-        # This label shows either QR result or CSV selected row summary
+        # Data Update / status labels
         self.qr_last_label = Label(text="Data Update: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.qr_last_label)
         self.status = Label(text="Status: not connected", size_hint=(1, None), height=dp(22), font_size=sp(13))
@@ -646,7 +647,7 @@ class VolumeToolkitApp(App):
         self.preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview_scatter = Scatter(do_translation=False, do_scale=False, do_rotation=False, size_hint=(None, None))
         self.preview = PreviewOverlay(size_hint=(None, None))
-        # bind the preview touch handler (method exists)
+        # preview tap is no-op for QR (QR controlled via button)
         self.preview.bind(on_touch_down=self._on_preview_touch)
         self.preview_scatter.add_widget(self.preview)
         self.preview_holder.add_widget(self.preview_scatter)
@@ -712,6 +713,7 @@ class VolumeToolkitApp(App):
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self._on_start_pressed())
         self.autofetch_btn.bind(on_press=lambda *_: self._on_autofetch_pressed())
+        self.qr_btn.bind(on_press=lambda *_: self._on_qr_pressed())
         self.csv_btn.bind(on_release=lambda *_: self._open_csv_menu())
         self.force_update_btn.bind(on_release=lambda *_: self._force_update_from_selection())
 
@@ -778,6 +780,29 @@ class VolumeToolkitApp(App):
                 self.autofetch_btn.text = "Autofetch Off"
         except Exception:
             pass
+
+    def _style_qr_button(self, running=False):
+        try:
+            self.qr_btn.background_normal = ""
+            self.qr_btn.background_down = ""
+            if running:
+                self.qr_btn.background_color = (0.05, 0.45, 0.05, 1.0)
+                self.qr_btn.text = "QR Detect On"
+            else:
+                self.qr_btn.background_color = (0.4, 0.4, 0.4, 1.0)
+                self.qr_btn.text = "QR Detect Off"
+        except Exception:
+            pass
+
+    def _on_qr_pressed(self):
+        # Toggle QR detection on/off and update UI
+        try:
+            new_state = not bool(self.qr_enabled)
+            self._set_qr_enabled(new_state)
+            self._style_qr_button(running=new_state)
+            self._log_internal(f"QR detection set to {new_state}")
+        except Exception as e:
+            self._log_internal(f"_on_qr_pressed error: {e}")
 
     def _on_autofetch_pressed(self):
         """
@@ -1567,9 +1592,9 @@ class VolumeToolkitApp(App):
     # ---------- liveview / decoder / QR ----------
     def _set_qr_enabled(self, enabled: bool):
         self.qr_enabled = bool(enabled)
-        if not self.qr_enabled and not self._qr_temp_active:
+        if not self.qr_enabled:
             self._set_qr_ui(None, None, note="Data Update: none")
-        elif self.qr_enabled:
+        else:
             self._set_qr_ui(None, None, note="Data Update: on")
 
     def _reschedule_display_loop(self, fps):
@@ -1760,7 +1785,8 @@ class VolumeToolkitApp(App):
     def _qr_loop(self):
         last_processed_ts = 0.0
         while self.live_running:
-            if not (self.qr_enabled or self._qr_temp_active):
+            # Only run QR logic when QR detection enabled
+            if not self.qr_enabled:
                 time.sleep(0.10)
                 continue
 
@@ -1775,12 +1801,15 @@ class VolumeToolkitApp(App):
                 continue
 
             try:
-                decoded, points, _ = self._qr_detector.detectAndDecode(bgr)
+                # Use grayscale for better detection reliability
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                decoded, points, _ = self._qr_detector.detectAndDecode(gray)
                 qr_text = decoded.strip() if isinstance(decoded, str) else ""
                 qr_points = None
                 if points is not None:
                     try:
-                        pts = points.astype(int).reshape(-1, 2)
+                        arr = np.array(points)
+                        pts = arr.reshape(-1, 2)
                         if len(pts) >= 4:
                             qr_points = [(int(pts[i][0]), int(pts[i][1])) for i in range(4)]
                     except Exception:
@@ -1788,13 +1817,15 @@ class VolumeToolkitApp(App):
 
                 if qr_text or qr_points:
                     self._publish_qr(qr_text if qr_text else None, qr_points)
-                    if self._qr_temp_active:
-                        Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
             except Exception:
                 pass
 
             last_processed_ts = ts
             time.sleep(max(0.05, float(self.qr_interval_s)))
+
+    # Preview touch is a no-op for QR detection (QR controlled via QR Detect button)
+    def _on_preview_touch(self, instance, touch):
+        return False
 
     def _publish_qr(self, text, points):
         now = time.time()
@@ -1869,46 +1900,6 @@ class VolumeToolkitApp(App):
                     pass
             self._qr_highlight_event = Clock.schedule_once(lambda *_: self._clear_qr_overlay(), 3.0)
         self.qr_status.text = note
-
-    # ---------- preview tap handling for QR pulse ----------
-    def _on_preview_touch(self, instance, touch):
-        # only respond to taps inside the PreviewOverlay region
-        if not instance.collide_point(*touch.pos):
-            return False
-        # Start a temporary QR pulse scan for 1 second (or until detection)
-        self._start_pulse_qr()
-        return True
-
-    def _start_pulse_qr(self):
-        if getattr(self, "_qr_pulse_event", None):
-            try:
-                self._qr_pulse_event.cancel()
-            except Exception:
-                pass
-            self._qr_pulse_event = None
-
-        self._qr_temp_active = True
-        self._set_qr_ui(None, None, note="Data Update: scanning…")
-        try:
-            self._qr_pulse_event = Clock.schedule_once(lambda *_: self._end_pulse_qr(), 1.0)
-        except Exception:
-            def _bg_end():
-                time.sleep(1.0)
-                Clock.schedule_once(lambda *_: self._end_pulse_qr(), 0)
-            threading.Thread(target=_bg_end, daemon=True).start()
-
-    def _end_pulse_qr(self, *args):
-        if getattr(self, "_qr_pulse_event", None):
-            try:
-                self._qr_pulse_event.cancel()
-            except Exception:
-                pass
-            self._qr_pulse_event = None
-        self._qr_temp_active = False
-        if not getattr(self, "qr_enabled", False):
-            self._set_qr_ui(None, None, note="Data Update: none")
-        else:
-            self._set_qr_ui(None, None, note="Data Update: on")
 
     # ---------- thumbnails, overlay, and full-res swap ----------
     def _download_thumb_for_path(self, ccapi_path: str):
