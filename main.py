@@ -496,8 +496,11 @@ class VolumeToolkitApp(App):
                     else:
                         label_text = "Exif Payload (none): none"
                         status_text = ("Exif Payload: on" if getattr(self, "live_running", False) else "Exif Payload: none")
-                    self.csv_payload_label.text = f"CSV Payload: {payload}"
-                    self.qr_status.text = status_text
+
+                    if hasattr(self, "exif_payload_label") and self.exif_payload_label is not None:
+                        self.exif_payload_label.text = label_text
+                    if hasattr(self, "qr_status") and self.qr_status is not None:
+                        self.qr_status.text = status_text
                 except Exception:
                     pass
 
@@ -608,6 +611,7 @@ class VolumeToolkitApp(App):
                 if found_text:
                     self._log_internal(f"QR Finder: found -> '{found_text}'")
                     self._set_qr_payload(found_text, source="QR")
+                    self._set_exif_payload(found_text, source="QR")
                     if found_points:
                         try:
                             self.preview.show_qr = True
@@ -733,15 +737,15 @@ class VolumeToolkitApp(App):
         root.add_widget(row2)
 
         # Exif / QR payload labels
+        # Payload labels
         self.csv_payload_label = Label(text="CSV Payload: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
-        root.add_widget(self.qr_payload_label)
+        root.add_widget(self.csv_payload_label)
+
         self.qr_payload_label = Label(text="QR Payload: none", size_hint=(1, None), height=dp(20), font_size=sp(12))
         root.add_widget(self.qr_payload_label)
-        self.status = Label(text="Status: not connected", size_hint=(1, None), height=dp(22), font_size=sp(13))
-        root.add_widget(self.status)
-        self.qr_status = Label(text="", size_hint=(1, None), height=dp(18), font_size=sp(11))
-        root.add_widget(self.qr_status)
 
+        self.exif_payload_label = Label(text="Exif Payload (none): none", size_hint=(1, None), height=dp(22), font_size=sp(13))
+        root.add_widget(self.exif_payload_label)
         # Main area
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
         self.preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
@@ -882,7 +886,7 @@ class VolumeToolkitApp(App):
         popup.open()
 
     # ----------
- thumbnail highlight helpers ----------
+    # ---------- thumbnail highlight helpers ----------
     def _highlight_thumb(self, idx):
         self._clear_thumb_highlight()
         if idx is None or idx >= len(self._thumb_images):
@@ -1202,18 +1206,28 @@ class VolumeToolkitApp(App):
         if not self.selected_headers and headers:
             self.selected_headers = headers[:3]
 
+        # Default CSV payload from first row (if available)
+        try:
+            if self.csv_rows and self.selected_headers:
+                r0 = self.csv_rows[0]
+                self._csv_payload = ' '.join((r0.get(h, '') or '').strip() for h in self.selected_headers).strip()
+            else:
+                self._csv_payload = ''
+
+            def _ui(_dt):
+                try:
+                    self.csv_payload_label.text = f"CSV Payload: {self._csv_payload or 'none'}"
+                except Exception:
+                    pass
+
+            Clock.schedule_once(_ui, 0)
+        except Exception:
+            pass
+
     # ---------- connect / author ----------
     def connect_camera(self):
         if self.live_running:
             self._log_internal("Connect disabled while live view is running. Stop first.")
-                    # Set default CSV payload from first data row if available
-        try:
-            if rows:
-                self._csv_payload = ' '.join(str(x) for x in rows[0])
-                self.csv_payload_label.text = f\"CSV Payload: {self._csv_payload}\"
-        except Exception:
-            pass
-
         return
         if not self.camera_ip:
             self.status.text = "Status: enter an IP (use Settings->IP)"
