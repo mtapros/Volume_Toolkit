@@ -734,7 +734,7 @@ class VolumeToolkitApp(App):
 
         # Exif / QR payload labels
         self.csv_payload_label = Label(text="CSV Payload: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
-        root.add_widget(self.qr_last_label)
+        root.add_widget(self.qr_payload_label)
         self.qr_payload_label = Label(text="QR Payload: none", size_hint=(1, None), height=dp(20), font_size=sp(12))
         root.add_widget(self.qr_payload_label)
         self.status = Label(text="Status: not connected", size_hint=(1, None), height=dp(22), font_size=sp(13))
@@ -1206,7 +1206,15 @@ class VolumeToolkitApp(App):
     def connect_camera(self):
         if self.live_running:
             self._log_internal("Connect disabled while live view is running. Stop first.")
-            return
+                    # Set default CSV payload from first data row if available
+        try:
+            if rows:
+                self._csv_payload = ' '.join(str(x) for x in rows[0])
+                self.csv_payload_label.text = f\"CSV Payload: {self._csv_payload}\"
+        except Exception:
+            pass
+
+        return
         if not self.camera_ip:
             self.status.text = "Status: enter an IP (use Settings->IP)"
             return
