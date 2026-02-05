@@ -1,15 +1,18 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# Notes for this revision (v2.0.5):
-# - Removed the "QR:" status label from the main screen (QR decode still updates "Last QR").
-# - Thumbnails are rotated 90 degrees CCW to match live preview orientation.
-# - Tapping a thumbnail "freezes" the preview by replacing the live texture with the thumbnail
-#   stretched exactly the same as live preview; overlays remain on top (same PreviewOverlay).
-# - While frozen, live view can keep running but new live textures are ignored.
-# - After tap, the app fetches the full-resolution JPG in the background and replaces
-#   the low-res thumbnail when ready (same orientation as live preview).
-# - Tap the preview to unfreeze and return to live.
-# - Capture type default is JPG; RAW remains selectable in the menu (no RAW download pipeline implemented).
+# Notes for this revision (v2.0.6):
+# - Preview area locked to 85% width, thumbnail strip locked to 15% width.
+# - Main-row AutoFetch toggle added between Live View and QR Detect.
+#   Removed AutoFetch start/stop from Menu.
+# - Button styling changes:
+#   - Connect: blue w/ white text; when connected, label becomes "Connected" in yellow.
+#   - Live view toggle button: Off = red + white text ("Live View Off"),
+#     On = green + yellow text ("Live View On").
+#   - AutoFetch toggle: Off = red ("Autofetch Off"), On = green ("Autofetch On").
+# - Autofetch baseline behavior: when turned ON, baseline is set immediately and only
+#   images after that point are fetched (no backlog).
+# - "Author" renamed to "Current EXIF" and "Last QR" renamed to "QR Payload".
+# - If Current EXIF matches QR Payload => EXIF text turns green; else red.
 #
 import os
 import json
@@ -76,7 +79,7 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
-    # v2.0.4+: default rotation is 270 to rotate 180 from original behavior.
+    # Default live preview rotation (matches earlier versions)
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
@@ -224,7 +227,6 @@ class CaptureType:
 
 
 class VolumeToolkitApp(App):
-    # v2.0.5: JPG default
     capture_type = StringProperty(CaptureType.JPG)
 
     def __init__(self, **kwargs):
@@ -281,6 +283,7 @@ class VolumeToolkitApp(App):
         self._author_update_in_flight = False
 
         self._current_payload = ""
+        self._current_exif = ""  # camera author field; displayed as "Current EXIF"
 
         # CSV / headers
         self.csv_headers = []
@@ -291,14 +294,18 @@ class VolumeToolkitApp(App):
         # thumbnails
         self._thumb_textures = []
         self._thumb_images = []
-        self._thumb_paths = []  # ccapi paths
+        self._thumb_paths = []
 
         self.thumb_dir = "thumbs"
 
+        # poller
         self._last_seen_image = None
         self._poll_thread = None
         self._poll_thread_stop = threading.Event()
         self.poll_interval_s = 2.0
+
+        # v2.0.6: AutoFetch main toggle state
+        self.autofetch_enabled = False
 
         self._session = requests.Session()
         self._session.verify = False
@@ -312,39 +319,78 @@ class VolumeToolkitApp(App):
         self._ip_popup = None
         self._fps_popup = None
 
-        # v2.0.5: freeze (still) mode
+        # freeze (still) mode
         self._freeze_active = False
         self._freeze_ccapi_path = None
-        self._freeze_request_id = 0  # increments on each freeze to ignore stale downloads
+        self._freeze_request_id = 0
 
+    # ---------- styling helpers ----------
+    @staticmethod
+    def _set_btn_style(btn: Button, bg_rgba, fg_rgba):
+        btn.background_normal = ""
+        btn.background_down = ""
+        btn.background_color = bg_rgba
+        btn.color = fg_rgba
+
+    def _apply_connect_btn_style(self):
+        # Connect blue always, label changes when connected
+        self._set_btn_style(self.connect_btn, (0.10, 0.35, 0.85, 1.0), (1, 1, 1, 1))
+        if self.connected:
+            self.connect_btn.text = "Connected"
+            self.connect_btn.color = (1.0, 1.0, 0.0, 1.0)  # yellow text
+        else:
+            self.connect_btn.text = "Connect"
+            self.connect_btn.color = (1, 1, 1, 1)
+
+    def _apply_live_btn_style(self):
+        if self.live_running:
+            self.start_btn.text = "Live View On"
+            self._set_btn_style(self.start_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))  # green / yellow
+        else:
+            self.start_btn.text = "Live View Off"
+            self._set_btn_style(self.start_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))  # red / white
+
+    def _apply_autofetch_btn_style(self):
+        if self.autofetch_enabled:
+            self.autofetch_btn.text = "Autofetch On"
+            self._set_btn_style(self.autofetch_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))  # green/yellow
+        else:
+            self.autofetch_btn.text = "Autofetch Off"
+            self._set_btn_style(self.autofetch_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))  # red/white
+
+    # ---------- build ----------
     def build(self):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
-        header.add_widget(Label(text="Volume Toolkit v2.0.5", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v2.0.6", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         root.add_widget(header)
 
+        # Connect / Live / AutoFetch / QR row
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(1, 1))
-        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16), size_hint=(1, 1))
+        self.start_btn = Button(text="Live View Off", disabled=True, font_size=sp(16), size_hint=(1, 1))
+        self.autofetch_btn = Button(text="Autofetch Off", disabled=True, font_size=sp(16), size_hint=(1, 1))
         self.qr_btn = Button(text="QR Detect: OFF", disabled=True, font_size=sp(16), size_hint=(1, 1))
         row2.add_widget(self.connect_btn)
         row2.add_widget(self.start_btn)
+        row2.add_widget(self.autofetch_btn)
         row2.add_widget(self.qr_btn)
         root.add_widget(row2)
 
-        row_author = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(40))
-        row_author.add_widget(Label(text="Author", size_hint=(None, 1), width=dp(90), font_size=sp(14)))
-        self.author_label = Label(text="(not connected)", size_hint=(1, 1), font_size=sp(14),
-                                  halign="left", valign="middle")
-        self.author_label.bind(size=lambda *_: setattr(self.author_label, "text_size", (self.author_label.width, None)))
-        row_author.add_widget(self.author_label)
-        root.add_widget(row_author)
+        # Current EXIF + Payload
+        row_exif = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(40))
+        row_exif.add_widget(Label(text="Current EXIF", size_hint=(None, 1), width=dp(130), font_size=sp(14)))
+        self.exif_label = Label(text="(not connected)", size_hint=(1, 1), font_size=sp(14),
+                                halign="left", valign="middle")
+        self.exif_label.bind(size=lambda *_: setattr(self.exif_label, "text_size", (self.exif_label.width, None)))
+        row_exif.add_widget(self.exif_label)
+        root.add_widget(row_exif)
 
         row_payload = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(40))
-        row_payload.add_widget(Label(text="Last QR", size_hint=(None, 1), width=dp(90), font_size=sp(14)))
+        row_payload.add_widget(Label(text="QR Payload", size_hint=(None, 1), width=dp(130), font_size=sp(14)))
         self.payload_label = Label(text="(none)", size_hint=(1, 1), font_size=sp(14),
                                    halign="left", valign="middle")
         self.payload_label.bind(size=lambda *_: setattr(self.payload_label, "text_size", (self.payload_label.width, None)))
@@ -355,22 +401,22 @@ class VolumeToolkitApp(App):
                              size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.metrics)
 
+        # Main preview + thumbs locked to 85/15
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
-        preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.75, 1))
+        preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.85, 1))
         self.preview_scatter = Scatter(do_translation=True, do_scale=True, do_rotation=False,
                                        scale_min=0.5, scale_max=2.5)
         self.preview_scatter.size_hint = (None, None)
 
         self.preview = PreviewOverlay(size_hint=(None, None))
-        # Tap preview to unfreeze
         self.preview.bind(on_touch_down=self._on_preview_touch)
 
         self.preview_scatter.add_widget(self.preview)
         preview_holder.add_widget(self.preview_scatter)
         main_area.add_widget(preview_holder)
 
-        sidebar = BoxLayout(orientation="vertical", size_hint=(0.25, 1), spacing=dp(4))
+        sidebar = BoxLayout(orientation="vertical", size_hint=(0.15, 1), spacing=dp(4))
         sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
         for idx in range(5):
             img = Image(size_hint=(1, 0.18), allow_stretch=True, keep_ratio=True)
@@ -404,16 +450,21 @@ class VolumeToolkitApp(App):
 
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self.toggle_liveview())
+        self.autofetch_btn.bind(on_press=lambda *_: self.toggle_autofetch())
         self.qr_btn.bind(on_press=lambda *_: self.toggle_qr_detect())
         self.push_btn.bind(on_press=lambda *_: self.push_payload())
 
         self._reschedule_display_loop(12)
 
+        # Apply initial styles
+        self._apply_connect_btn_style()
+        self._apply_live_btn_style()
+        self._apply_autofetch_btn_style()
+
         self._set_controls_idle()
         self.log("Android CCAPI GUI ready")
         return root
 
-    # ---------- lifecycle ----------
     def on_start(self):
         if platform == "android":
             try:
@@ -466,24 +517,39 @@ class VolumeToolkitApp(App):
             raise Exception(f"HTTP {resp.status_code} {resp.reason}")
         return resp.content
 
-    # ---------- Author refresh ----------
-    def refresh_author(self, note=None):
+    # ---------- EXIF vs payload coloring ----------
+    def _update_exif_payload_colors(self):
+        exif = (self._current_exif or "").strip()
+        payload = (self._current_payload or "").strip()
+        # Only green when both are non-empty and match exactly
+        if exif and payload and exif == payload:
+            self.exif_label.color = (0.2, 1.0, 0.2, 1.0)  # green
+        else:
+            self.exif_label.color = (1.0, 0.2, 0.2, 1.0)  # red
+
+    # ---------- Author/EXIF refresh ----------
+    def refresh_exif(self, note=None):
         if not self.connected:
-            Clock.schedule_once(lambda *_: setattr(self.author_label, "text", "(not connected)"), 0)
+            Clock.schedule_once(lambda *_: self._set_exif_text("(not connected)"), 0)
             return
 
         def worker():
             st, data = self._json_call("GET", "/ccapi/ver100/functions/registeredname/author", None, timeout=8.0)
             if st.startswith("200") and isinstance(data, dict):
-                author = (data.get("author") or "").strip()
+                exif = (data.get("author") or "").strip()
             else:
-                author = f"(read failed: {st})"
+                exif = f"(read failed: {st})"
 
-            Clock.schedule_once(lambda *_: setattr(self.author_label, "text", author if author else "(empty)"), 0)
+            Clock.schedule_once(lambda *_: self._set_exif_text(exif if exif else "(empty)"), 0)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # ---------- controls ----------
+    def _set_exif_text(self, exif: str):
+        self._current_exif = exif or ""
+        self.exif_label.text = self._current_exif
+        self._update_exif_payload_colors()
+
+    # ---------- connect / controls ----------
     def connect_camera(self):
         if self.live_running:
             self.log("Connect disabled while live view is running. Stop live view first.")
@@ -494,29 +560,41 @@ class VolumeToolkitApp(App):
         if st.startswith("200") and data:
             self.connected = True
             self.log("Connected OK")
-            self.author_label.text = "(loading...)"
-            self.refresh_author(note="connect")
+            self._set_exif_text("(loading...)")
+            self.refresh_exif(note="connect")
         else:
             self.connected = False
-            self.author_label.text = f"(connect failed: {st})"
+            self._set_exif_text(f"(connect failed: {st})")
             self.log(f"Connect failed: {st}")
 
         self._set_controls_idle()
+        self._apply_connect_btn_style()
 
     def _set_controls_idle(self):
         self.connect_btn.disabled = False
+
         self.start_btn.disabled = not self.connected
-        self.start_btn.text = "Start"
+        self.autofetch_btn.disabled = not self.connected
         self.qr_btn.disabled = not self.connected
         self.push_btn.disabled = not self.connected
 
+        self._apply_live_btn_style()
+        self._apply_autofetch_btn_style()
+        self._apply_connect_btn_style()
+
     def _set_controls_running(self):
         self.connect_btn.disabled = True
+
         self.start_btn.disabled = False
-        self.start_btn.text = "Stop"
+        self.autofetch_btn.disabled = False
         self.qr_btn.disabled = False
         self.push_btn.disabled = False
 
+        self._apply_live_btn_style()
+        self._apply_autofetch_btn_style()
+        self._apply_connect_btn_style()
+
+    # ---------- live view toggle ----------
     def toggle_liveview(self):
         if not self.connected:
             return
@@ -578,6 +656,35 @@ class VolumeToolkitApp(App):
         self.log("Live view stopped")
         self._set_controls_idle()
 
+    # ---------- AutoFetch toggle ----------
+    def toggle_autofetch(self):
+        if not self.connected:
+            return
+
+        self.autofetch_enabled = not bool(self.autofetch_enabled)
+        self._apply_autofetch_btn_style()
+
+        if self.autofetch_enabled:
+            # Baseline is set NOW; do not backfill.
+            self._last_seen_image = None
+            self.log("Autofetch enabled: setting baseline to latest (no backlog)")
+            # Set baseline immediately in background (no download)
+            threading.Thread(target=self._autofetch_set_baseline_worker, daemon=True).start()
+            self.start_polling_new_images()
+        else:
+            self.log("Autofetch disabled")
+            self.stop_polling_new_images()
+
+    def _autofetch_set_baseline_worker(self):
+        try:
+            images = self.list_all_images()
+            jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
+            if jpgs:
+                self._last_seen_image = jpgs[-1]
+                self.log(f"Autofetch baseline set to {self._last_seen_image}")
+        except Exception as e:
+            self.log(f"Autofetch baseline error: {e}")
+
     # ---------- QR ----------
     def toggle_qr_detect(self):
         self.qr_enabled = not bool(self.qr_enabled)
@@ -588,6 +695,7 @@ class VolumeToolkitApp(App):
         payload = (payload or "").strip()
         self._current_payload = payload
         self.payload_label.text = payload if payload else "(none)"
+        self._update_exif_payload_colors()
 
     # ---------- push payload ----------
     def _author_value(self, payload: str) -> str:
@@ -654,7 +762,7 @@ class VolumeToolkitApp(App):
                 self.log(f"Author updated+verified ({source}): '{value}'")
             else:
                 self.log(f"Author verify failed ({source}). wrote='{value}' read='{got}' err='{err}'")
-            self.refresh_author(note="after push")
+            self.refresh_exif(note="after push")
 
         Clock.schedule_once(_finish, 0)
 
@@ -662,17 +770,15 @@ class VolumeToolkitApp(App):
     def _on_preview_touch(self, widget, touch):
         if not self._freeze_active:
             return False
-        # only if tap is inside the preview widget
         if not self.preview.collide_point(*touch.pos):
             return False
-        # unfreeze on tap
         self._unfreeze_preview()
         return True
 
     def _unfreeze_preview(self):
         self._freeze_active = False
         self._freeze_ccapi_path = None
-        self._freeze_request_id += 1  # invalidate any in-flight still downloads
+        self._freeze_request_id += 1
         self.log("Unfroze preview (returning to live)")
 
     def _freeze_with_texture(self, ccapi_path: str, tex: Texture):
@@ -751,7 +857,6 @@ class VolumeToolkitApp(App):
                 rgb_bytes = rgb.tobytes()
 
                 def _update_texture_on_main(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ts=ts):
-                    # v2.0.5: if frozen, ignore live updates
                     if self._freeze_active:
                         return
                     try:
@@ -829,28 +934,14 @@ class VolumeToolkitApp(App):
 
     # ---------- still image fetch ----------
     def _contents_fullres_url(self, ccapi_path: str) -> str:
-        """
-        User-provided rule:
-          full JPG = GET https://<camera-ip>/ccapi/ver100/contents/<path>
-        where <path> is the path on the SD card.
-
-        In our app, ccapi_path values coming from /ccapi/ver120/contents look like:
-          /ccapi/ver120/contents/.../IMG_0001.JPG
-        We'll strip the leading '/ccapi/ver120/contents/' and prepend '/ccapi/ver100/contents/'.
-        """
         prefix = "/ccapi/ver120/contents/"
         if ccapi_path.startswith(prefix):
             sd_path = ccapi_path[len(prefix):]
         else:
-            # fallback: if it's already an SD-card-like path, just use as-is
             sd_path = ccapi_path.lstrip("/")
         return f"https://{self.camera_ip}/ccapi/ver100/contents/{sd_path}"
 
     def _download_fullres_and_replace(self, ccapi_path: str, request_id: int):
-        """
-        Download full-res JPG for ccapi_path in background, rotate to preview orientation,
-        and if still frozen with same request_id, replace the preview texture.
-        """
         try:
             url = self._contents_fullres_url(ccapi_path)
             self.log(f"Full-res download (bg): {url}")
@@ -881,14 +972,12 @@ class VolumeToolkitApp(App):
             return
 
         def _apply(_dt, rgb_bytes=rgb_bytes, w=w, h=h):
-            # only apply if still frozen and request matches
             if not self._freeze_active:
                 return
             if request_id != self._freeze_request_id:
                 return
             if self._freeze_ccapi_path != ccapi_path:
                 return
-
             try:
                 tex = Texture.create(size=(w, h), colorfmt="rgb")
                 tex.flip_vertical()
@@ -914,7 +1003,6 @@ class VolumeToolkitApp(App):
             self.log(f"Thumbnail download error: {e}")
             return
 
-        # Save thumbnail for inspection
         try:
             os.makedirs(self.thumb_dir, exist_ok=True)
             name = os.path.basename(ccapi_path) or "image"
@@ -926,11 +1014,11 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
 
-        # Decode using PIL and rotate CCW 90 to match live preview
+        # Decode using PIL and rotate CCW 90 for sidebar consistency with live preview
         try:
             pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
             try:
-                pil = pil.transpose(PILImage.Transpose.ROTATE_90)  # CCW
+                pil = pil.transpose(PILImage.Transpose.ROTATE_90)
             except Exception:
                 pil = pil.transpose(PILImage.ROTATE_90)
             pil.thumbnail((200, 200))
@@ -955,17 +1043,13 @@ class VolumeToolkitApp(App):
             self._thumb_paths = self._thumb_paths[:5]
 
             for idx, img in enumerate(self._thumb_images):
-                if idx < len(self._thumb_textures):
-                    img.texture = self._thumb_textures[idx]
-                else:
-                    img.texture = None
+                img.texture = self._thumb_textures[idx] if idx < len(self._thumb_textures) else None
 
         Clock.schedule_once(_make_texture_and_update, 0)
 
     def _on_thumb_touch(self, image_widget, touch):
         if not image_widget.collide_point(*touch.pos):
             return False
-
         idx = getattr(image_widget, "thumb_index", None)
         if idx is None or idx >= len(self._thumb_paths):
             return False
@@ -973,10 +1057,8 @@ class VolumeToolkitApp(App):
         ccapi_path = self._thumb_paths[idx]
         tex = self._thumb_textures[idx]
 
-        # Freeze preview immediately with thumbnail
         rid = self._freeze_with_texture(ccapi_path, tex)
 
-        # Now fetch full-res JPG in background and replace when done
         if self.capture_type == CaptureType.JPG:
             threading.Thread(
                 target=self._download_fullres_and_replace,
@@ -984,11 +1066,19 @@ class VolumeToolkitApp(App):
                 daemon=True
             ).start()
         else:
-            self.log(f"Capture type is {self.capture_type}; full-res download not implemented for RAW.")
+            self.log("RAW selected; full-res RAW fetch not implemented yet.")
 
         return True
 
-    # ---------- content listing + poller ----------
+    def _on_preview_touch(self, widget, touch):
+        if not self._freeze_active:
+            return False
+        if not self.preview.collide_point(*touch.pos):
+            return False
+        self._unfreeze_preview()
+        return True
+
+    # ---------- contents + poller ----------
     def list_all_images(self):
         images = []
         st, root = self._json_call("GET", "/ccapi/ver120/contents", None, timeout=8.0)
@@ -1050,48 +1140,43 @@ class VolumeToolkitApp(App):
     def _poll_worker(self):
         while not self._poll_thread_stop.is_set():
             try:
+                if not self.autofetch_enabled:
+                    self._poll_thread_stop.wait(self.poll_interval_s)
+                    continue
+
                 images = self.list_all_images()
-                if images:
-                    jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
-                    if jpgs:
-                        if self._last_seen_image is None:
-                            self._last_seen_image = jpgs[-1]
-                            self.log(f"Poll (bg): baseline set to {self._last_seen_image}")
-                        else:
-                            new_start_idx = None
-                            for idx, path in enumerate(jpgs):
-                                if path == self._last_seen_image:
-                                    new_start_idx = idx + 1
-                                    break
-                            if new_start_idx is None:
-                                self.log("Poll (bg): last_seen not found, resetting baseline")
-                                self._last_seen_image = jpgs[-1]
-                            else:
-                                new_items = jpgs[new_start_idx:]
-                                for path in new_items:
-                                    self.log(f"Poll (bg): New image detected: {path}")
-                                    threading.Thread(
-                                        target=self._download_thumb_for_path,
-                                        args=(path,),
-                                        daemon=True
-                                    ).start()
-                                    self._last_seen_image = path
+                jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
+                if not jpgs:
+                    self._poll_thread_stop.wait(self.poll_interval_s)
+                    continue
+
+                if self._last_seen_image is None:
+                    # Should not happen after baseline worker runs, but safe:
+                    self._last_seen_image = jpgs[-1]
+                    self.log(f"Poll (bg): baseline set to {self._last_seen_image}")
+                    self._poll_thread_stop.wait(self.poll_interval_s)
+                    continue
+
+                new_start_idx = None
+                for idx, path in enumerate(jpgs):
+                    if path == self._last_seen_image:
+                        new_start_idx = idx + 1
+                        break
+
+                if new_start_idx is None:
+                    self.log("Poll (bg): last_seen not found, resetting baseline")
+                    self._last_seen_image = jpgs[-1]
+                else:
+                    new_items = jpgs[new_start_idx:]
+                    for path in new_items:
+                        self.log(f"Poll (bg): New image detected: {path}")
+                        threading.Thread(target=self._download_thumb_for_path, args=(path,), daemon=True).start()
+                        self._last_seen_image = path
+
             except Exception as e:
                 self.log(f"Poll worker error: {e}")
 
             self._poll_thread_stop.wait(self.poll_interval_s)
-
-    def dump_ccapi(self):
-        st, data = self._json_call("GET", "/ccapi", None, timeout=10.0)
-        self.log(f"/ccapi status={st}")
-        try:
-            j = json.dumps(data, indent=2)
-        except Exception:
-            j = str(data)
-        self.log("=== ccapi JSON START ===")
-        for line in j.splitlines():
-            self.log(line)
-        self.log("=== ccapi JSON END ===")
 
     # ---------- menu / popups ----------
     def _style_menu_button(self, b):
@@ -1166,19 +1251,14 @@ class VolumeToolkitApp(App):
         add_header("Display")
         add_button("Set display FPS…", lambda: self._open_fps_popup())
 
-        add_header("Author")
-        add_button("Refresh Author now", lambda: self.refresh_author(note="manual"))
-        add_button("Load CSV…", lambda: self._open_csv_filechooser())
-        add_button("Select headers…", lambda: self._open_headers_popup())
+        add_header("EXIF / Author")
+        add_button("Refresh Current EXIF now", lambda: self.refresh_exif(note="manual"))
 
         add_header("Capture")
         add_capture_type_buttons()
-        add_button("Fetch latest image", lambda: self.download_and_thumbnail_latest())
-        add_button("Start auto-fetch", lambda: self.start_polling_new_images())
-        add_button("Stop auto-fetch", lambda: self.stop_polling_new_images())
+        add_button("Fetch latest image (thumb)", lambda: self.download_and_thumbnail_latest())
 
         add_header("Debug")
-        add_button("Dump /ccapi", lambda: self.dump_ccapi())
         add_button("Show log…", lambda: self._open_log_popup())
 
         return dd
@@ -1244,7 +1324,7 @@ class VolumeToolkitApp(App):
                 self.camera_ip = new_ip
                 self.log(f"Camera IP set to {self.camera_ip}")
                 if self.connected:
-                    self.author_label.text = "(IP changed; reconnect)"
+                    self._set_exif_text("(IP changed; reconnect)")
             popup.dismiss()
 
         ok.bind(on_release=do_ok)
@@ -1291,176 +1371,6 @@ class VolumeToolkitApp(App):
         popup.bind(on_dismiss=lambda *_: setattr(self, "_fps_popup", None))
         popup.open()
         self._fps_popup = popup
-
-    # ---------- Android SAF CSV ----------
-    def _bind_android_activity_once(self):
-        if getattr(self, "_android_activity_bound", False):
-            return
-        try:
-            from android import activity
-            activity.bind(on_activity_result=self._on_android_activity_result)
-            self._android_activity_bound = True
-        except Exception as e:
-            self.log(f"Android activity bind failed: {e}")
-
-    def _open_csv_saf(self):
-        self._bind_android_activity_once()
-        self._csv_req_code = getattr(self, "_csv_req_code", 4242)
-
-        try:
-            from android import mActivity
-            from jnius import autoclass
-
-            Intent = autoclass("android.content.Intent")
-
-            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
-            intent.addCategory(Intent.CATEGORY_OPENABLE)
-            intent.setType("*/*")
-
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-
-            self.log("Opening Android file picker…")
-            mActivity.startActivityForResult(intent, self._csv_req_code)
-
-        except Exception as e:
-            self.log(f"Failed to open Android picker: {e}")
-
-    def _on_android_activity_result(self, request_code, result_code, intent):
-        if request_code != getattr(self, "_csv_req_code", 4242):
-            return
-
-        if result_code != -1 or intent is None:
-            self.log("CSV picker canceled")
-            return
-
-        try:
-            from android import mActivity
-            from jnius import cast, autoclass
-
-            Intent = autoclass("android.content.Intent")
-            uri = cast("android.net.Uri", intent.getData())
-            if uri is None:
-                self.log("CSV picker returned no URI")
-                return
-
-            try:
-                flags = intent.getFlags()
-                take_flags = flags & (
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-                )
-                mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
-            except Exception:
-                pass
-
-            data = self._read_android_uri_bytes(uri)
-            self._parse_csv_bytes(data)
-            self.log(f"CSV loaded from picker: {len(self.csv_rows)} rows")
-
-        except Exception as e:
-            self.log(f"CSV load failed (Android): {e}")
-
-    def _read_android_uri_bytes(self, uri):
-        from android import mActivity
-
-        cr = mActivity.getContentResolver()
-        stream = cr.openInputStream(uri)
-        if stream is None:
-            raise Exception("openInputStream() returned null")
-
-        out = bytearray()
-        buf = bytearray(64 * 1024)
-        while True:
-            n = stream.read(buf)
-            if n == -1 or n == 0:
-                break
-            out.extend(buf[:n])
-        stream.close()
-        return bytes(out)
-
-    def _open_csv_filechooser(self):
-        if platform != "android":
-            self.log("CSV load is Android-only (SAF). Please run on-device to load CSV.")
-            return
-        return self._open_csv_saf()
-
-    def _parse_csv_bytes(self, b: bytes):
-        self.log(f"CSV size: {len(b)} bytes")
-        try:
-            text = b.decode("utf-8-sig")
-        except Exception:
-            text = b.decode("latin-1", errors="replace")
-
-        reader = csv.DictReader(text.splitlines())
-        headers = reader.fieldnames or []
-        self.csv_headers = headers
-        rows = []
-        for r in reader:
-            rows.append({k: (r.get(k) or "").strip() for k in headers})
-        self.csv_rows = rows
-        self.log(f"CSV headers: {headers}")
-        self.log(f"CSV rows: {len(rows)}")
-
-        preferred = ["LAST_NAME", "FIRST_NAME", "GRADE", "TEACHER", "STUDENT_ID"]
-        self.selected_headers = [h for h in preferred if h in headers]
-        if not self.selected_headers and headers:
-            self.selected_headers = headers[:3]
-
-    def _open_headers_popup(self):
-        if not self.csv_headers:
-            self.log("No CSV loaded; cannot pick headers")
-            return
-
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Select columns to include in Author (joined with _):",
-                              size_hint=(1, None), height=dp(40), font_size=sp(12)))
-
-        sv = ScrollView(size_hint=(1, 1))
-        inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
-        inner.bind(minimum_height=inner.setter("height"))
-        sv.add_widget(inner)
-
-        current_sel = set(self.selected_headers)
-
-        for h in self.csv_headers:
-            row = BoxLayout(size_hint_y=None, height=dp(28))
-            lbl = Label(text=h, size_hint=(0.7, 1), font_size=sp(12), halign="left", valign="middle")
-            lbl.bind(size=lbl.setter("text_size"))
-            cb = CheckBox(active=(h in current_sel), size_hint=(0.3, 1))
-
-            def toggle_cb(inst, val, header=h):
-                if val:
-                    if header not in self.selected_headers:
-                        self.selected_headers.append(header)
-                else:
-                    if header in self.selected_headers:
-                        self.selected_headers.remove(header)
-
-            cb.bind(active=toggle_cb)
-            row.add_widget(lbl)
-            row.add_widget(cb)
-            inner.add_widget(row)
-
-        root.add_widget(sv)
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
-        btn_ok = Button(text="OK")
-        btn_cancel = Button(text="Cancel")
-        btns.add_widget(btn_ok)
-        btns.add_widget(btn_cancel)
-        root.add_widget(btns)
-
-        popup = Popup(title="Select CSV columns", content=root, size_hint=(0.9, 0.9))
-
-        def do_ok(*_):
-            self.log(f"Selected headers: {self.selected_headers}")
-            popup.dismiss()
-
-        btn_ok.bind(on_release=do_ok)
-        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
-
-        popup.open()
-        self._headers_popup = popup
 
     def on_stop(self):
         try:
