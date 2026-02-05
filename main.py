@@ -1,27 +1,31 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# Notes for this revision (v2.0.6 + CSV/Subject List/Payload chooser):
-# - Restores Android SAF CSV loading + parsing + header selection popup.
-# - Adds Menu item "Load CSV" which opens a popup with:
-#     - Load CSV file
-#     - Select headers
-# - Adds "Subject List" button next to "Push Payload" (each 50% width).
-#   Subject List opens a popup to browse CSV rows with:
-#     - Search box (text contains across selected headers)
-#     - Sort selector (by any header, asc/desc)
-#     - Per-header filter inputs (contains match)
-#   Selecting a row builds "CSV payload" by joining selected headers with "_" and stores it in:
-#     - self._csv_payload
-# - Main screen metric line replaced by CSV Payload display.
-#   Metrics moved under Menu ("Show metrics…" popup).
-# - Push Payload now prompts user to choose QR or CSV when both exist.
-#   If only one exists, it pushes that one automatically.
+# v2.0.6: CSV + Subject List + payload chooser + metrics popup + autofetch (FULL FILE)
 #
-# NOTE: This keeps the existing Canon "author" write-back endpoint and uses it for "Current EXIF".
-# NOTE: Subject list UI is implemented as a Popup (full-screen-ish) to keep everything in one file.
+# Included:
+# - Preview locked to 85% width; thumbnail strip 15%.
+# - Main row: Connect / Live View toggle / AutoFetch toggle / QR Detect toggle.
+# - Connect button blue; shows "Connected" in yellow when connected.
+# - Live View button: Off red/white, On green/yellow.
+# - AutoFetch button: Off red/white, On green/yellow.
+# - AutoFetch baseline: when toggled ON, sets baseline to current latest image and only fetches new shots.
+# - "Current EXIF" reflects camera Author field; "QR Payload" reflects latest QR decode.
+#   EXIF text turns green when it matches QR payload exactly, else red.
+# - CSV loading (Android SAF) + header selection popup.
+# - Menu "Load CSV…" popup: "Load CSV file" and "Select headers".
+# - Subject List button: browse CSV with search, per-header filters, and sort; choose row -> CSV payload.
+# - CSV payload shown on main screen where metrics used to be.
+# - Metrics moved to Menu ("Show metrics…").
+# - Push Payload: choose QR vs CSV when both exist, else pushes the one available.
+# - Thumbnails are rotated 90° CCW to match preview.
+# - Tapping a thumbnail freezes preview with that still, then downloads full-res JPG and replaces.
+# - Tap preview to unfreeze and return to live.
+#
+# Notes:
+# - Full-res URL rule: https://<camera-ip>/ccapi/ver100/contents/<sdcard-path> derived
+#   from ccapi_path returned by /ccapi/ver120/contents.
 #
 import os
-import json
 import threading
 import time
 from datetime import datetime
@@ -292,7 +296,6 @@ class VolumeToolkitApp(App):
         self.csv_rows = []
         self.selected_headers = []
         self._headers_popup = None
-
         self._subject_popup = None
 
         # thumbnails
@@ -308,6 +311,7 @@ class VolumeToolkitApp(App):
         self.poll_interval_s = 2.0
         self.autofetch_enabled = False
 
+        # HTTP session
         self._session = requests.Session()
         self._session.verify = False
 
@@ -371,7 +375,6 @@ class VolumeToolkitApp(App):
         header.add_widget(self.menu_btn)
         root.add_widget(header)
 
-        # Connect / Live / AutoFetch / QR row
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(1, 1))
         self.start_btn = Button(text="Live View Off", disabled=True, font_size=sp(16), size_hint=(1, 1))
@@ -399,7 +402,6 @@ class VolumeToolkitApp(App):
         row_payload.add_widget(self.payload_label)
         root.add_widget(row_payload)
 
-        # CSV Payload displayed where metrics used to be
         row_csv_payload = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(28))
         row_csv_payload.add_widget(Label(text="CSV Payload", size_hint=(None, 1), width=dp(130), font_size=sp(13)))
         self.csv_payload_label = Label(text="(none)", size_hint=(1, 1), font_size=sp(13),
@@ -408,10 +410,8 @@ class VolumeToolkitApp(App):
         row_csv_payload.add_widget(self.csv_payload_label)
         root.add_widget(row_csv_payload)
 
-        # Keep metrics label but not on screen; shown via Menu popup
         self.metrics = Label(text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0")
 
-        # Preview (85%) + thumbs (15%)
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
         preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.85, 1))
@@ -437,7 +437,6 @@ class VolumeToolkitApp(App):
 
         root.add_widget(main_area)
 
-        # Bottom row: Push Payload + Subject List (50/50)
         bottom = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None), height=dp(52))
         self.push_btn = Button(text="Push Payload", font_size=sp(16), disabled=True)
         self.subject_btn = Button(text="Subject List", font_size=sp(16), disabled=True)
@@ -478,6 +477,7 @@ class VolumeToolkitApp(App):
         self.log("Android CCAPI GUI ready")
         return root
 
+    # ---------- lifecycle ----------
     def on_start(self):
         if platform == "android":
             try:
@@ -614,32 +614,6 @@ class VolumeToolkitApp(App):
 
         self._set_controls_idle()
 
-    # ---------- button style apply ----------
-    def _apply_connect_btn_style(self):
-        self._set_btn_style(self.connect_btn, (0.10, 0.35, 0.85, 1.0), (1, 1, 1, 1))
-        if self.connected:
-            self.connect_btn.text = "Connected"
-            self.connect_btn.color = (1.0, 1.0, 0.0, 1.0)
-        else:
-            self.connect_btn.text = "Connect"
-            self.connect_btn.color = (1, 1, 1, 1)
-
-    def _apply_live_btn_style(self):
-        if self.live_running:
-            self.start_btn.text = "Live View On"
-            self._set_btn_style(self.start_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
-        else:
-            self.start_btn.text = "Live View Off"
-            self._set_btn_style(self.start_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
-
-    def _apply_autofetch_btn_style(self):
-        if self.autofetch_enabled:
-            self.autofetch_btn.text = "Autofetch On"
-            self._set_btn_style(self.autofetch_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
-        else:
-            self.autofetch_btn.text = "Autofetch Off"
-            self._set_btn_style(self.autofetch_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
-
     # ---------- live view ----------
     def toggle_liveview(self):
         if not self.connected:
@@ -729,6 +703,61 @@ class VolumeToolkitApp(App):
         except Exception as e:
             self.log(f"Autofetch baseline error: {e}")
 
+    def start_polling_new_images(self):
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return
+        self.log(f"Starting image poller every {self.poll_interval_s}s (background thread)")
+        self._poll_thread_stop.clear()
+        self._poll_thread = threading.Thread(target=self._poll_worker, daemon=True)
+        self._poll_thread.start()
+
+    def stop_polling_new_images(self):
+        if self._poll_thread is None:
+            return
+        self.log("Stopping image poller (background thread)")
+        self._poll_thread_stop.set()
+        self._poll_thread = None
+
+    def _poll_worker(self):
+        while not self._poll_thread_stop.is_set():
+            try:
+                if not self.autofetch_enabled:
+                    self._poll_thread_stop.wait(self.poll_interval_s)
+                    continue
+
+                images = self.list_all_images()
+                jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
+                if not jpgs:
+                    self._poll_thread_stop.wait(self.poll_interval_s)
+                    continue
+
+                if self._last_seen_image is None:
+                    self._last_seen_image = jpgs[-1]
+                    self.log(f"Poll (bg): baseline set to {self._last_seen_image}")
+                    self._poll_thread_stop.wait(self.poll_interval_s)
+                    continue
+
+                new_start_idx = None
+                for idx, path in enumerate(jpgs):
+                    if path == self._last_seen_image:
+                        new_start_idx = idx + 1
+                        break
+
+                if new_start_idx is None:
+                    self.log("Poll (bg): last_seen not found, resetting baseline")
+                    self._last_seen_image = jpgs[-1]
+                else:
+                    new_items = jpgs[new_start_idx:]
+                    for path in new_items:
+                        self.log(f"Poll (bg): New image detected: {path}")
+                        threading.Thread(target=self._download_thumb_for_path, args=(path,), daemon=True).start()
+                        self._last_seen_image = path
+
+            except Exception as e:
+                self.log(f"Poll worker error: {e}")
+
+            self._poll_thread_stop.wait(self.poll_interval_s)
+
     # ---------- QR ----------
     def toggle_qr_detect(self):
         self.qr_enabled = not bool(self.qr_enabled)
@@ -743,10 +772,6 @@ class VolumeToolkitApp(App):
         return s[: int(self.author_max_chars)]
 
     def push_payload(self):
-        """
-        If both QR and CSV payload exist, prompt user.
-        Otherwise push the only one available.
-        """
         if not self.connected:
             self.log("Push payload skipped: not connected")
             return
@@ -772,9 +797,10 @@ class VolumeToolkitApp(App):
             self._push_author_value(value, source=label)
             return
 
-        # Prompt
         root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
         root.add_widget(Label(text="Choose payload to push:", size_hint=(1, None), height=dp(30), font_size=sp(14)))
+
+        popup = Popup(title="Push Payload", content=root, size_hint=(0.95, 0.6))
 
         for label, value in options:
             preview = value[:120] + ("…" if len(value) > 120 else "")
@@ -785,10 +811,9 @@ class VolumeToolkitApp(App):
             root.add_widget(btn)
 
         cancel = Button(text="Cancel", size_hint=(1, None), height=dp(44))
+        cancel.bind(on_release=lambda *_: popup.dismiss())
         root.add_widget(cancel)
 
-        popup = Popup(title="Push Payload", content=root, size_hint=(0.95, 0.6))
-        cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
     def _push_author_value(self, raw_value: str, source="manual"):
@@ -844,7 +869,7 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_finish, 0)
 
-    # ---------- metrics (menu popup) ----------
+    # ---------- metrics loop ----------
     def _reschedule_display_loop(self, fps):
         if self._display_event is not None:
             self._display_event.cancel()
@@ -1171,7 +1196,7 @@ class VolumeToolkitApp(App):
             self.log("RAW selected; full-res RAW fetch not implemented yet.")
         return True
 
-    # ---------- contents + poller ----------
+    # ---------- contents listing ----------
     def list_all_images(self):
         images = []
         st, root = self._json_call("GET", "/ccapi/ver120/contents", None, timeout=8.0)
@@ -1195,77 +1220,6 @@ class VolumeToolkitApp(App):
                     for f in f_data["path"]:
                         images.append(f)
         return images
-
-    def download_and_thumbnail_latest(self):
-        if not self.connected:
-            self.log("Not connected; cannot fetch contents.")
-            return
-        images = self.list_all_images()
-        if not images:
-            self.log("No images found on camera.")
-            return
-        jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
-        if not jpgs:
-            self.log("No JPG files found.")
-            return
-        latest = jpgs[-1]
-        threading.Thread(target=self._download_thumb_for_path, args=(latest,), daemon=True).start()
-        self._last_seen_image = latest
-
-    def start_polling_new_images(self):
-        if self._poll_thread is not None and self._poll_thread.is_alive():
-            return
-        self.log(f"Starting image poller every {self.poll_interval_s}s (background thread)")
-        self._poll_thread_stop.clear()
-        self._poll_thread = threading.Thread(target=self._poll_worker, daemon=True)
-        self._poll_thread.start()
-
-    def stop_polling_new_images(self):
-        if self._poll_thread is None:
-            return
-        self.log("Stopping image poller (background thread)")
-        self._poll_thread_stop.set()
-        self._poll_thread = None
-
-    def _poll_worker(self):
-        while not self._poll_thread_stop.is_set():
-            try:
-                if not self.autofetch_enabled:
-                    self._poll_thread_stop.wait(self.poll_interval_s)
-                    continue
-
-                images = self.list_all_images()
-                jpgs = [p for p in images if p.lower().endswith((".jpg", ".jpeg"))]
-                if not jpgs:
-                    self._poll_thread_stop.wait(self.poll_interval_s)
-                    continue
-
-                if self._last_seen_image is None:
-                    self._last_seen_image = jpgs[-1]
-                    self.log(f"Poll (bg): baseline set to {self._last_seen_image}")
-                    self._poll_thread_stop.wait(self.poll_interval_s)
-                    continue
-
-                new_start_idx = None
-                for idx, path in enumerate(jpgs):
-                    if path == self._last_seen_image:
-                        new_start_idx = idx + 1
-                        break
-
-                if new_start_idx is None:
-                    self.log("Poll (bg): last_seen not found, resetting baseline")
-                    self._last_seen_image = jpgs[-1]
-                else:
-                    new_items = jpgs[new_start_idx:]
-                    for path in new_items:
-                        self.log(f"Poll (bg): New image detected: {path}")
-                        threading.Thread(target=self._download_thumb_for_path, args=(path,), daemon=True).start()
-                        self._last_seen_image = path
-
-            except Exception as e:
-                self.log(f"Poll worker error: {e}")
-
-            self._poll_thread_stop.wait(self.poll_interval_s)
 
     # ---------- Menu + popups ----------
     def _style_menu_button(self, b):
@@ -1346,10 +1300,10 @@ class VolumeToolkitApp(App):
 
         add_header("CSV")
         add_button("Load CSV…", lambda: self._open_csv_menu_popup())
+        add_button("Subject List", lambda: self.open_subject_list())
 
         add_header("Capture")
         add_capture_type_buttons()
-        add_button("Fetch latest image (thumb)", lambda: self.download_and_thumbnail_latest())
 
         add_header("Debug")
         add_button("Show log…", lambda: self._open_log_popup())
@@ -1480,7 +1434,7 @@ class VolumeToolkitApp(App):
         popup.open()
         self._fps_popup = popup
 
-    # ---------- CSV SAF loading (restored) ----------
+    # ---------- CSV SAF loading ----------
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
             return
@@ -1651,7 +1605,7 @@ class VolumeToolkitApp(App):
         popup.open()
         self._headers_popup = popup
 
-    # ---------- Subject List popup ----------
+    # ---------- Subject List ----------
     def _build_csv_payload_from_row(self, row: dict) -> str:
         headers = self.selected_headers if self.selected_headers else (self.csv_headers[:3] if self.csv_headers else [])
         parts = []
@@ -1672,34 +1626,24 @@ class VolumeToolkitApp(App):
                 pass
             self._subject_popup = None
 
-        # UI state
-        state = {
-            "search": "",
-            "sort_header": (self.selected_headers[0] if self.selected_headers else (self.csv_headers[0] if self.csv_headers else "")),
-            "sort_desc": False,
-            "filters": {h: "" for h in self.csv_headers},
-        }
-
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
 
-        # Top controls: search
         row_search = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         row_search.add_widget(Label(text="Search", size_hint=(None, 1), width=dp(70), font_size=sp(12)))
         ti_search = TextInput(text="", multiline=False, font_size=sp(14))
         row_search.add_widget(ti_search)
         root.add_widget(row_search)
 
-        # Sort controls
         row_sort = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         row_sort.add_widget(Label(text="Sort by", size_hint=(None, 1), width=dp(70), font_size=sp(12)))
-        ti_sort = TextInput(text=state["sort_header"], multiline=False, font_size=sp(14), hint_text="Header name")
+        default_sort = self.selected_headers[0] if self.selected_headers else (self.csv_headers[0] if self.csv_headers else "")
+        ti_sort = TextInput(text=default_sort, multiline=False, font_size=sp(14), hint_text="Header name")
         row_sort.add_widget(ti_sort)
-        cb_desc = CheckBox(active=state["sort_desc"], size_hint=(None, 1), width=dp(44))
+        cb_desc = CheckBox(active=False, size_hint=(None, 1), width=dp(44))
         row_sort.add_widget(Label(text="Desc", size_hint=(None, 1), width=dp(50), font_size=sp(12)))
         row_sort.add_widget(cb_desc)
         root.add_widget(row_sort)
 
-        # Filters: scroll list of header->TextInput
         root.add_widget(Label(text="Filters (contains):", size_hint=(1, None), height=dp(22), font_size=sp(12)))
 
         sv_filters = ScrollView(size_hint=(1, None), height=dp(160), do_scroll_x=False)
@@ -1708,7 +1652,6 @@ class VolumeToolkitApp(App):
         sv_filters.add_widget(filters_inner)
 
         filter_inputs = {}
-
         for h in self.csv_headers:
             r = BoxLayout(size_hint_y=None, height=dp(32), spacing=dp(6))
             lbl = Label(text=h, size_hint=(0.4, 1), font_size=sp(11), halign="left", valign="middle")
@@ -1721,7 +1664,6 @@ class VolumeToolkitApp(App):
 
         root.add_widget(sv_filters)
 
-        # Results list
         root.add_widget(Label(text="Results:", size_hint=(1, None), height=dp(22), font_size=sp(12)))
         sv_results = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         results_inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
@@ -1729,7 +1671,6 @@ class VolumeToolkitApp(App):
         sv_results.add_widget(results_inner)
         root.add_widget(sv_results)
 
-        # Bottom buttons
         btn_bar = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
         btn_refresh = Button(text="Refresh")
         btn_close = Button(text="Close")
@@ -1752,7 +1693,6 @@ class VolumeToolkitApp(App):
 
             rows = self.csv_rows
 
-            # apply per-header filters
             if filters:
                 def row_ok(r):
                     for h, v in filters.items():
@@ -1761,7 +1701,6 @@ class VolumeToolkitApp(App):
                     return True
                 rows = [r for r in rows if row_ok(r)]
 
-            # apply search across selected headers (or all headers if none selected)
             if search:
                 headers = self.selected_headers if self.selected_headers else self.csv_headers
                 def hit(r):
@@ -1771,7 +1710,6 @@ class VolumeToolkitApp(App):
                     return False
                 rows = [r for r in rows if hit(r)]
 
-            # sort
             if sort_h:
                 def key_fn(r):
                     return (r.get(sort_h) or "").lower()
@@ -1785,8 +1723,9 @@ class VolumeToolkitApp(App):
         def render_results():
             results_inner.clear_widgets()
             rows = compute_filtered_rows()
-            max_show = 200  # safety for UI; can increase later
+            max_show = 200
             show_rows = rows[:max_show]
+
             if not show_rows:
                 results_inner.add_widget(Label(text="(no results)", size_hint_y=None, height=dp(24), font_size=sp(12)))
                 return
@@ -1797,6 +1736,7 @@ class VolumeToolkitApp(App):
                 payload = self._build_csv_payload_from_row(r)
                 display = payload if payload else " / ".join([(r.get(h) or "") for h in headers])
                 btn = Button(text=display[:120], size_hint_y=None, height=dp(44), font_size=sp(12))
+
                 def _make_pick(row=r, payload=payload):
                     def _pick(*_):
                         p = payload or self._build_csv_payload_from_row(row)
@@ -1804,6 +1744,7 @@ class VolumeToolkitApp(App):
                         self.log(f"CSV payload selected: {p}")
                         popup.dismiss()
                     return _pick
+
                 btn.bind(on_release=_make_pick())
                 results_inner.add_widget(btn)
 
@@ -1817,11 +1758,7 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: popup.dismiss())
         ti_search.bind(text=lambda *_: render_results())
         cb_desc.bind(active=lambda *_: render_results())
-
-        # Also refresh when sort header changes (on text input)
         ti_sort.bind(text=lambda *_: render_results())
-
-        # Filters refresh on change
         for ti in filter_inputs.values():
             ti.bind(text=lambda *_: render_results())
 
@@ -1829,6 +1766,167 @@ class VolumeToolkitApp(App):
         popup.open()
         self._subject_popup = popup
         render_results()
+
+    # ---------- CSV controls ----------
+    def _bind_android_activity_once(self):
+        if getattr(self, "_android_activity_bound", False):
+            return
+        try:
+            from android import activity
+            activity.bind(on_activity_result=self._on_android_activity_result)
+            self._android_activity_bound = True
+        except Exception as e:
+            self.log(f"Android activity bind failed: {e}")
+
+    def _open_csv_saf(self):
+        self._bind_android_activity_once()
+        self._csv_req_code = getattr(self, "_csv_req_code", 4242)
+        try:
+            from android import mActivity
+            from jnius import autoclass
+
+            Intent = autoclass("android.content.Intent")
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
+            self.log("Opening Android file picker…")
+            mActivity.startActivityForResult(intent, self._csv_req_code)
+        except Exception as e:
+            self.log(f"Failed to open Android picker: {e}")
+
+    def _on_android_activity_result(self, request_code, result_code, intent):
+        if request_code != getattr(self, "_csv_req_code", 4242):
+            return
+        if result_code != -1 or intent is None:
+            self.log("CSV picker canceled")
+            return
+        try:
+            from android import mActivity
+            from jnius import cast, autoclass
+
+            Intent = autoclass("android.content.Intent")
+            uri = cast("android.net.Uri", intent.getData())
+            if uri is None:
+                self.log("CSV picker returned no URI")
+                return
+
+            try:
+                flags = intent.getFlags()
+                take_flags = flags & (
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                )
+                mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
+            except Exception:
+                pass
+
+            data = self._read_android_uri_bytes(uri)
+            self._parse_csv_bytes(data)
+            self.log(f"CSV loaded from picker: {len(self.csv_rows)} rows")
+            Clock.schedule_once(lambda *_: self._set_controls_idle(), 0)
+        except Exception as e:
+            self.log(f"CSV load failed (Android): {e}")
+
+    def _read_android_uri_bytes(self, uri):
+        from android import mActivity
+        cr = mActivity.getContentResolver()
+        stream = cr.openInputStream(uri)
+        if stream is None:
+            raise Exception("openInputStream() returned null")
+        out = bytearray()
+        buf = bytearray(64 * 1024)
+        while True:
+            n = stream.read(buf)
+            if n == -1 or n == 0:
+                break
+            out.extend(buf[:n])
+        stream.close()
+        return bytes(out)
+
+    def _open_csv_filechooser(self):
+        if platform != "android":
+            self.log("CSV load is Android-only (SAF). Please run on-device to load CSV.")
+            return
+        return self._open_csv_saf()
+
+    def _parse_csv_bytes(self, b: bytes):
+        self.log(f"CSV size: {len(b)} bytes")
+        try:
+            text = b.decode("utf-8-sig")
+        except Exception:
+            text = b.decode("latin-1", errors="replace")
+        reader = csv.DictReader(text.splitlines())
+        headers = reader.fieldnames or []
+        self.csv_headers = headers
+        rows = []
+        for r in reader:
+            rows.append({k: (r.get(k) or "").strip() for k in headers})
+        self.csv_rows = rows
+        self.log(f"CSV headers: {headers}")
+        self.log(f"CSV rows: {len(rows)}")
+
+        preferred = ["LAST_NAME", "FIRST_NAME", "GRADE", "TEACHER", "STUDENT_ID"]
+        self.selected_headers = [h for h in preferred if h in headers]
+        if not self.selected_headers and headers:
+            self.selected_headers = headers[:3]
+
+    # ---------- remaining menu helpers ----------
+    def _open_headers_popup(self):
+        if not self.csv_headers:
+            self.log("No CSV loaded; cannot pick headers")
+            return
+
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Select columns to include in CSV Payload (joined with _):",
+                              size_hint=(1, None), height=dp(40), font_size=sp(12)))
+        sv = ScrollView(size_hint=(1, 1))
+        inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        inner.bind(minimum_height=inner.setter("height"))
+        sv.add_widget(inner)
+
+        current_sel = set(self.selected_headers)
+
+        for h in self.csv_headers:
+            row = BoxLayout(size_hint_y=None, height=dp(28))
+            lbl = Label(text=h, size_hint=(0.7, 1), font_size=sp(12), halign="left", valign="middle")
+            lbl.bind(size=lbl.setter("text_size"))
+            cb = CheckBox(active=(h in current_sel), size_hint=(0.3, 1))
+
+            def toggle_cb(inst, val, header=h):
+                if val:
+                    if header not in self.selected_headers:
+                        self.selected_headers.append(header)
+                else:
+                    if header in self.selected_headers:
+                        self.selected_headers.remove(header)
+
+            cb.bind(active=toggle_cb)
+            row.add_widget(lbl)
+            row.add_widget(cb)
+            inner.add_widget(row)
+
+        root.add_widget(sv)
+
+        btns = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
+        btn_ok = Button(text="OK")
+        btn_cancel = Button(text="Cancel")
+        btns.add_widget(btn_ok)
+        btns.add_widget(btn_cancel)
+        root.add_widget(btns)
+
+        popup = Popup(title="Select CSV columns", content=root, size_hint=(0.9, 0.9))
+
+        def do_ok(*_):
+            self.log(f"Selected headers: {self.selected_headers}")
+            popup.dismiss()
+
+        btn_ok.bind(on_release=do_ok)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+
+        popup.open()
+        self._headers_popup = popup
 
     # ---------- lifecycle ----------
     def on_stop(self):
