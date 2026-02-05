@@ -2,24 +2,28 @@
 #
 # v2.1.1
 #
-# Based on v2.0.9 (known-good live view + CSV push), with ONLY these behavior changes:
+# Base: v2.0.9 (keeps known-good Live View + AutoFetch + CSV load + Push Payload)
+#
+# Requested changes included:
 # - QR Detect button uses same On/Off color scheme as Live View and Autofetch:
 #     OFF: red background, white text
 #     ON:  green background, yellow text
-# - Live preview placement LOCKED (no dragging / panning). (No zoom in this version.)
-# - Thumbnail review: active thumb highlighted with green border.
-# - Close thumbnail review by tapping the same thumbnail again (toggle).
-#   (Preview tap no longer exits review.)
-# - Log overlay: non-modal panel on bottom of UI with auto-scroll. Menu toggle.
-# - Full-res endpoint fix:
+# - Remove "Reset framing" (no longer meaningful once placement is locked / no zoom).
+# - Layout:
+#     - Compact EXIF / QR / CSV rows (left-justified headings, tighter vertical spacing).
+#     - Ensure preview + thumbs do not collide with bottom Push/Subject buttons by placing
+#       preview+thumbs in a middle band above the bottom button row.
+# - Thumbnails:
+#     - Right strip is scrollable and shows ~4 items at a time ("Most Recent").
+#     - Holds effectively unlimited history by storing thumb files on disk (thumbs/ folder)
+#       and lazy-loading textures with a small in-memory cache.
+#     - Active reviewed thumbnail highlighted with a green border.
+#     - Close review by tapping the same thumbnail again (toggle).
+#     - Tapping the preview no longer exits review.
+# - Log overlay: non-modal bottom overlay panel (auto-scroll) with menu toggle.
+# - Full-res fetch endpoints:
 #     Primary:  https://{ip}{ccapi_path}
-#     Fallback: existing /ccapi/ver100/contents/<sdpath> mapping (url-encoded)
-#
-# Still image "fill exactly":
-# - Stills are rotated to preview orientation and center-cropped to fixed portrait aspect 2:3,
-#   so they fill the preview window exactly and align with framing guides.
-#
-# Note: This file is Android-only (uses android.* for SAF).
+#     Fallback: https://{ip}/ccapi/ver100/contents/<sdpath> mapping (url-encoded)
 #
 import os
 import threading
@@ -232,8 +236,7 @@ class CaptureType:
 
 class VolumeToolkitApp(App):
     capture_type = StringProperty(CaptureType.JPG)
-
-    STILL_TARGET_ASPECT = 2.0 / 3.0  # portrait (w/h = 2/3)
+    STILL_TARGET_ASPECT = 2.0 / 3.0  # portrait
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -256,7 +259,7 @@ class VolumeToolkitApp(App):
         self._stat_t0 = time.time()
 
         self._log_lines = []
-        self._max_log_lines = 400
+        self._max_log_lines = 500
 
         self._frame_texture = None
         self._frame_size = None
@@ -295,14 +298,20 @@ class VolumeToolkitApp(App):
         self._headers_popup = None
         self._subject_popup = None
 
-        # thumbnails
-        self._thumb_textures = []
-        self._thumb_images = []
-        self._thumb_paths = []
+        # thumbnails (history)
+        self._thumb_textures = []              # parallel to _thumb_items
+        self._thumb_items = []                 # list of dicts: {ccapi_path, local_path}
         self.thumb_dir = "thumbs"
-
         self._active_thumb_index = None
+
+        # visible thumb widgets
+        self._thumb_images = []
         self._thumb_border_lines = []
+
+        # thumb texture cache (small)
+        self._thumb_tex_cache = {}             # local_path -> Texture
+        self._thumb_tex_cache_order = []       # local_path order (oldest first)
+        self._thumb_tex_cache_max = 24
 
         # poller
         self._last_seen_image = None
@@ -321,6 +330,8 @@ class VolumeToolkitApp(App):
 
         # popups
         self.dropdown = None
+        self._log_popup = None
+        self._log_popup_label = None
         self._ip_popup = None
         self._fps_popup = None
         self._metrics_popup = None
@@ -335,31 +346,7 @@ class VolumeToolkitApp(App):
         self._log_overlay_label = None
         self._log_overlay_sv = None
 
-    # ---------- lifecycle ----------
-    def on_start(self):
-        if platform == "android":
-            try:
-                from android.permissions import request_permissions, Permission
-                request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
-                self.log("Requested storage permissions (Android).")
-            except Exception as e:
-                self.log(f"Permission request failed: {e}")
-
-    def on_stop(self):
-        try:
-            self.stop_liveview()
-        except Exception:
-            pass
-        try:
-            self.stop_polling_new_images()
-        except Exception:
-            pass
-        try:
-            self._decoder_stop.set()
-        except Exception:
-            pass
-
-    # ---------- app exit ----------
+    # ---------- header buttons ----------
     def exit_app(self):
         try:
             self.stop_liveview()
@@ -370,6 +357,57 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
         self.stop()
+
+    # ---------- styling helpers ----------
+    @staticmethod
+    def _set_btn_style(btn: Button, bg_rgba, fg_rgba):
+        btn.background_normal = ""
+        btn.background_down = ""
+        btn.background_color = bg_rgba
+        btn.color = fg_rgba
+
+    def _apply_connect_btn_style(self):
+        self._set_btn_style(self.connect_btn, (0.10, 0.35, 0.85, 1.0), (1, 1, 1, 1))
+        if self.connected:
+            self.connect_btn.text = "Connected"
+            self.connect_btn.color = (1.0, 1.0, 0.0, 1.0)
+        else:
+            self.connect_btn.text = "Connect"
+            self.connect_btn.color = (1, 1, 1, 1)
+
+    def _apply_live_btn_style(self):
+        if self.live_running:
+            self.start_btn.text = "Live View On"
+            self._set_btn_style(self.start_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
+        else:
+            self.start_btn.text = "Live View Off"
+            self._set_btn_style(self.start_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
+
+    def _apply_autofetch_btn_style(self):
+        if self.autofetch_enabled:
+            self.autofetch_btn.text = "Autofetch On"
+            self._set_btn_style(self.autofetch_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
+        else:
+            self.autofetch_btn.text = "Autofetch Off"
+            self._set_btn_style(self.autofetch_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
+
+    def _apply_qr_btn_style(self):
+        if self.qr_enabled:
+            self.qr_btn.text = "QR Detect On"
+            self._set_btn_style(self.qr_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
+        else:
+            self.qr_btn.text = "QR Detect Off"
+            self._set_btn_style(self.qr_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
+
+    # ---------- lifecycle ----------
+    def on_start(self):
+        if platform == "android":
+            try:
+                from android.permissions import request_permissions, Permission
+                request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
+                self.log("Requested storage permissions (Android).")
+            except Exception as e:
+                self.log(f"Permission request failed: {e}")
 
     # ---------- logging ----------
     def log(self, msg):
@@ -432,47 +470,6 @@ class VolumeToolkitApp(App):
         if resp.status_code != 200:
             raise Exception(f"HTTP {resp.status_code} {resp.reason}")
         return resp.content
-
-    # ---------- styling helpers ----------
-    @staticmethod
-    def _set_btn_style(btn: Button, bg_rgba, fg_rgba):
-        btn.background_normal = ""
-        btn.background_down = ""
-        btn.background_color = bg_rgba
-        btn.color = fg_rgba
-
-    def _apply_connect_btn_style(self):
-        self._set_btn_style(self.connect_btn, (0.10, 0.35, 0.85, 1.0), (1, 1, 1, 1))
-        if self.connected:
-            self.connect_btn.text = "Connected"
-            self.connect_btn.color = (1.0, 1.0, 0.0, 1.0)
-        else:
-            self.connect_btn.text = "Connect"
-            self.connect_btn.color = (1, 1, 1, 1)
-
-    def _apply_live_btn_style(self):
-        if self.live_running:
-            self.start_btn.text = "Live View On"
-            self._set_btn_style(self.start_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
-        else:
-            self.start_btn.text = "Live View Off"
-            self._set_btn_style(self.start_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
-
-    def _apply_autofetch_btn_style(self):
-        if self.autofetch_enabled:
-            self.autofetch_btn.text = "Autofetch On"
-            self._set_btn_style(self.autofetch_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
-        else:
-            self.autofetch_btn.text = "Autofetch Off"
-            self._set_btn_style(self.autofetch_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
-
-    def _apply_qr_btn_style(self):
-        if self.qr_enabled:
-            self.qr_btn.text = "QR Detect On"
-            self._set_btn_style(self.qr_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
-        else:
-            self.qr_btn.text = "QR Detect Off"
-            self._set_btn_style(self.qr_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
 
     # ---------- matching colors ----------
     def _match_trimmed(self, s: str) -> str:
@@ -791,8 +788,10 @@ class VolumeToolkitApp(App):
         for label, value in options:
             preview = value[:120] + ("…" if len(value) > 120 else "")
             btn = Button(text=f"{label}: {preview}", size_hint=(1, None), height=dp(48))
+
             def _make_onpress(lbl=label, val=value):
                 return lambda *_: (popup.dismiss(), self._push_author_value(val, source=lbl))
+
             btn.bind(on_release=_make_onpress())
             root.add_widget(btn)
 
@@ -1056,17 +1055,84 @@ class VolumeToolkitApp(App):
                 self.log(f"QR: {text}")
         Clock.schedule_once(lambda *_: self._set_payload(text), 0)
 
-    # ---------- freeze/review + thumbs/full-res ----------
+    # ---------- thumb cache + rendering ----------
+    def _thumb_local_path_for_ccapi_path(self, ccapi_path: str) -> str:
+        # Ensure stable unique-ish name: basename plus a hash of full path
+        base = os.path.basename(ccapi_path) or "image"
+        if not base.lower().endswith((".jpg", ".jpeg")):
+            base = base + ".jpg"
+        h = str(abs(hash(ccapi_path)))  # ok for local cache naming
+        name = f"{h}_{base}"
+        return os.path.join(self.thumb_dir, name)
+
+    def _thumb_cache_put(self, local_path: str, tex: Texture):
+        self._thumb_tex_cache[local_path] = tex
+        if local_path in self._thumb_tex_cache_order:
+            self._thumb_tex_cache_order.remove(local_path)
+        self._thumb_tex_cache_order.append(local_path)
+
+        while len(self._thumb_tex_cache_order) > int(self._thumb_tex_cache_max):
+            old = self._thumb_tex_cache_order.pop(0)
+            try:
+                del self._thumb_tex_cache[old]
+            except Exception:
+                pass
+
+    def _thumb_cache_get(self, local_path: str):
+        tex = self._thumb_tex_cache.get(local_path)
+        if tex is not None:
+            # bump recency
+            if local_path in self._thumb_tex_cache_order:
+                self._thumb_tex_cache_order.remove(local_path)
+            self._thumb_tex_cache_order.append(local_path)
+        return tex
+
+    def _load_thumb_texture_from_file(self, local_path: str):
+        tex = self._thumb_cache_get(local_path)
+        if tex is not None:
+            return tex
+        if not os.path.exists(local_path):
+            return None
+        try:
+            pil = PILImage.open(local_path).convert("RGB")
+            try:
+                pil = pil.transpose(PILImage.Transpose.ROTATE_90)
+            except Exception:
+                pil = pil.transpose(PILImage.ROTATE_90)
+            pil.thumbnail((240, 240))
+            w, h = pil.size
+            rgb_bytes = pil.tobytes()
+            tex = Texture.create(size=(w, h), colorfmt="rgb")
+            tex.flip_vertical()
+            tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
+            self._thumb_cache_put(local_path, tex)
+            return tex
+        except Exception as e:
+            self.log(f"thumb file decode error: {e}")
+            return None
+
+    def _refresh_thumb_widgets(self, *_args):
+        # Fill each visible widget with the corresponding item (newest at top).
+        for idx, img in enumerate(self._thumb_images):
+            if idx < len(self._thumb_items):
+                item = self._thumb_items[idx]
+                tex = self._load_thumb_texture_from_file(item["local_path"])
+                img.texture = tex
+            else:
+                img.texture = None
+        self._update_thumb_borders()
+
     def _update_thumb_borders(self):
         for idx, img in enumerate(self._thumb_images):
             ln = self._thumb_border_lines[idx]
-            if self._active_thumb_index == idx and idx < len(self._thumb_paths):
+            if self._active_thumb_index == idx and idx < len(self._thumb_items):
                 x, y = img.pos
                 w, h = img.size
                 ln.rectangle = (x, y, w, h)
             else:
                 ln.rectangle = (0, 0, 0, 0)
 
+    # ---------- still review toggle ----------
     def _close_review(self):
         self._freeze_active = False
         self._freeze_ccapi_path = None
@@ -1075,6 +1141,7 @@ class VolumeToolkitApp(App):
         self._update_thumb_borders()
         self.log("Review closed (thumb toggle)")
 
+    # ---------- endpoints ----------
     def _contents_fullres_url(self, ccapi_path: str) -> str:
         prefix = "/ccapi/ver120/contents/"
         if ccapi_path.startswith(prefix):
@@ -1085,8 +1152,6 @@ class VolumeToolkitApp(App):
         return f"https://{self.camera_ip}/ccapi/ver100/contents/{sd_path_enc}"
 
     def _download_fullres_and_replace(self, ccapi_path: str, request_id: int):
-        # Primary: https://<ip><ccapi_path>
-        # Fallback: /ccapi/ver100/contents/<sdpath> mapping
         urls = [
             ("PRIMARY", f"https://{self.camera_ip}{ccapi_path}"),
             ("FALLBACK", self._contents_fullres_url(ccapi_path)),
@@ -1094,6 +1159,7 @@ class VolumeToolkitApp(App):
 
         jpg_bytes = None
         used = None
+
         for name, url in urls:
             try:
                 self.log(f"FULLRES {name} START url={url}")
@@ -1146,6 +1212,7 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_apply, 0)
 
+    # ---------- thumbnail download (background) ----------
     def _download_thumb_for_path(self, ccapi_path: str):
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         self.log(f"Downloading thumbnail (bg): {thumb_url}")
@@ -1161,65 +1228,37 @@ class VolumeToolkitApp(App):
 
         try:
             os.makedirs(self.thumb_dir, exist_ok=True)
-            name = os.path.basename(ccapi_path) or "image"
-            if not name.lower().endswith((".jpg", ".jpeg")):
-                name = name + ".jpg"
-            out_path = os.path.join(self.thumb_dir, name)
-            with open(out_path, "wb") as f:
+            local_path = self._thumb_local_path_for_ccapi_path(ccapi_path)
+            with open(local_path, "wb") as f:
                 f.write(thumb_bytes)
-        except Exception:
-            pass
-
-        try:
-            pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
-            try:
-                pil = pil.transpose(PILImage.Transpose.ROTATE_90)
-            except Exception:
-                pil = pil.transpose(PILImage.ROTATE_90)
-            pil.thumbnail((240, 240))
-            w, h = pil.size
-            rgb_bytes = pil.tobytes()
         except Exception as e:
-            self.log(f"Thumbnail decode/rotate err (bg): {e}")
+            self.log(f"Thumbnail save error: {e}")
             return
 
-        def _make_texture_and_update(_dt, rgb_bytes=rgb_bytes, w=w, h=h, ccapi_path=ccapi_path):
-            try:
-                tex = Texture.create(size=(w, h), colorfmt="rgb")
-                tex.flip_vertical()
-                tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
-            except Exception as e:
-                self.log(f"Texture create/blit err: {e}")
-                return
+        def _add_item(_dt):
+            # newest at top
+            self._thumb_items.insert(0, {"ccapi_path": ccapi_path, "local_path": local_path})
+            # refresh visible widgets
+            self._refresh_thumb_widgets()
 
-            self._thumb_textures.insert(0, tex)
-            self._thumb_paths.insert(0, ccapi_path)
-            self._thumb_textures = self._thumb_textures[:5]
-            self._thumb_paths = self._thumb_paths[:5]
+        Clock.schedule_once(_add_item, 0)
 
-            for idx, img in enumerate(self._thumb_images):
-                img.texture = self._thumb_textures[idx] if idx < len(self._thumb_textures) else None
-
-            if self._active_thumb_index is not None and self._active_thumb_index >= len(self._thumb_paths):
-                self._active_thumb_index = None
-            self._update_thumb_borders()
-
-        Clock.schedule_once(_make_texture_and_update, 0)
-
+    # ---------- thumb tap ----------
     def _on_thumb_touch(self, image_widget, touch):
         if not image_widget.collide_point(*touch.pos):
             return False
         idx = getattr(image_widget, "thumb_index", None)
-        if idx is None or idx >= len(self._thumb_paths):
+        if idx is None or idx >= len(self._thumb_items):
             return False
 
-        # Toggle close if tapping same active thumb
+        # Toggle close if tapping same active thumb while frozen
         if self._freeze_active and self._active_thumb_index == idx:
             self._close_review()
             return True
 
-        ccapi_path = self._thumb_paths[idx]
-        thumb_tex = self._thumb_textures[idx]
+        item = self._thumb_items[idx]
+        ccapi_path = item["ccapi_path"]
+        local_path = item["local_path"]
 
         # Enter freeze mode
         rid = self._freeze_request_id + 1
@@ -1230,23 +1269,25 @@ class VolumeToolkitApp(App):
         self._active_thumb_index = idx
         self._update_thumb_borders()
 
-        self.log(f"Thumb tapped -> freeze (rid={rid}): {ccapi_path}")
+        self.log(f"REVIEW START idx={idx} rid={rid} path={ccapi_path}")
 
-        # immediate response
-        self.preview.set_texture(thumb_tex)
+        # Immediate feedback: show local thumb texture if present
+        tex = self._load_thumb_texture_from_file(local_path)
+        if tex is not None:
+            self.preview.set_texture(tex)
 
-        # background: apply cropped thumb then full-res
+        # Start background pipeline: fetch thumb bytes again -> crop -> apply -> fullres
         threading.Thread(target=self._freeze_pipeline_for_thumb, args=(ccapi_path, rid), daemon=True).start()
         return True
 
     def _freeze_pipeline_for_thumb(self, ccapi_path: str, request_id: int):
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         try:
-            self.log(f"Freeze thumb fetch START (bg): {thumb_url}")
+            self.log(f"REVIEW THUMB START url={thumb_url}")
             b = self._get_bytes(thumb_url, timeout=12.0)
-            self.log(f"Freeze thumb fetch OK (bg): {len(b)} bytes")
+            self.log(f"REVIEW THUMB OK bytes={len(b)}")
         except Exception as e:
-            self.log(f"Freeze thumb fetch ERROR: {e}")
+            self.log(f"REVIEW THUMB ERROR {e}")
             return
 
         try:
@@ -1261,7 +1302,7 @@ class VolumeToolkitApp(App):
             h, w = rgb.shape[:2]
             rgb_bytes = rgb.tobytes()
         except Exception as e:
-            self.log(f"Freeze thumb decode/rotate/crop ERROR: {e}")
+            self.log(f"REVIEW THUMB DECODE/ROTATE/CROP ERROR {e}")
             return
 
         def apply_thumb(_dt):
@@ -1276,9 +1317,9 @@ class VolumeToolkitApp(App):
                 tex.flip_vertical()
                 tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
                 self.preview.set_texture(tex)
-                self.log(f"Freeze thumb applied to preview: {ccapi_path} ({w}x{h})")
+                self.log(f"REVIEW THUMB APPLY w={w} h={h}")
             except Exception as e:
-                self.log(f"Freeze thumb texture apply ERROR: {e}")
+                self.log(f"REVIEW THUMB APPLY ERROR {e}")
 
         Clock.schedule_once(apply_thumb, 0)
 
@@ -1312,7 +1353,186 @@ class VolumeToolkitApp(App):
                         images.append(f)
         return images
 
-    # ---------- CSV SAF loading + Subject List (copied from v2.0.9) ----------
+    # ---------- Menu + popups ----------
+    def _style_menu_button(self, b):
+        b.background_normal = ""
+        b.background_down = ""
+        b.background_color = (0.10, 0.10, 0.10, 0.80)
+        b.color = (1, 1, 1, 1)
+        return b
+
+    def _build_dropdown(self):
+        dd = DropDown(auto_dismiss=True)
+        dd.auto_width = False
+        dd.width = dp(380)
+        dd.max_height = dp(650)
+
+        with dd.canvas.before:
+            Color(0.0, 0.0, 0.0, 0.80)
+            panel = Rectangle(pos=dd.pos, size=dd.size)
+        dd.bind(pos=lambda *_: setattr(panel, "pos", dd.pos), size=lambda *_: setattr(panel, "size", dd.size))
+
+        def add_header(text):
+            dd.add_widget(Label(text=text, size_hint_y=None, height=dp(26),
+                                font_size=sp(15), color=(1, 1, 1, 1)))
+
+        def add_button(text, on_press):
+            b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
+            self._style_menu_button(b)
+            b.bind(on_release=lambda *_: on_press())
+            dd.add_widget(b)
+
+        def add_toggle(text, initial, on_change):
+            row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(6), 0, dp(6), 0])
+            row.add_widget(Label(text=text, font_size=sp(13), color=(1, 1, 1, 1)))
+            cb = CheckBox(active=initial, size_hint=(None, 1), width=dp(44))
+            cb.bind(active=lambda inst, val: on_change(val))
+            row.add_widget(cb)
+            dd.add_widget(row)
+
+        def add_capture_type_buttons():
+            row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4), padding=[dp(4), 0, dp(4), 0])
+            row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70),
+                                 font_size=sp(13), color=(1, 1, 1, 1)))
+
+            def make_btn(label, ctype):
+                b = Button(text=label, size_hint=(1, 1), font_size=sp(12))
+                self._style_menu_button(b)
+
+                def set_type():
+                    self.capture_type = ctype
+                    self.log(f"Capture type set to {ctype}")
+
+                b.bind(on_release=lambda *_: set_type())
+                return b
+
+            row.add_widget(make_btn("JPG", CaptureType.JPG))
+            row.add_widget(make_btn("RAW", CaptureType.RAW))
+            dd.add_widget(row)
+
+        add_header("Overlays")
+        add_toggle("Border (blue)", True, lambda v: setattr(self.preview, "show_border", v))
+        add_toggle("Grid (orange)", True, lambda v: setattr(self.preview, "show_grid", v))
+        add_toggle("Crop 5:7 (red)", True, lambda v: setattr(self.preview, "show_57", v))
+        add_toggle("Crop 8:10 (yellow)", True, lambda v: setattr(self.preview, "show_810", v))
+        add_toggle("Oval (purple)", True, lambda v: setattr(self.preview, "show_oval", v))
+
+        add_header("Network")
+        add_button("Set camera IP…", lambda: self._open_ip_popup())
+
+        add_header("Display")
+        add_button("Set display FPS…", lambda: self._open_fps_popup())
+        add_button("Show metrics…", lambda: self._open_metrics_popup())
+        add_toggle("Log overlay", False, lambda v: self._set_log_overlay_visible(v))
+
+        add_header("EXIF / Author")
+        add_button("Refresh Current EXIF now", lambda: self.refresh_exif())
+
+        add_header("CSV")
+        add_button("Load CSV…", lambda: self._open_csv_menu_popup())
+        add_button("Subject List", lambda: self.open_subject_list())
+
+        add_header("Capture")
+        add_capture_type_buttons()
+
+        add_header("Debug")
+        add_button("Clear log", lambda: self._clear_log())
+
+        return dd
+
+    def _open_ip_popup(self):
+        if self._ip_popup is not None:
+            try:
+                self._ip_popup.dismiss()
+            except Exception:
+                pass
+            self._ip_popup = None
+
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Camera IP:", size_hint=(1, None), height=dp(28), font_size=sp(12)))
+        ip_in = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16),
+                          size_hint=(1, None), height=dp(44))
+        root.add_widget(ip_in)
+
+        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
+        ok = Button(text="OK")
+        cancel = Button(text="Cancel")
+        btns.add_widget(ok)
+        btns.add_widget(cancel)
+        root.add_widget(btns)
+
+        popup = Popup(title="Set Camera IP", content=root, size_hint=(0.9, 0.4))
+
+        def do_ok(*_):
+            new_ip = ip_in.text.strip()
+            if new_ip:
+                self.camera_ip = new_ip
+                self.log(f"Camera IP set to {self.camera_ip}")
+                if self.connected:
+                    self._set_exif_text("(IP changed; reconnect)")
+            popup.dismiss()
+
+        ok.bind(on_release=do_ok)
+        cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.bind(on_dismiss=lambda *_: setattr(self, "_ip_popup", None))
+        popup.open()
+        self._ip_popup = popup
+
+    def _open_fps_popup(self):
+        if self._fps_popup is not None:
+            try:
+                self._fps_popup.dismiss()
+            except Exception:
+                pass
+            self._fps_popup = None
+
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Display FPS (metrics tick)", size_hint=(1, None), height=dp(28),
+                              font_size=sp(12)))
+
+        slider = Slider(min=5, max=30, value=12, step=1)
+        val_lbl = Label(text="12", size_hint=(1, None), height=dp(22), font_size=sp(12))
+        root.add_widget(slider)
+        root.add_widget(val_lbl)
+        slider.bind(value=lambda inst, v: setattr(val_lbl, "text", str(int(v))))
+
+        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
+        ok = Button(text="OK")
+        cancel = Button(text="Cancel")
+        btns.add_widget(ok)
+        btns.add_widget(cancel)
+        root.add_widget(btns)
+
+        popup = Popup(title="Set Display FPS", content=root, size_hint=(0.9, 0.5))
+
+        def do_ok(*_):
+            fps = int(slider.value)
+            self._reschedule_display_loop(fps)
+            self.log(f"Display FPS set to {fps}")
+            popup.dismiss()
+
+        ok.bind(on_release=do_ok)
+        cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.bind(on_dismiss=lambda *_: setattr(self, "_fps_popup", None))
+        popup.open()
+        self._fps_popup = popup
+
+    # ---------- CSV menu + SAF + Subject List ----------
+    def _open_csv_menu_popup(self):
+        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        b1 = Button(text="Load CSV file", size_hint=(1, None), height=dp(48))
+        b2 = Button(text="Select headers", size_hint=(1, None), height=dp(48))
+        b3 = Button(text="Close", size_hint=(1, None), height=dp(44))
+        root.add_widget(b1)
+        root.add_widget(b2)
+        root.add_widget(b3)
+
+        popup = Popup(title="Load CSV", content=root, size_hint=(0.9, 0.45))
+        b1.bind(on_release=lambda *_: (popup.dismiss(), self._open_csv_filechooser()))
+        b2.bind(on_release=lambda *_: (popup.dismiss(), self._open_headers_popup()))
+        b3.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
             return
@@ -1633,195 +1853,10 @@ class VolumeToolkitApp(App):
         self._subject_popup = popup
         render_results()
 
-    # ---------- Menu + popups ----------
-    def _style_menu_button(self, b):
-        b.background_normal = ""
-        b.background_down = ""
-        b.background_color = (0.10, 0.10, 0.10, 0.80)
-        b.color = (1, 1, 1, 1)
-        return b
-
-    def _build_dropdown(self, reset_callback):
-        dd = DropDown(auto_dismiss=True)
-        dd.auto_width = False
-        dd.width = dp(380)
-        dd.max_height = dp(650)
-
-        with dd.canvas.before:
-            Color(0.0, 0.0, 0.0, 0.80)
-            panel = Rectangle(pos=dd.pos, size=dd.size)
-        dd.bind(pos=lambda *_: setattr(panel, "pos", dd.pos), size=lambda *_: setattr(panel, "size", dd.size))
-
-        def add_header(text):
-            dd.add_widget(Label(text=text, size_hint_y=None, height=dp(26),
-                                font_size=sp(15), color=(1, 1, 1, 1)))
-
-        def add_button(text, on_press):
-            b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
-            self._style_menu_button(b)
-            b.bind(on_release=lambda *_: on_press())
-            dd.add_widget(b)
-
-        def add_toggle(text, initial, on_change):
-            row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(6), 0, dp(6), 0])
-            row.add_widget(Label(text=text, font_size=sp(13), color=(1, 1, 1, 1)))
-            cb = CheckBox(active=initial, size_hint=(None, 1), width=dp(44))
-            cb.bind(active=lambda inst, val: on_change(val))
-            row.add_widget(cb)
-            dd.add_widget(row)
-
-        def add_capture_type_buttons():
-            row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4), padding=[dp(4), 0, dp(4), 0])
-            row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70),
-                                 font_size=sp(13), color=(1, 1, 1, 1)))
-
-            def make_btn(label, ctype):
-                b = Button(text=label, size_hint=(1, 1), font_size=sp(12))
-                self._style_menu_button(b)
-
-                def set_type():
-                    self.capture_type = ctype
-                    self.log(f"Capture type set to {ctype}")
-
-                b.bind(on_release=lambda *_: set_type())
-                return b
-
-            row.add_widget(make_btn("JPG", CaptureType.JPG))
-            row.add_widget(make_btn("RAW", CaptureType.RAW))
-            dd.add_widget(row)
-
-        add_header("Framing")
-        add_button("Reset framing", reset_callback)
-
-        add_header("Overlays")
-        add_toggle("Border (blue)", True, lambda v: setattr(self.preview, "show_border", v))
-        add_toggle("Grid (orange)", True, lambda v: setattr(self.preview, "show_grid", v))
-        add_toggle("Crop 5:7 (red)", True, lambda v: setattr(self.preview, "show_57", v))
-        add_toggle("Crop 8:10 (yellow)", True, lambda v: setattr(self.preview, "show_810", v))
-        add_toggle("Oval (purple)", True, lambda v: setattr(self.preview, "show_oval", v))
-
-        add_header("Network")
-        add_button("Set camera IP…", lambda: self._open_ip_popup())
-
-        add_header("Display")
-        add_button("Set display FPS…", lambda: self._open_fps_popup())
-        add_button("Show metrics…", lambda: self._open_metrics_popup())
-        add_toggle("Log overlay", False, lambda v: self._set_log_overlay_visible(v))
-
-        add_header("EXIF / Author")
-        add_button("Refresh Current EXIF now", lambda: self.refresh_exif())
-
-        add_header("CSV")
-        add_button("Load CSV…", lambda: self._open_csv_menu_popup())
-        add_button("Select headers", lambda: self._open_headers_popup())
-        add_button("Subject List", lambda: self.open_subject_list())
-
-        add_header("Capture")
-        add_capture_type_buttons()
-
-        add_header("Debug")
-        add_button("Clear log", lambda: self._clear_log())
-
-        return dd
-
-    def _open_ip_popup(self):
-        if self._ip_popup is not None:
-            try:
-                self._ip_popup.dismiss()
-            except Exception:
-                pass
-            self._ip_popup = None
-
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Camera IP:", size_hint=(1, None), height=dp(28), font_size=sp(12)))
-        ip_in = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16),
-                          size_hint=(1, None), height=dp(44))
-        root.add_widget(ip_in)
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
-        ok = Button(text="OK")
-        cancel = Button(text="Cancel")
-        btns.add_widget(ok)
-        btns.add_widget(cancel)
-        root.add_widget(btns)
-
-        popup = Popup(title="Set Camera IP", content=root, size_hint=(0.9, 0.4))
-
-        def do_ok(*_):
-            new_ip = ip_in.text.strip()
-            if new_ip:
-                self.camera_ip = new_ip
-                self.log(f"Camera IP set to {self.camera_ip}")
-                if self.connected:
-                    self._set_exif_text("(IP changed; reconnect)")
-            popup.dismiss()
-
-        ok.bind(on_release=do_ok)
-        cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.bind(on_dismiss=lambda *_: setattr(self, "_ip_popup", None))
-        popup.open()
-        self._ip_popup = popup
-
-    def _open_fps_popup(self):
-        if self._fps_popup is not None:
-            try:
-                self._fps_popup.dismiss()
-            except Exception:
-                pass
-            self._fps_popup = None
-
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Display FPS (metrics tick)", size_hint=(1, None), height=dp(28),
-                              font_size=sp(12)))
-
-        slider = Slider(min=5, max=30, value=12, step=1)
-        val_lbl = Label(text="12", size_hint=(1, None), height=dp(22), font_size=sp(12))
-        root.add_widget(slider)
-        root.add_widget(val_lbl)
-        slider.bind(value=lambda inst, v: setattr(val_lbl, "text", str(int(v))))
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
-        ok = Button(text="OK")
-        cancel = Button(text="Cancel")
-        btns.add_widget(ok)
-        btns.add_widget(cancel)
-        root.add_widget(btns)
-
-        popup = Popup(title="Set Display FPS", content=root, size_hint=(0.9, 0.5))
-
-        def do_ok(*_):
-            fps = int(slider.value)
-            self._reschedule_display_loop(fps)
-            self.log(f"Display FPS set to {fps}")
-            popup.dismiss()
-
-        ok.bind(on_release=do_ok)
-        cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.bind(on_dismiss=lambda *_: setattr(self, "_fps_popup", None))
-        popup.open()
-        self._fps_popup = popup
-
-    # ---------- CSV menu ----------
-    def _open_csv_menu_popup(self):
-        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
-        b1 = Button(text="Load CSV file", size_hint=(1, None), height=dp(48))
-        b2 = Button(text="Select headers", size_hint=(1, None), height=dp(48))
-        b3 = Button(text="Close", size_hint=(1, None), height=dp(44))
-        root.add_widget(b1)
-        root.add_widget(b2)
-        root.add_widget(b3)
-
-        popup = Popup(title="Load CSV", content=root, size_hint=(0.9, 0.45))
-        b1.bind(on_release=lambda *_: (popup.dismiss(), self._open_csv_filechooser()))
-        b2.bind(on_release=lambda *_: (popup.dismiss(), self._open_headers_popup()))
-        b3.bind(on_release=lambda *_: popup.dismiss())
-        popup.open()
-
     # ---------- build ----------
     def build(self):
         outer = FloatLayout()
-
-        main = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8), size_hint=(1, 1))
+        main = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6), size_hint=(1, 1))
         outer.add_widget(main)
 
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
@@ -1833,7 +1868,6 @@ class VolumeToolkitApp(App):
         main.add_widget(header)
 
         top_font = sp(12)
-
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=top_font, size_hint=(1, 1))
         self.start_btn = Button(text="Live View Off", disabled=True, font_size=top_font, size_hint=(1, 1))
@@ -1845,46 +1879,55 @@ class VolumeToolkitApp(App):
         row2.add_widget(self.qr_btn)
         main.add_widget(row2)
 
-        row_exif = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(40))
-        row_exif.add_widget(Label(text="Current EXIF", size_hint=(None, 1), width=dp(130), font_size=sp(14)))
-        self.exif_label = Label(text="(not connected)", size_hint=(1, 1), font_size=sp(14),
-                                halign="left", valign="middle")
-        self.exif_label.bind(size=lambda *_: setattr(self.exif_label, "text_size", (self.exif_label.width, None)))
-        row_exif.add_widget(self.exif_label)
+        # Compact info rows (single-line)
+        def info_row(title, initial, title_w=dp(110), h=dp(28), f=sp(13)):
+            row = BoxLayout(spacing=dp(6), size_hint=(1, None), height=h)
+            t = Label(text=title, size_hint=(None, 1), width=title_w, font_size=f, halign="left", valign="middle")
+            t.bind(size=lambda *_: setattr(t, "text_size", (t.width, None)))
+            v = Label(text=initial, size_hint=(1, 1), font_size=f, halign="left", valign="middle")
+            v.bind(size=lambda *_: setattr(v, "text_size", (v.width, None)))
+            row.add_widget(t)
+            row.add_widget(v)
+            return row, v
+
+        row_exif, self.exif_label = info_row("Current EXIF", "(not connected)", h=dp(28), f=sp(13))
+        row_qr, self.payload_label = info_row("QR Payload", "(none)", h=dp(28), f=sp(13))
+        row_csv, self.csv_payload_label = info_row("CSV Payload", "(none)", h=dp(24), f=sp(12))
+
         main.add_widget(row_exif)
-
-        row_payload = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(40))
-        row_payload.add_widget(Label(text="QR Payload", size_hint=(None, 1), width=dp(130), font_size=sp(14)))
-        self.payload_label = Label(text="(none)", size_hint=(1, 1), font_size=sp(14),
-                                   halign="left", valign="middle")
-        self.payload_label.bind(size=lambda *_: setattr(self.payload_label, "text_size", (self.payload_label.width, None)))
-        row_payload.add_widget(self.payload_label)
-        main.add_widget(row_payload)
-
-        row_csv_payload = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(28))
-        row_csv_payload.add_widget(Label(text="CSV Payload", size_hint=(None, 1), width=dp(130), font_size=sp(13)))
-        self.csv_payload_label = Label(text="(none)", size_hint=(1, 1), font_size=sp(13),
-                                       halign="left", valign="middle")
-        self.csv_payload_label.bind(size=lambda *_: setattr(self.csv_payload_label, "text_size", (self.csv_payload_label.width, None)))
-        row_csv_payload.add_widget(self.csv_payload_label)
-        main.add_widget(row_csv_payload)
+        main.add_widget(row_qr)
+        main.add_widget(row_csv)
 
         self.metrics = Label(text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0")
 
-        main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
+        # Middle band (preview + scrollable thumbs)
+        middle = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 1))
+        main.add_widget(middle)
 
         preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview = PreviewOverlay(size_hint=(None, None))
         preview_holder.add_widget(self.preview)
-        main_area.add_widget(preview_holder)
+        middle.add_widget(preview_holder)
 
         sidebar = BoxLayout(orientation="vertical", size_hint=(0.20, 1), spacing=dp(4))
-        sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
+        sidebar.add_widget(Label(text="Most Recent", size_hint=(1, None), height=dp(20), font_size=sp(12)))
+
+        thumb_sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
+        thumbs_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4), padding=[0, dp(2), 0, dp(2)])
+        thumbs_box.bind(minimum_height=thumbs_box.setter("height"))
+        thumb_sv.add_widget(thumbs_box)
+        sidebar.add_widget(thumb_sv)
+        middle.add_widget(sidebar)
+
+        # Create many thumb widgets, but size the strip so ~4 are visible at a time.
+        # Height of each thumb is computed relative to the sidebar height in a scheduled callback.
+        VISIBLE_THUMBS = 4
+        TOTAL_THUMB_WIDGETS = 40  # plenty; history is actually unbounded via file-backed list
 
         self._thumb_images = []
         self._thumb_border_lines = []
-        for idx in range(5):
-            img = Image(size_hint=(1, 0.18), allow_stretch=True, keep_ratio=True)
+        for idx in range(TOTAL_THUMB_WIDGETS):
+            img = Image(size_hint=(1, None), height=dp(80), allow_stretch=True, keep_ratio=True)
             img.thumb_index = idx
             img.bind(on_touch_down=self._on_thumb_touch)
 
@@ -1893,19 +1936,9 @@ class VolumeToolkitApp(App):
                 ln = Line(rectangle=(0, 0, 0, 0), width=3)
             img.bind(pos=lambda *_: self._update_thumb_borders(), size=lambda *_: self._update_thumb_borders())
 
-            sidebar.add_widget(img)
+            thumbs_box.add_widget(img)
             self._thumb_images.append(img)
             self._thumb_border_lines.append(ln)
-
-        main_area.add_widget(sidebar)
-        main.add_widget(main_area)
-
-        bottom = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None), height=dp(52))
-        self.push_btn = Button(text="Push Payload", font_size=sp(16), disabled=True)
-        self.subject_btn = Button(text="Subject List", font_size=sp(16), disabled=True)
-        bottom.add_widget(self.push_btn)
-        bottom.add_widget(self.subject_btn)
-        main.add_widget(bottom)
 
         def fit_preview_to_holder(*_):
             w = max(dp(220), preview_holder.width * 0.98)
@@ -1913,6 +1946,23 @@ class VolumeToolkitApp(App):
             self.preview.size = (w, h)
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
+
+        def size_thumbs_to_show_four(*_):
+            # Make the thumb strip show ~4 thumbs tall.
+            available_h = max(dp(200), sidebar.height - dp(20) - dp(6))
+            thumb_h = max(dp(56), available_h / float(VISIBLE_THUMBS))
+            for img in self._thumb_images:
+                img.height = thumb_h
+
+        sidebar.bind(size=size_thumbs_to_show_four)
+
+        # Bottom fixed action row
+        bottom = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None), height=dp(52))
+        self.push_btn = Button(text="Push Payload", font_size=sp(16), disabled=True)
+        self.subject_btn = Button(text="Subject List", font_size=sp(16), disabled=True)
+        bottom.add_widget(self.push_btn)
+        bottom.add_widget(self.subject_btn)
+        main.add_widget(bottom)
 
         # Bottom log overlay
         self.log_overlay = BoxLayout(
@@ -1954,7 +2004,7 @@ class VolumeToolkitApp(App):
         btn_clear.bind(on_release=lambda *_: self._clear_log())
 
         # Menu + event bindings
-        self.dropdown = self._build_dropdown(fit_preview_to_holder)
+        self.dropdown = self._build_dropdown()
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
         self.exit_btn.bind(on_press=lambda *_: self.exit_app())
@@ -1975,6 +2025,21 @@ class VolumeToolkitApp(App):
 
         self.log("Android CCAPI GUI ready")
         return outer
+
+    # ---------- stop ----------
+    def on_stop(self):
+        try:
+            self.stop_liveview()
+        except Exception:
+            pass
+        try:
+            self.stop_polling_new_images()
+        except Exception:
+            pass
+        try:
+            self._decoder_stop.set()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
