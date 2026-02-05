@@ -8,10 +8,12 @@
 # - QR detection uses the latest decoded BGR frame (avoids re-decoding).
 # - PreviewOverlay grid list is initialized to avoid canvas errors.
 #
-# Keep in mind:
-# - This is Android-only code (uses android.* when running on device).
-# - The build workflow in .github/workflows/build.yml already builds an APK.
-# - The app still disables TLS verification for camera requests (self-signed certs).
+# Notes for this revision (v2.0.2):
+# - Default camera IP changed to 172.25.162.76.
+# - QR overlay removed (no polygon drawn on preview).
+# - "QR overlay" and "QR detect (OpenCV)" menu options removed.
+# - Added a "QR Detect" button on the Connect/Start/Stop row to toggle QR decoding.
+# - QR decoding remains functional; it only updates status / author (no overlay).
 #
 import os
 import json
@@ -96,7 +98,6 @@ class PreviewOverlay(FloatLayout):
     show_57 = BooleanProperty(True)
     show_810 = BooleanProperty(True)
     show_oval = BooleanProperty(True)
-    show_qr = BooleanProperty(True)
 
     grid_n = NumericProperty(3)
 
@@ -118,7 +119,6 @@ class PreviewOverlay(FloatLayout):
         self.add_widget(self.img)
 
         lw = 2
-        lw_qr = 6
 
         with self.img.canvas.after:
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
@@ -136,30 +136,22 @@ class PreviewOverlay(FloatLayout):
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
             self._ln_oval = Line(width=lw)
 
-            self._c_qr = Color(0.2, 1.0, 0.2, 0.95)
-            self._ln_qr = Line(width=lw_qr, close=True)
-
         # Ensure the grid lines list is initialized before any redraw uses it.
         self._ln_grid_list = []
 
         self.bind(pos=self._redraw, size=self._redraw)
         self.bind(
             show_border=self._redraw, show_grid=self._redraw, show_57=self._redraw,
-            show_810=self._redraw, show_oval=self._redraw, show_qr=self._redraw,
+            show_810=self._redraw, show_oval=self._redraw,
             grid_n=self._redraw,
             oval_cx=self._redraw, oval_cy=self._redraw, oval_w=self._redraw, oval_h=self._redraw
         )
         self.img.bind(pos=self._redraw, size=self._redraw, texture=self._redraw, texture_size=self._redraw)
 
-        self._qr_points_px = None
         self._redraw()
 
     def set_texture(self, texture):
         self.img.texture = texture
-        self._redraw()
-
-    def set_qr(self, points_px):
-        self._qr_points_px = points_px
         self._redraw()
 
     def _drawn_rect(self):
@@ -218,7 +210,7 @@ class PreviewOverlay(FloatLayout):
         else:
             self._ln_810.rectangle = (0, 0, 0, 0)
 
-        # v1.0.6: Grid lines drawn separately to avoid diagonal connections
+        # Grid lines drawn separately to avoid diagonal connections
         n = int(self.grid_n)
         # Clear old grid lines
         for line in list(self._ln_grid_list):
@@ -259,22 +251,6 @@ class PreviewOverlay(FloatLayout):
             self._clear_line_modes(self._ln_oval)
             self._ln_oval.ellipse = (0, 0, 0, 0)
 
-        if self.show_qr and self._qr_points_px and self.img.texture and self.img.texture.size[0] > 0:
-            iw, ih = self.img.texture.size
-            dx, dy, dw, dh = fx, fy, fw, fh
-
-            line_pts = []
-            for (x, y) in self._qr_points_px:
-                u = float(x) / float(iw)
-                v = float(y) / float(ih)
-                sx = dx + u * dw
-                sy = dy + v * dh
-                line_pts += [sx, sy]
-
-            self._ln_qr.points = line_pts
-        else:
-            self._ln_qr.points = []
-
 
 class CaptureType:
     JPG = "JPG"
@@ -289,7 +265,8 @@ class VolumeToolkitApp(App):
         super().__init__(**kwargs)
 
         self.connected = False
-        self.camera_ip = "192.168.34.29"  # adjust as needed
+        # Default IP updated per request
+        self.camera_ip = "172.25.162.76"
 
         self.live_running = False
         self.session_started = False
@@ -316,14 +293,13 @@ class VolumeToolkitApp(App):
         self.dropdown = None
         self.show_log = True
 
-        # QR
-        self.qr_enabled = True
+        # QR (decode remains, overlay removed)
+        self.qr_enabled = False  # default off; user toggles with "QR Detect" button
         self.qr_interval_s = 0.15
         self.qr_new_gate_s = 0.70
         self._qr_detector = cv2.QRCodeDetector()
         self._qr_thread = None
         self._latest_qr_text = None
-        self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
 
@@ -378,7 +354,7 @@ class VolumeToolkitApp(App):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
-        header.add_widget(Label(text="Volume Toolkit v1.0.6", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v2.0.2", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         root.add_widget(header)
@@ -388,13 +364,16 @@ class VolumeToolkitApp(App):
         row1.add_widget(self.ip_input)
         root.add_widget(row1)
 
+        # Connect/Start/Stop/QR row: force size_hint_x=1 and explicit widths so all buttons remain visible.
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
-        self.connect_btn = Button(text="Connect", font_size=sp(16))
-        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16))
-        self.stop_btn = Button(text="Stop", disabled=True, font_size=sp(16))
+        self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(1, 1))
+        self.start_btn = Button(text="Start", disabled=True, font_size=sp(16), size_hint=(1, 1))
+        self.stop_btn = Button(text="Stop", disabled=True, font_size=sp(16), size_hint=(1, 1))
+        self.qr_btn = Button(text="QR Detect: OFF", disabled=True, font_size=sp(16), size_hint=(1, 1))
         row2.add_widget(self.connect_btn)
         row2.add_widget(self.start_btn)
         row2.add_widget(self.stop_btn)
+        row2.add_widget(self.qr_btn)
         root.add_widget(row2)
 
         row3 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(40))
@@ -411,7 +390,7 @@ class VolumeToolkitApp(App):
         root.add_widget(self.status)
         root.add_widget(self.metrics)
 
-        self.qr_status = Label(text="QR: none", size_hint=(1, None), height=dp(22), font_size=sp(13))
+        self.qr_status = Label(text="QR: (button is OFF)", size_hint=(1, None), height=dp(22), font_size=sp(13))
         root.add_widget(self.qr_status)
 
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
@@ -466,6 +445,7 @@ class VolumeToolkitApp(App):
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self.start_liveview())
         self.stop_btn.bind(on_press=lambda *_: self.stop_liveview())
+        self.qr_btn.bind(on_press=lambda *_: self.toggle_qr_detect())
         self.fps_slider.bind(value=self._on_fps_change)
 
         self._reschedule_display_loop(int(self.fps_slider.value))
@@ -594,10 +574,8 @@ class VolumeToolkitApp(App):
         add_toggle("Crop 5:7 (red)", True, lambda v: setattr(self.preview, "show_57", v))
         add_toggle("Crop 8:10 (yellow)", True, lambda v: setattr(self.preview, "show_810", v))
         add_toggle("Oval (purple)", True, lambda v: setattr(self.preview, "show_oval", v))
-        add_toggle("QR overlay", True, lambda v: setattr(self.preview, "show_qr", v))
 
-        add_header("QR & Author")
-        add_toggle("QR detect (OpenCV)", True, lambda v: self._set_qr_enabled(v))
+        add_header("Author")
         add_button("Load CSV…", lambda: self._open_csv_filechooser())
         add_button("Select headers…", lambda: self._open_headers_popup())
         add_button("Push payload (Author)", lambda: self._maybe_commit_author(self.manual_payload, source="manual"))
@@ -706,12 +684,20 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_finish, 0)
 
-    # ---------- liveview + QR + decoder ----------
+    # ---------- QR toggle button ----------
 
-    def _set_qr_enabled(self, enabled: bool):
-        self.qr_enabled = bool(enabled)
-        if not self.qr_enabled:
-            self._set_qr_ui(None, None, note="QR: off")
+    def toggle_qr_detect(self):
+        # Same effect as the old "QR detect (OpenCV)" toggle, but moved to a button.
+        self.qr_enabled = not bool(self.qr_enabled)
+        self.qr_btn.text = "QR Detect: ON" if self.qr_enabled else "QR Detect: OFF"
+        if self.qr_enabled:
+            self.qr_status.text = "QR: enabled"
+            self.log("QR detect enabled (button)")
+        else:
+            self.qr_status.text = "QR: disabled"
+            self.log("QR detect disabled (button)")
+
+    # ---------- liveview + decoder + QR ----------
 
     def _on_fps_change(self, *_):
         fps = int(self.fps_slider.value)
@@ -722,10 +708,11 @@ class VolumeToolkitApp(App):
         if self._display_event is not None:
             self._display_event.cancel()
         fps = max(1, int(fps))
-        self._display_event = Clock.schedule_interval(self._ui_noop_display_tick, 1.0 / fps)
+        # Keep a lightweight periodic callback for metrics.
+        self._display_event = Clock.schedule_interval(self._display_tick, 1.0 / fps)
 
-    def _ui_noop_display_tick(self, dt):
-        # Display is driven by decoder scheduling; this tick only updates metrics periodically.
+    def _display_tick(self, dt):
+        # Rendering is driven by decoder scheduling; this tick updates display metrics.
         self._display_count += 1
         self._update_metrics(self._last_decoded_ts)
 
@@ -734,12 +721,15 @@ class VolumeToolkitApp(App):
         self.connect_btn.disabled = False
         self.start_btn.disabled = not self.connected
         self.stop_btn.disabled = True
+        self.qr_btn.disabled = not self.connected  # allow enabling QR only when connected
 
     def _set_controls_running(self):
         self.ip_input.disabled = True
         self.connect_btn.disabled = True
         self.start_btn.disabled = True
         self.stop_btn.disabled = False
+        # Allow toggling QR during live view
+        self.qr_btn.disabled = False
 
     def start_liveview(self):
         if not self.connected or self.live_running:
@@ -762,15 +752,17 @@ class VolumeToolkitApp(App):
         with self._lock:
             self._latest_jpeg = None
             self._latest_jpeg_ts = 0.0
+            self._latest_decoded_bgr = None
+            self._latest_decoded_bgr_ts = 0.0
+
         self._last_decoded_ts = 0.0
         self._frame_texture = None
         self._frame_size = None
 
         self._latest_qr_text = None
-        self._latest_qr_points = None
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
-        self._set_qr_ui(None, None, note="QR: none")
+        self.qr_status.text = "QR: enabled" if self.qr_enabled else "QR: disabled"
 
         self._fetch_count = 0
         self._decode_count = 0
@@ -781,6 +773,7 @@ class VolumeToolkitApp(App):
         self._fetch_thread = threading.Thread(target=self._liveview_fetch_loop, daemon=True)
         self._fetch_thread.start()
 
+        # QR thread runs regardless; it checks qr_enabled and live_running.
         self._qr_thread = threading.Thread(target=self._qr_loop, daemon=True)
         self._qr_thread.start()
 
@@ -857,6 +850,7 @@ class VolumeToolkitApp(App):
 
                 # keep latest decoded BGR for QR thread
                 with self._lock:
+                    # copy so QR thread doesn't see partially mutated buffers
                     self._latest_decoded_bgr = bgr.copy()
                     self._latest_decoded_bgr_ts = ts
 
@@ -907,20 +901,11 @@ class VolumeToolkitApp(App):
                 continue
 
             try:
-                decoded, points, _ = self._qr_detector.detectAndDecode(bgr)
+                decoded, _points, _ = self._qr_detector.detectAndDecode(bgr)
 
                 qr_text = decoded.strip() if isinstance(decoded, str) else ""
-                qr_points = None
-                if points is not None:
-                    try:
-                        pts = points.astype(int).reshape(-1, 2)
-                        if len(pts) >= 4:
-                            qr_points = [(int(pts[i][0]), int(pts[i][1])) for i in range(4)]
-                    except Exception:
-                        qr_points = None
-
-                if qr_text or qr_points:
-                    self._publish_qr(qr_text if qr_text else None, qr_points)
+                if qr_text:
+                    self._publish_qr(qr_text)
 
             except Exception:
                 pass
@@ -928,7 +913,7 @@ class VolumeToolkitApp(App):
             last_processed_ts = ts
             time.sleep(max(0.05, float(self.qr_interval_s)))
 
-    def _publish_qr(self, text, points):
+    def _publish_qr(self, text):
         now = time.time()
 
         if text:
@@ -938,31 +923,13 @@ class VolumeToolkitApp(App):
                 self.log(f"QR: {text}")
             self._maybe_commit_author(text, source="qr")
 
-        if not self.qr_enabled:
-            note = "QR: off"
-        elif text:
-            note = f"QR: {text[:80]}"
-        elif points:
-            note = self.qr_status.text if self.qr_status.text and self.qr_status.text != "QR: none" else "QR: detected (undecoded)"
-        else:
-            note = self.qr_status.text if self.qr_status.text else "QR: none"
+        note = f"QR: {text[:80]}" if text else "QR: none"
+        Clock.schedule_once(lambda *_: self._set_qr_ui(text, note=note), 0)
 
-        Clock.schedule_once(lambda *_: self._set_qr_ui(text, points, note=note), 0)
-
-    def _set_qr_ui(self, text, points, note="QR: none"):
+    def _set_qr_ui(self, text, note="QR: none"):
         if text:
             self._latest_qr_text = text
-        if points:
-            self._latest_qr_points = points
-            self.preview.set_qr(points)
         self.qr_status.text = note
-
-    # ---------- UI decode/display entry point (no heavy work here) ----------
-
-    def _ui_noop_display_tick(self, dt):
-        # stub: actual rendering is done when decoder schedules texture updates,
-        # this tick just updates metrics periodically (handled in _update_metrics).
-        pass
 
     def _update_metrics(self, frame_ts):
         now = time.time()
@@ -1158,7 +1125,7 @@ class VolumeToolkitApp(App):
         popup.open()
         self._headers_popup = popup
 
-    # ---------- contents + download (ver120, thumbnails only) ----------
+    # ---------- contents + download (thumbnails only) ----------
 
     def list_all_images(self):
         images = []
@@ -1321,8 +1288,7 @@ class VolumeToolkitApp(App):
                 self.log(f"Poll worker error: {e}")
 
             # Wait, but allow early exit
-            stop_event = self._poll_thread_stop
-            stop_event.wait(self.poll_interval_s)
+            self._poll_thread_stop.wait(self.poll_interval_s)
 
     def dump_ccapi(self):
         status, data = self._json_call("GET", '/ccapi', None, timeout=10.0)
