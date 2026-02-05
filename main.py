@@ -1,29 +1,26 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# v2.0.6: CSV + Subject List + payload chooser + metrics popup + autofetch (FULL FILE)
+# v2.0.9
 #
-# Included:
-# - Preview locked to 85% width; thumbnail strip 15%.
-# - Main row: Connect / Live View toggle / AutoFetch toggle / QR Detect toggle.
-# - Connect button blue; shows "Connected" in yellow when connected.
-# - Live View button: Off red/white, On green/yellow.
-# - AutoFetch button: Off red/white, On green/yellow.
-# - AutoFetch baseline: when toggled ON, sets baseline to current latest image and only fetches new shots.
-# - "Current EXIF" reflects camera Author field; "QR Payload" reflects latest QR decode.
-#   EXIF text turns green when it matches QR payload exactly, else red.
-# - CSV loading (Android SAF) + header selection popup.
-# - Menu "Load CSV…" popup: "Load CSV file" and "Select headers".
-# - Subject List button: browse CSV with search, per-header filters, and sort; choose row -> CSV payload.
-# - CSV payload shown on main screen where metrics used to be.
-# - Metrics moved to Menu ("Show metrics…").
-# - Push Payload: choose QR vs CSV when both exist, else pushes the one available.
-# - Thumbnails are rotated 90° CCW to match preview.
-# - Tapping a thumbnail freezes preview with that still, then downloads full-res JPG and replaces.
-# - Tap preview to unfreeze and return to live.
+# Changes from v2.0.6:
+# - Top-row button font reduced so labels fit.
+# - Header now has an Exit button (left) and Menu button (right).
+# - Preview/thumb width split is now 80% / 20%.
+# - Still-image (thumb + full-res) display now center-crops to a fixed portrait 2:3 aspect
+#   AFTER applying the same rotation as live preview, so the still fills the preview exactly
+#   and aligns with framing guides (no letterboxing).
+# - Added explicit debug logging around full-res download start/success/failure.
+# - Match-color logic updated across Current EXIF / QR Payload / CSV Payload:
+#     Let E=EXIF, Q=QR payload, C=CSV payload (trimmed).
+#     - If E==C (non-empty): E green, C green.
+#     - If E==Q (non-empty): E green, Q green.
+#     - If E==C==Q: all green.
+#     - If E matches one but not the other: non-matching payload red.
+#     - If E matches neither: EXIF red; payloads white.
 #
-# Notes:
-# - Full-res URL rule: https://<camera-ip>/ccapi/ver100/contents/<sdcard-path> derived
-#   from ccapi_path returned by /ccapi/ver120/contents.
+# NOTE: For now we assume the desired on-screen portrait aspect is 2:3 (w:h = 2/3).
+# This is applied to both thumbs and full-res stills. Live view may still letterbox
+# if the live stream is not 2:3; we are not adjusting live stream here.
 #
 import os
 import threading
@@ -32,6 +29,7 @@ from datetime import datetime
 from io import BytesIO
 import csv
 import queue
+from urllib.parse import quote
 
 import requests
 import urllib3
@@ -89,6 +87,7 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
+    # live/still rotation
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
@@ -236,6 +235,9 @@ class CaptureType:
 class VolumeToolkitApp(App):
     capture_type = StringProperty(CaptureType.JPG)
 
+    # Fixed portrait aspect: 2:3 (w/h = 2/3)
+    STILL_TARGET_ASPECT = 2.0 / 3.0
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -272,7 +274,6 @@ class VolumeToolkitApp(App):
         self._qr_seen = set()
         self._qr_last_add_time = 0.0
 
-        # last decoded for QR
         self._latest_decoded_bgr = None
         self._latest_decoded_bgr_ts = 0.0
 
@@ -282,14 +283,14 @@ class VolumeToolkitApp(App):
         self._decoder_stop = threading.Event()
         self._decoder_thread.start()
 
-        # author push (manual)
+        # author push
         self.author_max_chars = 60
         self._last_committed_author = None
         self._author_update_in_flight = False
 
         self._current_payload = ""   # QR payload
-        self._csv_payload = ""       # CSV payload (selected subject)
-        self._current_exif = ""      # camera author field
+        self._csv_payload = ""       # CSV payload
+        self._current_exif = ""      # EXIF author
 
         # CSV data
         self.csv_headers = []
@@ -332,6 +333,18 @@ class VolumeToolkitApp(App):
         self._freeze_ccapi_path = None
         self._freeze_request_id = 0
 
+    # ---------- header buttons ----------
+    def exit_app(self):
+        try:
+            self.stop_liveview()
+        except Exception:
+            pass
+        try:
+            self.stop_polling_new_images()
+        except Exception:
+            pass
+        self.stop()
+
     # ---------- styling helpers ----------
     @staticmethod
     def _set_btn_style(btn: Button, bg_rgba, fg_rgba):
@@ -370,16 +383,21 @@ class VolumeToolkitApp(App):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
 
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
-        header.add_widget(Label(text="Volume Toolkit v2.0.6", font_size=sp(18)))
+        self.exit_btn = Button(text="Exit", size_hint=(None, 1), width=dp(90), font_size=sp(14))
+        header.add_widget(self.exit_btn)
+        header.add_widget(Label(text="Volume Toolkit v2.0.9", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         root.add_widget(header)
 
+        # Smaller font so text fits
+        top_font = sp(12)
+
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
-        self.connect_btn = Button(text="Connect", font_size=sp(16), size_hint=(1, 1))
-        self.start_btn = Button(text="Live View Off", disabled=True, font_size=sp(16), size_hint=(1, 1))
-        self.autofetch_btn = Button(text="Autofetch Off", disabled=True, font_size=sp(16), size_hint=(1, 1))
-        self.qr_btn = Button(text="QR Detect: OFF", disabled=True, font_size=sp(16), size_hint=(1, 1))
+        self.connect_btn = Button(text="Connect", font_size=top_font, size_hint=(1, 1))
+        self.start_btn = Button(text="Live View Off", disabled=True, font_size=top_font, size_hint=(1, 1))
+        self.autofetch_btn = Button(text="Autofetch Off", disabled=True, font_size=top_font, size_hint=(1, 1))
+        self.qr_btn = Button(text="QR Detect: OFF", disabled=True, font_size=top_font, size_hint=(1, 1))
         row2.add_widget(self.connect_btn)
         row2.add_widget(self.start_btn)
         row2.add_widget(self.autofetch_btn)
@@ -414,7 +432,7 @@ class VolumeToolkitApp(App):
 
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
-        preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.85, 1))
+        preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview_scatter = Scatter(do_translation=True, do_scale=True, do_rotation=False,
                                        scale_min=0.5, scale_max=2.5)
         self.preview_scatter.size_hint = (None, None)
@@ -425,7 +443,7 @@ class VolumeToolkitApp(App):
         preview_holder.add_widget(self.preview_scatter)
         main_area.add_widget(preview_holder)
 
-        sidebar = BoxLayout(orientation="vertical", size_hint=(0.15, 1), spacing=dp(4))
+        sidebar = BoxLayout(orientation="vertical", size_hint=(0.20, 1), spacing=dp(4))
         sidebar.add_widget(Label(text="Last 5", size_hint=(1, None), height=dp(20), font_size=sp(12)))
         for idx in range(5):
             img = Image(size_hint=(1, 0.18), allow_stretch=True, keep_ratio=True)
@@ -460,6 +478,7 @@ class VolumeToolkitApp(App):
         self.dropdown = self._build_dropdown(fit_preview_to_holder)
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
+        self.exit_btn.bind(on_press=lambda *_: self.exit_app())
         self.connect_btn.bind(on_press=lambda *_: self.connect_camera())
         self.start_btn.bind(on_press=lambda *_: self.toggle_liveview())
         self.autofetch_btn.bind(on_press=lambda *_: self.toggle_autofetch())
@@ -530,14 +549,60 @@ class VolumeToolkitApp(App):
             raise Exception(f"HTTP {resp.status_code} {resp.reason}")
         return resp.content
 
-    # ---------- EXIF vs payload coloring ----------
-    def _update_exif_payload_colors(self):
-        exif = (self._current_exif or "").strip()
-        payload = (self._current_payload or "").strip()
-        if exif and payload and exif == payload:
-            self.exif_label.color = (0.2, 1.0, 0.2, 1.0)
+    # ---------- matching colors ----------
+    def _match_trimmed(self, s: str) -> str:
+        return (s or "").strip()
+
+    def _apply_match_colors(self):
+        E = self._match_trimmed(self._current_exif)
+        Q = self._match_trimmed(self._current_payload)
+        C = self._match_trimmed(self._csv_payload)
+
+        GREEN = (0.2, 1.0, 0.2, 1.0)
+        RED = (1.0, 0.2, 0.2, 1.0)
+        WHITE = (1.0, 1.0, 1.0, 1.0)
+
+        e_green = False
+        q_green = False
+        c_green = False
+
+        if E and C and E == C:
+            e_green = True
+            c_green = True
+        if E and Q and E == Q:
+            e_green = True
+            q_green = True
+
+        if e_green:
+            self.exif_label.color = GREEN
         else:
-            self.exif_label.color = (1.0, 0.2, 0.2, 1.0)
+            # if E exists but doesn't match either present payload, exif red
+            if E and ((C and E != C) or (Q and E != Q)):
+                self.exif_label.color = RED
+            else:
+                self.exif_label.color = WHITE
+
+        if c_green:
+            self.csv_payload_label.color = GREEN
+        else:
+            # if E matches Q but not C and C exists => C red, else white
+            if E and C and (E != C) and (E == Q):
+                self.csv_payload_label.color = RED
+            elif E and C and (E != C) and (Q == "" or E != Q):
+                # E does not match C; if E doesn't match Q either, payloads should be white
+                self.csv_payload_label.color = WHITE
+            else:
+                self.csv_payload_label.color = WHITE
+
+        if q_green:
+            self.payload_label.color = GREEN
+        else:
+            if E and Q and (E != Q) and (E == C):
+                self.payload_label.color = RED
+            elif E and Q and (E != Q) and (C == "" or E != C):
+                self.payload_label.color = WHITE
+            else:
+                self.payload_label.color = WHITE
 
     # ---------- EXIF refresh ----------
     def refresh_exif(self):
@@ -558,19 +623,20 @@ class VolumeToolkitApp(App):
     def _set_exif_text(self, exif: str):
         self._current_exif = exif or ""
         self.exif_label.text = self._current_exif
-        self._update_exif_payload_colors()
+        self._apply_match_colors()
 
     # ---------- payload setters ----------
     def _set_payload(self, payload: str):
         payload = (payload or "").strip()
         self._current_payload = payload
         self.payload_label.text = payload if payload else "(none)"
-        self._update_exif_payload_colors()
+        self._apply_match_colors()
 
     def _set_csv_payload(self, payload: str):
         payload = (payload or "").strip()
         self._csv_payload = payload
         self.csv_payload_label.text = payload if payload else "(none)"
+        self._apply_match_colors()
 
     # ---------- connect / controls ----------
     def _set_controls_idle(self):
@@ -957,6 +1023,42 @@ class VolumeToolkitApp(App):
                 self.log(f"liveview fetch error: {e}")
                 time.sleep(0.10)
 
+    def _rotate_bgr(self, bgr):
+        rot = int(self.preview.preview_rotation) % 360
+        if rot == 90:
+            return cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+        if rot == 180:
+            return cv2.rotate(bgr, cv2.ROTATE_180)
+        if rot == 270:
+            return cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return bgr
+
+    @staticmethod
+    def _center_crop_bgr_to_aspect(bgr, target_aspect_w_over_h: float):
+        """
+        Center-crop a BGR image to target aspect (w/h).
+        """
+        if bgr is None:
+            return None
+        h, w = bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return bgr
+        src_aspect = float(w) / float(h)
+        tgt = float(target_aspect_w_over_h)
+        if abs(src_aspect - tgt) < 1e-3:
+            return bgr
+
+        if src_aspect > tgt:
+            # too wide -> crop width
+            new_w = int(h * tgt)
+            x0 = max(0, (w - new_w) // 2)
+            return bgr[:, x0:x0 + new_w]
+        else:
+            # too tall -> crop height
+            new_h = int(w / tgt)
+            y0 = max(0, (h - new_h) // 2)
+            return bgr[y0:y0 + new_h, :]
+
     def _decoder_loop(self):
         while not self._decoder_stop.is_set():
             try:
@@ -970,13 +1072,7 @@ class VolumeToolkitApp(App):
                 if bgr is None:
                     continue
 
-                rot = int(self.preview.preview_rotation) % 360
-                if rot == 90:
-                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
-                elif rot == 180:
-                    bgr = cv2.rotate(bgr, cv2.ROTATE_180)
-                elif rot == 270:
-                    bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                bgr = self._rotate_bgr(bgr)
 
                 with self._lock:
                     self._latest_decoded_bgr = bgr.copy()
@@ -1072,15 +1168,19 @@ class VolumeToolkitApp(App):
             sd_path = ccapi_path[len(prefix):]
         else:
             sd_path = ccapi_path.lstrip("/")
-        return f"https://{self.camera_ip}/ccapi/ver100/contents/{sd_path}"
+
+        # URL-encode path segments (keep slashes)
+        sd_path_enc = quote(sd_path, safe="/")
+        return f"https://{self.camera_ip}/ccapi/ver100/contents/{sd_path_enc}"
 
     def _download_fullres_and_replace(self, ccapi_path: str, request_id: int):
         try:
             url = self._contents_fullres_url(ccapi_path)
-            self.log(f"Full-res download (bg): {url}")
-            jpg_bytes = self._get_bytes(url, timeout=20.0)
+            self.log(f"Full-res download START (bg): {url}")
+            jpg_bytes = self._get_bytes(url, timeout=25.0)
+            self.log(f"Full-res download OK (bg): {len(jpg_bytes)} bytes")
         except Exception as e:
-            self.log(f"Full-res download error: {e}")
+            self.log(f"Full-res download ERROR: {e}")
             return
 
         try:
@@ -1089,19 +1189,14 @@ class VolumeToolkitApp(App):
             if bgr is None:
                 raise Exception("cv2.imdecode failed for full-res")
 
-            rot = int(self.preview.preview_rotation) % 360
-            if rot == 90:
-                bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
-            elif rot == 180:
-                bgr = cv2.rotate(bgr, cv2.ROTATE_180)
-            elif rot == 270:
-                bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            bgr = self._rotate_bgr(bgr)
+            bgr = self._center_crop_bgr_to_aspect(bgr, self.STILL_TARGET_ASPECT)
 
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             h, w = rgb.shape[:2]
             rgb_bytes = rgb.tobytes()
         except Exception as e:
-            self.log(f"Full-res decode/rotate error: {e}")
+            self.log(f"Full-res decode/rotate/crop ERROR: {e}")
             return
 
         def _apply(_dt, rgb_bytes=rgb_bytes, w=w, h=h):
@@ -1116,9 +1211,9 @@ class VolumeToolkitApp(App):
                 tex.flip_vertical()
                 tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
                 self.preview.set_texture(tex)
-                self.log(f"Full-res applied to preview: {ccapi_path}")
+                self.log(f"Full-res applied to preview: {ccapi_path} ({w}x{h})")
             except Exception as e:
-                self.log(f"Full-res texture apply error: {e}")
+                self.log(f"Full-res texture apply ERROR: {e}")
 
         Clock.schedule_once(_apply, 0)
 
@@ -1135,6 +1230,7 @@ class VolumeToolkitApp(App):
             self.log(f"Thumbnail download error: {e}")
             return
 
+        # Save thumb for inspection
         try:
             os.makedirs(self.thumb_dir, exist_ok=True)
             name = os.path.basename(ccapi_path) or "image"
@@ -1146,13 +1242,14 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
 
+        # Sidebar thumb: rotate CCW 90 so it "looks like" the preview, but keep_ratio in sidebar is fine.
         try:
             pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
             try:
-                pil = pil.transpose(PILImage.Transpose.ROTATE_90)  # CCW
+                pil = pil.transpose(PILImage.Transpose.ROTATE_90)
             except Exception:
                 pil = pil.transpose(PILImage.ROTATE_90)
-            pil.thumbnail((200, 200))
+            pil.thumbnail((240, 240))
             w, h = pil.size
             rgb_bytes = pil.tobytes()
         except Exception as e:
@@ -1178,6 +1275,15 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_make_texture_and_update, 0)
 
+    def _texture_from_bgr(self, bgr):
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        rgb_bytes = rgb.tobytes()
+        tex = Texture.create(size=(w, h), colorfmt="rgb")
+        tex.flip_vertical()
+        tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
+        return tex
+
     def _on_thumb_touch(self, image_widget, touch):
         if not image_widget.collide_point(*touch.pos):
             return False
@@ -1186,15 +1292,77 @@ class VolumeToolkitApp(App):
             return False
 
         ccapi_path = self._thumb_paths[idx]
-        tex = self._thumb_textures[idx]
+        thumb_tex = self._thumb_textures[idx]
 
-        rid = self._freeze_with_texture(ccapi_path, tex)
+        # Build a "fill-exact" still from the thumbnail by fetching the thumb bytes again
+        # and cropping to the 2:3 portrait aspect after rotation. This avoids using the
+        # sidebar thumb texture (which is square-ish thumbnail) as the preview still.
+        #
+        # (Yes: this is extra network work; but it ensures perfect framing alignment.)
+        rid = self._freeze_request_id + 1
+        self._freeze_active = True
+        self._freeze_ccapi_path = ccapi_path
+        self._freeze_request_id = rid
+        self.log(f"Thumb tapped -> freeze (rid={rid}): {ccapi_path}")
 
-        if self.capture_type == CaptureType.JPG:
-            threading.Thread(target=self._download_fullres_and_replace, args=(ccapi_path, rid), daemon=True).start()
-        else:
-            self.log("RAW selected; full-res RAW fetch not implemented yet.")
+        # Immediately show *something* (existing sidebar thumb) so UI responds
+        self.preview.set_texture(thumb_tex)
+
+        # Now: in background, download a higher-quality thumbnail (same endpoint) and crop to 2:3 for exact fill,
+        # then set it, then start full-res download.
+        threading.Thread(target=self._freeze_pipeline_for_thumb, args=(ccapi_path, rid), daemon=True).start()
         return True
+
+    def _freeze_pipeline_for_thumb(self, ccapi_path: str, request_id: int):
+        # Step 1: fetch thumbnail bytes again
+        thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
+        try:
+            self.log(f"Freeze thumb fetch START (bg): {thumb_url}")
+            b = self._get_bytes(thumb_url, timeout=12.0)
+            self.log(f"Freeze thumb fetch OK (bg): {len(b)} bytes")
+        except Exception as e:
+            self.log(f"Freeze thumb fetch ERROR: {e}")
+            return
+
+        # Step 2: decode -> rotate -> crop to 2:3 -> apply on main thread
+        try:
+            arr = np.frombuffer(b, dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise Exception("imdecode thumb failed")
+            bgr = self._rotate_bgr(bgr)
+            bgr = self._center_crop_bgr_to_aspect(bgr, self.STILL_TARGET_ASPECT)
+
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            rgb_bytes = rgb.tobytes()
+        except Exception as e:
+            self.log(f"Freeze thumb decode/rotate/crop ERROR: {e}")
+            return
+
+        def apply_thumb(_dt):
+            if not self._freeze_active:
+                return
+            if request_id != self._freeze_request_id:
+                return
+            if self._freeze_ccapi_path != ccapi_path:
+                return
+            try:
+                tex = Texture.create(size=(w, h), colorfmt="rgb")
+                tex.flip_vertical()
+                tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
+                self.preview.set_texture(tex)
+                self.log(f"Freeze thumb applied to preview: {ccapi_path} ({w}x{h})")
+            except Exception as e:
+                self.log(f"Freeze thumb texture apply ERROR: {e}")
+
+        Clock.schedule_once(apply_thumb, 0)
+
+        # Step 3: full-res in background
+        if self.capture_type == CaptureType.JPG:
+            self._download_fullres_and_replace(ccapi_path, request_id)
+        else:
+            self.log("RAW selected; full-res RAW fetch not implemented.")
 
     # ---------- contents listing ----------
     def list_all_images(self):
@@ -1292,7 +1460,7 @@ class VolumeToolkitApp(App):
         add_button("Set camera IP…", lambda: self._open_ip_popup())
 
         add_header("Display")
-        add_button("Set display FPS…", lambda: self._open_fps_popup())
+        add_button("Set display FPS���", lambda: self._open_fps_popup())
         add_button("Show metrics…", lambda: self._open_metrics_popup())
 
         add_header("EXIF / Author")
@@ -1448,34 +1616,28 @@ class VolumeToolkitApp(App):
     def _open_csv_saf(self):
         self._bind_android_activity_once()
         self._csv_req_code = getattr(self, "_csv_req_code", 4242)
-
         try:
             from android import mActivity
             from jnius import autoclass
 
             Intent = autoclass("android.content.Intent")
-
             intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
             intent.addCategory(Intent.CATEGORY_OPENABLE)
             intent.setType("*/*")
-
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
 
             self.log("Opening Android file picker…")
             mActivity.startActivityForResult(intent, self._csv_req_code)
-
         except Exception as e:
             self.log(f"Failed to open Android picker: {e}")
 
     def _on_android_activity_result(self, request_code, result_code, intent):
         if request_code != getattr(self, "_csv_req_code", 4242):
             return
-
         if result_code != -1 or intent is None:
             self.log("CSV picker canceled")
             return
-
         try:
             from android import mActivity
             from jnius import cast, autoclass
@@ -1505,12 +1667,10 @@ class VolumeToolkitApp(App):
 
     def _read_android_uri_bytes(self, uri):
         from android import mActivity
-
         cr = mActivity.getContentResolver()
         stream = cr.openInputStream(uri)
         if stream is None:
             raise Exception("openInputStream() returned null")
-
         out = bytearray()
         buf = bytearray(64 * 1024)
         while True:
@@ -1533,7 +1693,6 @@ class VolumeToolkitApp(App):
             text = b.decode("utf-8-sig")
         except Exception:
             text = b.decode("latin-1", errors="replace")
-
         reader = csv.DictReader(text.splitlines())
         headers = reader.fieldnames or []
         self.csv_headers = headers
@@ -1557,7 +1716,6 @@ class VolumeToolkitApp(App):
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
         root.add_widget(Label(text="Select columns to include in CSV Payload (joined with _):",
                               size_hint=(1, None), height=dp(40), font_size=sp(12)))
-
         sv = ScrollView(size_hint=(1, 1))
         inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
         inner.bind(minimum_height=inner.setter("height"))
@@ -1767,168 +1925,23 @@ class VolumeToolkitApp(App):
         self._subject_popup = popup
         render_results()
 
-    # ---------- CSV controls ----------
-    def _bind_android_activity_once(self):
-        if getattr(self, "_android_activity_bound", False):
-            return
-        try:
-            from android import activity
-            activity.bind(on_activity_result=self._on_android_activity_result)
-            self._android_activity_bound = True
-        except Exception as e:
-            self.log(f"Android activity bind failed: {e}")
+    # ---------- CSV menu launcher ----------
+    def _open_csv_menu_popup(self):
+        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        b1 = Button(text="Load CSV file", size_hint=(1, None), height=dp(48))
+        b2 = Button(text="Select headers", size_hint=(1, None), height=dp(48))
+        b3 = Button(text="Close", size_hint=(1, None), height=dp(44))
+        root.add_widget(b1)
+        root.add_widget(b2)
+        root.add_widget(b3)
 
-    def _open_csv_saf(self):
-        self._bind_android_activity_once()
-        self._csv_req_code = getattr(self, "_csv_req_code", 4242)
-        try:
-            from android import mActivity
-            from jnius import autoclass
-
-            Intent = autoclass("android.content.Intent")
-            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
-            intent.addCategory(Intent.CATEGORY_OPENABLE)
-            intent.setType("*/*")
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-
-            self.log("Opening Android file picker…")
-            mActivity.startActivityForResult(intent, self._csv_req_code)
-        except Exception as e:
-            self.log(f"Failed to open Android picker: {e}")
-
-    def _on_android_activity_result(self, request_code, result_code, intent):
-        if request_code != getattr(self, "_csv_req_code", 4242):
-            return
-        if result_code != -1 or intent is None:
-            self.log("CSV picker canceled")
-            return
-        try:
-            from android import mActivity
-            from jnius import cast, autoclass
-
-            Intent = autoclass("android.content.Intent")
-            uri = cast("android.net.Uri", intent.getData())
-            if uri is None:
-                self.log("CSV picker returned no URI")
-                return
-
-            try:
-                flags = intent.getFlags()
-                take_flags = flags & (
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-                )
-                mActivity.getContentResolver().takePersistableUriPermission(uri, take_flags)
-            except Exception:
-                pass
-
-            data = self._read_android_uri_bytes(uri)
-            self._parse_csv_bytes(data)
-            self.log(f"CSV loaded from picker: {len(self.csv_rows)} rows")
-            Clock.schedule_once(lambda *_: self._set_controls_idle(), 0)
-        except Exception as e:
-            self.log(f"CSV load failed (Android): {e}")
-
-    def _read_android_uri_bytes(self, uri):
-        from android import mActivity
-        cr = mActivity.getContentResolver()
-        stream = cr.openInputStream(uri)
-        if stream is None:
-            raise Exception("openInputStream() returned null")
-        out = bytearray()
-        buf = bytearray(64 * 1024)
-        while True:
-            n = stream.read(buf)
-            if n == -1 or n == 0:
-                break
-            out.extend(buf[:n])
-        stream.close()
-        return bytes(out)
-
-    def _open_csv_filechooser(self):
-        if platform != "android":
-            self.log("CSV load is Android-only (SAF). Please run on-device to load CSV.")
-            return
-        return self._open_csv_saf()
-
-    def _parse_csv_bytes(self, b: bytes):
-        self.log(f"CSV size: {len(b)} bytes")
-        try:
-            text = b.decode("utf-8-sig")
-        except Exception:
-            text = b.decode("latin-1", errors="replace")
-        reader = csv.DictReader(text.splitlines())
-        headers = reader.fieldnames or []
-        self.csv_headers = headers
-        rows = []
-        for r in reader:
-            rows.append({k: (r.get(k) or "").strip() for k in headers})
-        self.csv_rows = rows
-        self.log(f"CSV headers: {headers}")
-        self.log(f"CSV rows: {len(rows)}")
-
-        preferred = ["LAST_NAME", "FIRST_NAME", "GRADE", "TEACHER", "STUDENT_ID"]
-        self.selected_headers = [h for h in preferred if h in headers]
-        if not self.selected_headers and headers:
-            self.selected_headers = headers[:3]
-
-    # ---------- remaining menu helpers ----------
-    def _open_headers_popup(self):
-        if not self.csv_headers:
-            self.log("No CSV loaded; cannot pick headers")
-            return
-
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Select columns to include in CSV Payload (joined with _):",
-                              size_hint=(1, None), height=dp(40), font_size=sp(12)))
-        sv = ScrollView(size_hint=(1, 1))
-        inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
-        inner.bind(minimum_height=inner.setter("height"))
-        sv.add_widget(inner)
-
-        current_sel = set(self.selected_headers)
-
-        for h in self.csv_headers:
-            row = BoxLayout(size_hint_y=None, height=dp(28))
-            lbl = Label(text=h, size_hint=(0.7, 1), font_size=sp(12), halign="left", valign="middle")
-            lbl.bind(size=lbl.setter("text_size"))
-            cb = CheckBox(active=(h in current_sel), size_hint=(0.3, 1))
-
-            def toggle_cb(inst, val, header=h):
-                if val:
-                    if header not in self.selected_headers:
-                        self.selected_headers.append(header)
-                else:
-                    if header in self.selected_headers:
-                        self.selected_headers.remove(header)
-
-            cb.bind(active=toggle_cb)
-            row.add_widget(lbl)
-            row.add_widget(cb)
-            inner.add_widget(row)
-
-        root.add_widget(sv)
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(36), spacing=dp(6))
-        btn_ok = Button(text="OK")
-        btn_cancel = Button(text="Cancel")
-        btns.add_widget(btn_ok)
-        btns.add_widget(btn_cancel)
-        root.add_widget(btns)
-
-        popup = Popup(title="Select CSV columns", content=root, size_hint=(0.9, 0.9))
-
-        def do_ok(*_):
-            self.log(f"Selected headers: {self.selected_headers}")
-            popup.dismiss()
-
-        btn_ok.bind(on_release=do_ok)
-        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
-
+        popup = Popup(title="Load CSV", content=root, size_hint=(0.9, 0.45))
+        b1.bind(on_release=lambda *_: (popup.dismiss(), self._open_csv_filechooser()))
+        b2.bind(on_release=lambda *_: (popup.dismiss(), self._open_headers_popup()))
+        b3.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
-        self._headers_popup = popup
 
-    # ---------- lifecycle ----------
+    # ---------- exit / stop ----------
     def on_stop(self):
         try:
             self.stop_liveview()
