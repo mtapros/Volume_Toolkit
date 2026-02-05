@@ -4,23 +4,18 @@
 #
 # Base: v2.0.9 (keeps known-good Live View + AutoFetch + CSV load + Push Payload)
 #
-# Requested changes included:
-# - QR Detect button uses same On/Off color scheme as Live View and Autofetch:
-#     OFF: red background, white text
-#     ON:  green background, yellow text
-# - Remove "Reset framing" (no longer meaningful once placement is locked / no zoom).
+# Changes included:
+# - QR Detect button styling matches Live View / Autofetch (On/Off color scheme).
+# - Remove "Reset framing" (no longer meaningful; placement locked / no zoom).
 # - Layout:
-#     - Compact EXIF / QR / CSV rows (left-justified headings, tighter vertical spacing).
-#     - Ensure preview + thumbs do not collide with bottom Push/Subject buttons by placing
-#       preview+thumbs in a middle band above the bottom button row.
+#   - Compact EXIF / QR / CSV rows.
+#   - Preview + thumb strip are in a middle band above the bottom buttons (no overlap).
 # - Thumbnails:
-#     - Right strip is scrollable and shows ~4 items at a time ("Most Recent").
-#     - Holds effectively unlimited history by storing thumb files on disk (thumbs/ folder)
-#       and lazy-loading textures with a small in-memory cache.
-#     - Active reviewed thumbnail highlighted with a green border.
-#     - Close review by tapping the same thumbnail again (toggle).
-#     - Tapping the preview no longer exits review.
-# - Log overlay: non-modal bottom overlay panel (auto-scroll) with menu toggle.
+#   - Right strip uses RecycleView (shows ~4 items tall).
+#   - Unbounded history list stored on disk (thumbs/) + small texture cache.
+#   - Active reviewed thumb highlighted with a green border.
+#   - Close review by tapping the same thumb again (toggle).
+# - Log overlay: non-modal bottom overlay panel with auto-scroll (menu toggle).
 # - Full-res fetch endpoints:
 #     Primary:  https://{ip}{ccapi_path}
 #     Fallback: https://{ip}/ccapi/ver100/contents/<sdpath> mapping (url-encoded)
@@ -45,7 +40,7 @@ from kivy.clock import Clock
 from kivy.graphics import Color, Line, Rectangle
 from kivy.graphics.texture import Texture
 from kivy.metrics import dp, sp
-from kivy.properties import NumericProperty, BooleanProperty, StringProperty
+from kivy.properties import NumericProperty, BooleanProperty, StringProperty, ObjectProperty, ListProperty
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -59,6 +54,12 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.utils import platform
+
+# RecycleView for scrollable unlimited thumb list
+from kivy.uix.recycleview import RecycleView
+from kivy.uix.recycleview.views import RecycleDataViewBehavior
+from kivy.uix.recycleboxlayout import RecycleBoxLayout
+from kivy.uix.behaviors import ButtonBehavior
 
 from PIL import Image as PILImage
 
@@ -89,7 +90,6 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
-    # live/still rotation
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
@@ -234,6 +234,69 @@ class CaptureType:
     RAW = "RAW"
 
 
+class ThumbRow(ButtonBehavior, BoxLayout):
+    """
+    RecycleView row: clickable thumbnail + border highlight.
+    Data keys expected:
+      - index: int
+      - local_path: str
+      - ccapi_path: str
+      - active: bool
+    """
+    app = ObjectProperty(None)
+    index = NumericProperty(-1)
+    local_path = StringProperty("")
+    ccapi_path = StringProperty("")
+    active = BooleanProperty(False)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.orientation = "vertical"
+        self.size_hint_y = None
+        self.height = dp(90)
+
+        self._img = Image(allow_stretch=True, keep_ratio=True)
+        self.add_widget(self._img)
+
+        with self.canvas.after:
+            self._c = Color(0.2, 1.0, 0.2, 1.0)
+            self._ln = Line(rectangle=(0, 0, 0, 0), width=3)
+
+        self.bind(pos=self._redraw_border, size=self._redraw_border, active=self._redraw_border)
+
+    def refresh_view_attrs(self, rv, index, data):
+        # called by RecycleView
+        self.app = data.get("app")
+        self.index = int(data.get("index", -1))
+        self.local_path = data.get("local_path", "")
+        self.ccapi_path = data.get("ccapi_path", "")
+        self.active = bool(data.get("active", False))
+
+        tex = None
+        if self.app is not None and self.local_path:
+            tex = self.app._load_thumb_texture_from_file(self.local_path)
+        self._img.texture = tex
+
+        self._redraw_border()
+        return super().refresh_view_attrs(rv, index, data)
+
+    def _redraw_border(self, *_):
+        if self.active:
+            x, y = self.pos
+            w, h = self.size
+            self._ln.rectangle = (x, y, w, h)
+        else:
+            self._ln.rectangle = (0, 0, 0, 0)
+
+    def on_release(self):
+        if self.app is not None:
+            self.app.on_thumb_index_pressed(self.index)
+
+
+class ThumbRV(RecycleView):
+    pass
+
+
 class VolumeToolkitApp(App):
     capture_type = StringProperty(CaptureType.JPG)
     STILL_TARGET_ASPECT = 2.0 / 3.0  # portrait
@@ -299,19 +362,14 @@ class VolumeToolkitApp(App):
         self._subject_popup = None
 
         # thumbnails (history)
-        self._thumb_textures = []              # parallel to _thumb_items
-        self._thumb_items = []                 # list of dicts: {ccapi_path, local_path}
+        self._thumb_items = []  # newest first; dict: {ccapi_path, local_path}
         self.thumb_dir = "thumbs"
         self._active_thumb_index = None
 
-        # visible thumb widgets
-        self._thumb_images = []
-        self._thumb_border_lines = []
-
-        # thumb texture cache (small)
-        self._thumb_tex_cache = {}             # local_path -> Texture
-        self._thumb_tex_cache_order = []       # local_path order (oldest first)
-        self._thumb_tex_cache_max = 24
+        # thumb texture cache
+        self._thumb_tex_cache = {}       # local_path -> Texture
+        self._thumb_tex_cache_order = [] # oldest first
+        self._thumb_tex_cache_max = 40
 
         # poller
         self._last_seen_image = None
@@ -330,8 +388,6 @@ class VolumeToolkitApp(App):
 
         # popups
         self.dropdown = None
-        self._log_popup = None
-        self._log_popup_label = None
         self._ip_popup = None
         self._fps_popup = None
         self._metrics_popup = None
@@ -346,17 +402,8 @@ class VolumeToolkitApp(App):
         self._log_overlay_label = None
         self._log_overlay_sv = None
 
-    # ---------- header buttons ----------
-    def exit_app(self):
-        try:
-            self.stop_liveview()
-        except Exception:
-            pass
-        try:
-            self.stop_polling_new_images()
-        except Exception:
-            pass
-        self.stop()
+        # RV
+        self.thumb_rv = None
 
     # ---------- styling helpers ----------
     @staticmethod
@@ -409,19 +456,31 @@ class VolumeToolkitApp(App):
             except Exception as e:
                 self.log(f"Permission request failed: {e}")
 
-    # ---------- logging ----------
-    def log(self, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        print(line)
-        self._log_lines.append(line)
-        if len(self._log_lines) > self._max_log_lines:
-            self._log_lines = self._log_lines[-self._max_log_lines:]
-        self._append_log_overlay()
+    def on_stop(self):
+        try:
+            self.stop_liveview()
+        except Exception:
+            pass
+        try:
+            self.stop_polling_new_images()
+        except Exception:
+            pass
+        try:
+            self._decoder_stop.set()
+        except Exception:
+            pass
 
-    def _clear_log(self):
-        self._log_lines = []
-        self._append_log_overlay()
+    # ---------- app exit ----------
+    def exit_app(self):
+        try:
+            self.stop_liveview()
+        except Exception:
+            pass
+        try:
+            self.stop_polling_new_images()
+        except Exception:
+            pass
+        self.stop()
 
     # ---------- log overlay ----------
     def _set_log_overlay_visible(self, visible: bool):
@@ -438,6 +497,20 @@ class VolumeToolkitApp(App):
         self._log_overlay_label.text = "\n".join(self._log_lines)
         if self._log_overlay_sv is not None:
             Clock.schedule_once(lambda *_: setattr(self._log_overlay_sv, "scroll_y", 0.0), 0)
+
+    # ---------- logging ----------
+    def log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line)
+        self._log_lines.append(line)
+        if len(self._log_lines) > self._max_log_lines:
+            self._log_lines = self._log_lines[-self._max_log_lines:]
+        self._append_log_overlay()
+
+    def _clear_log(self):
+        self._log_lines = []
+        self._append_log_overlay()
 
     # ---------- HTTP ----------
     def _json_call(self, method, path, payload=None, timeout=8.0):
@@ -561,6 +634,7 @@ class VolumeToolkitApp(App):
         self.qr_btn.disabled = not self.connected
         self.push_btn.disabled = not self.connected
         self.subject_btn.disabled = not (self.connected and bool(self.csv_rows))
+
         self._apply_connect_btn_style()
         self._apply_live_btn_style()
         self._apply_autofetch_btn_style()
@@ -573,6 +647,7 @@ class VolumeToolkitApp(App):
         self.qr_btn.disabled = False
         self.push_btn.disabled = False
         self.subject_btn.disabled = not bool(self.csv_rows)
+
         self._apply_connect_btn_style()
         self._apply_live_btn_style()
         self._apply_autofetch_btn_style()
@@ -1055,13 +1130,14 @@ class VolumeToolkitApp(App):
                 self.log(f"QR: {text}")
         Clock.schedule_once(lambda *_: self._set_payload(text), 0)
 
-    # ---------- thumb cache + rendering ----------
+    # ---------- thumb file naming + cache ----------
     def _thumb_local_path_for_ccapi_path(self, ccapi_path: str) -> str:
-        # Ensure stable unique-ish name: basename plus a hash of full path
         base = os.path.basename(ccapi_path) or "image"
         if not base.lower().endswith((".jpg", ".jpeg")):
             base = base + ".jpg"
-        h = str(abs(hash(ccapi_path)))  # ok for local cache naming
+        # Use url-quoted path to avoid invalid chars; still long, so hash it too
+        safe = quote(ccapi_path, safe="")
+        h = str(abs(hash(safe)))
         name = f"{h}_{base}"
         return os.path.join(self.thumb_dir, name)
 
@@ -1081,7 +1157,6 @@ class VolumeToolkitApp(App):
     def _thumb_cache_get(self, local_path: str):
         tex = self._thumb_tex_cache.get(local_path)
         if tex is not None:
-            # bump recency
             if local_path in self._thumb_tex_cache_order:
                 self._thumb_tex_cache_order.remove(local_path)
             self._thumb_tex_cache_order.append(local_path)
@@ -1091,7 +1166,7 @@ class VolumeToolkitApp(App):
         tex = self._thumb_cache_get(local_path)
         if tex is not None:
             return tex
-        if not os.path.exists(local_path):
+        if not local_path or not os.path.exists(local_path):
             return None
         try:
             pil = PILImage.open(local_path).convert("RGB")
@@ -1111,35 +1186,55 @@ class VolumeToolkitApp(App):
             self.log(f"thumb file decode error: {e}")
             return None
 
-    def _refresh_thumb_widgets(self, *_args):
-        # Fill each visible widget with the corresponding item (newest at top).
-        for idx, img in enumerate(self._thumb_images):
-            if idx < len(self._thumb_items):
-                item = self._thumb_items[idx]
-                tex = self._load_thumb_texture_from_file(item["local_path"])
-                img.texture = tex
-            else:
-                img.texture = None
-        self._update_thumb_borders()
+    def _rv_rebuild_data(self):
+        if self.thumb_rv is None:
+            return
+        data = []
+        for i, item in enumerate(self._thumb_items):
+            data.append({
+                "app": self,
+                "index": i,
+                "local_path": item.get("local_path", ""),
+                "ccapi_path": item.get("ccapi_path", ""),
+                "active": (self._active_thumb_index == i and self._freeze_active),
+            })
+        self.thumb_rv.data = data
 
-    def _update_thumb_borders(self):
-        for idx, img in enumerate(self._thumb_images):
-            ln = self._thumb_border_lines[idx]
-            if self._active_thumb_index == idx and idx < len(self._thumb_items):
-                x, y = img.pos
-                w, h = img.size
-                ln.rectangle = (x, y, w, h)
-            else:
-                ln.rectangle = (0, 0, 0, 0)
-
-    # ---------- still review toggle ----------
+    # ---------- review toggle ----------
     def _close_review(self):
         self._freeze_active = False
         self._freeze_ccapi_path = None
         self._freeze_request_id += 1
         self._active_thumb_index = None
-        self._update_thumb_borders()
+        self._rv_rebuild_data()
         self.log("Review closed (thumb toggle)")
+
+    def on_thumb_index_pressed(self, idx: int):
+        if idx < 0 or idx >= len(self._thumb_items):
+            return
+
+        if self._freeze_active and self._active_thumb_index == idx:
+            self._close_review()
+            return
+
+        item = self._thumb_items[idx]
+        ccapi_path = item.get("ccapi_path", "")
+        local_path = item.get("local_path", "")
+
+        rid = self._freeze_request_id + 1
+        self._freeze_active = True
+        self._freeze_ccapi_path = ccapi_path
+        self._freeze_request_id = rid
+        self._active_thumb_index = idx
+        self._rv_rebuild_data()
+
+        self.log(f"REVIEW START idx={idx} rid={rid} path={ccapi_path}")
+
+        tex = self._load_thumb_texture_from_file(local_path)
+        if tex is not None:
+            self.preview.set_texture(tex)
+
+        threading.Thread(target=self._freeze_pipeline_for_thumb, args=(ccapi_path, rid), daemon=True).start()
 
     # ---------- endpoints ----------
     def _contents_fullres_url(self, ccapi_path: str) -> str:
@@ -1212,7 +1307,7 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_apply, 0)
 
-    # ---------- thumbnail download (background) ----------
+    # ---------- thumbnail download (sidebar) ----------
     def _download_thumb_for_path(self, ccapi_path: str):
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         self.log(f"Downloading thumbnail (bg): {thumb_url}")
@@ -1236,49 +1331,13 @@ class VolumeToolkitApp(App):
             return
 
         def _add_item(_dt):
-            # newest at top
             self._thumb_items.insert(0, {"ccapi_path": ccapi_path, "local_path": local_path})
-            # refresh visible widgets
-            self._refresh_thumb_widgets()
+            # Keep active selection stable: if currently active, it shifts by +1
+            if self._active_thumb_index is not None:
+                self._active_thumb_index += 1
+            self._rv_rebuild_data()
 
         Clock.schedule_once(_add_item, 0)
-
-    # ---------- thumb tap ----------
-    def _on_thumb_touch(self, image_widget, touch):
-        if not image_widget.collide_point(*touch.pos):
-            return False
-        idx = getattr(image_widget, "thumb_index", None)
-        if idx is None or idx >= len(self._thumb_items):
-            return False
-
-        # Toggle close if tapping same active thumb while frozen
-        if self._freeze_active and self._active_thumb_index == idx:
-            self._close_review()
-            return True
-
-        item = self._thumb_items[idx]
-        ccapi_path = item["ccapi_path"]
-        local_path = item["local_path"]
-
-        # Enter freeze mode
-        rid = self._freeze_request_id + 1
-        self._freeze_active = True
-        self._freeze_ccapi_path = ccapi_path
-        self._freeze_request_id = rid
-
-        self._active_thumb_index = idx
-        self._update_thumb_borders()
-
-        self.log(f"REVIEW START idx={idx} rid={rid} path={ccapi_path}")
-
-        # Immediate feedback: show local thumb texture if present
-        tex = self._load_thumb_texture_from_file(local_path)
-        if tex is not None:
-            self.preview.set_texture(tex)
-
-        # Start background pipeline: fetch thumb bytes again -> crop -> apply -> fullres
-        threading.Thread(target=self._freeze_pipeline_for_thumb, args=(ccapi_path, rid), daemon=True).start()
-        return True
 
     def _freeze_pipeline_for_thumb(self, ccapi_path: str, request_id: int):
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
@@ -1353,7 +1412,7 @@ class VolumeToolkitApp(App):
                         images.append(f)
         return images
 
-    # ---------- Menu + popups ----------
+    # ---------- menu / dropdown ----------
     def _style_menu_button(self, b):
         b.background_normal = ""
         b.background_down = ""
@@ -1440,14 +1499,8 @@ class VolumeToolkitApp(App):
 
         return dd
 
+    # ---------- popups ----------
     def _open_ip_popup(self):
-        if self._ip_popup is not None:
-            try:
-                self._ip_popup.dismiss()
-            except Exception:
-                pass
-            self._ip_popup = None
-
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
         root.add_widget(Label(text="Camera IP:", size_hint=(1, None), height=dp(28), font_size=sp(12)))
         ip_in = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16),
@@ -1474,18 +1527,9 @@ class VolumeToolkitApp(App):
 
         ok.bind(on_release=do_ok)
         cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.bind(on_dismiss=lambda *_: setattr(self, "_ip_popup", None))
         popup.open()
-        self._ip_popup = popup
 
     def _open_fps_popup(self):
-        if self._fps_popup is not None:
-            try:
-                self._fps_popup.dismiss()
-            except Exception:
-                pass
-            self._fps_popup = None
-
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
         root.add_widget(Label(text="Display FPS (metrics tick)", size_hint=(1, None), height=dp(28),
                               font_size=sp(12)))
@@ -1513,9 +1557,7 @@ class VolumeToolkitApp(App):
 
         ok.bind(on_release=do_ok)
         cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.bind(on_dismiss=lambda *_: setattr(self, "_fps_popup", None))
         popup.open()
-        self._fps_popup = popup
 
     # ---------- CSV menu + SAF + Subject List ----------
     def _open_csv_menu_popup(self):
@@ -1879,7 +1921,6 @@ class VolumeToolkitApp(App):
         row2.add_widget(self.qr_btn)
         main.add_widget(row2)
 
-        # Compact info rows (single-line)
         def info_row(title, initial, title_w=dp(110), h=dp(28), f=sp(13)):
             row = BoxLayout(spacing=dp(6), size_hint=(1, None), height=h)
             t = Label(text=title, size_hint=(None, 1), width=title_w, font_size=f, halign="left", valign="middle")
@@ -1893,14 +1934,13 @@ class VolumeToolkitApp(App):
         row_exif, self.exif_label = info_row("Current EXIF", "(not connected)", h=dp(28), f=sp(13))
         row_qr, self.payload_label = info_row("QR Payload", "(none)", h=dp(28), f=sp(13))
         row_csv, self.csv_payload_label = info_row("CSV Payload", "(none)", h=dp(24), f=sp(12))
-
         main.add_widget(row_exif)
         main.add_widget(row_qr)
         main.add_widget(row_csv)
 
         self.metrics = Label(text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0")
 
-        # Middle band (preview + scrollable thumbs)
+        # Middle band
         middle = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 1))
         main.add_widget(middle)
 
@@ -1912,33 +1952,16 @@ class VolumeToolkitApp(App):
         sidebar = BoxLayout(orientation="vertical", size_hint=(0.20, 1), spacing=dp(4))
         sidebar.add_widget(Label(text="Most Recent", size_hint=(1, None), height=dp(20), font_size=sp(12)))
 
-        thumb_sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
-        thumbs_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4), padding=[0, dp(2), 0, dp(2)])
-        thumbs_box.bind(minimum_height=thumbs_box.setter("height"))
-        thumb_sv.add_widget(thumbs_box)
-        sidebar.add_widget(thumb_sv)
+        self.thumb_rv = ThumbRV(size_hint=(1, 1))
+        # configure layout manager
+        rbl = RecycleBoxLayout(orientation="vertical", default_size=(None, dp(90)),
+                               default_size_hint=(1, None), size_hint=(1, None))
+        rbl.bind(minimum_height=rbl.setter("height"))
+        self.thumb_rv.layout_manager = rbl
+        self.thumb_rv.viewclass = ThumbRow
+        self.thumb_rv.add_widget(rbl)
+        sidebar.add_widget(self.thumb_rv)
         middle.add_widget(sidebar)
-
-        # Create many thumb widgets, but size the strip so ~4 are visible at a time.
-        # Height of each thumb is computed relative to the sidebar height in a scheduled callback.
-        VISIBLE_THUMBS = 4
-        TOTAL_THUMB_WIDGETS = 40  # plenty; history is actually unbounded via file-backed list
-
-        self._thumb_images = []
-        self._thumb_border_lines = []
-        for idx in range(TOTAL_THUMB_WIDGETS):
-            img = Image(size_hint=(1, None), height=dp(80), allow_stretch=True, keep_ratio=True)
-            img.thumb_index = idx
-            img.bind(on_touch_down=self._on_thumb_touch)
-
-            with img.canvas.after:
-                Color(0.2, 1.0, 0.2, 1.0)
-                ln = Line(rectangle=(0, 0, 0, 0), width=3)
-            img.bind(pos=lambda *_: self._update_thumb_borders(), size=lambda *_: self._update_thumb_borders())
-
-            thumbs_box.add_widget(img)
-            self._thumb_images.append(img)
-            self._thumb_border_lines.append(ln)
 
         def fit_preview_to_holder(*_):
             w = max(dp(220), preview_holder.width * 0.98)
@@ -1947,16 +1970,14 @@ class VolumeToolkitApp(App):
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
-        def size_thumbs_to_show_four(*_):
-            # Make the thumb strip show ~4 thumbs tall.
-            available_h = max(dp(200), sidebar.height - dp(20) - dp(6))
-            thumb_h = max(dp(56), available_h / float(VISIBLE_THUMBS))
-            for img in self._thumb_images:
-                img.height = thumb_h
+        # keep thumb list ~4 visible
+        def size_thumb_rows(*_):
+            avail = max(dp(240), sidebar.height - dp(20) - dp(4))
+            row_h = max(dp(56), avail / 4.0)
+            self.thumb_rv.layout_manager.default_size = (None, row_h)
 
-        sidebar.bind(size=size_thumbs_to_show_four)
+        sidebar.bind(size=size_thumb_rows)
 
-        # Bottom fixed action row
         bottom = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None), height=dp(52))
         self.push_btn = Button(text="Push Payload", font_size=sp(16), disabled=True)
         self.subject_btn = Button(text="Subject List", font_size=sp(16), disabled=True)
@@ -2003,7 +2024,7 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: self._set_log_overlay_visible(False))
         btn_clear.bind(on_release=lambda *_: self._clear_log())
 
-        # Menu + event bindings
+        # Menu + events
         self.dropdown = self._build_dropdown()
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
@@ -2023,23 +2044,11 @@ class VolumeToolkitApp(App):
         self._apply_qr_btn_style()
         self._set_controls_idle()
 
+        # init rv data
+        self._rv_rebuild_data()
+
         self.log("Android CCAPI GUI ready")
         return outer
-
-    # ---------- stop ----------
-    def on_stop(self):
-        try:
-            self.stop_liveview()
-        except Exception:
-            pass
-        try:
-            self.stop_polling_new_images()
-        except Exception:
-            pass
-        try:
-            self._decoder_stop.set()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
