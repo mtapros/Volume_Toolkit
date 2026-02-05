@@ -2,15 +2,14 @@
 #
 # v2.1.1
 #
-# Changes from v2.0.9:
+# Based on v2.0.9 (known-good live view + CSV push), with ONLY these behavior changes:
 # - QR Detect button uses same On/Off color scheme as Live View and Autofetch:
 #     OFF: red background, white text
 #     ON:  green background, yellow text
-# - Live preview placement LOCKED (no drag/pan). Zoom is "inside" the fixed preview window
-#   via texture UV cropping (widget size stays constant).
-# - Thumbnail review uses the same zoom control (same fixed viewport).
-# - Active reviewed thumbnail highlighted with a green border.
-# - Close review by tapping the same thumbnail again (toggle). (Preview tap no longer closes.)
+# - Live preview placement LOCKED (no dragging / panning). (No zoom in this version.)
+# - Thumbnail review: active thumb highlighted with green border.
+# - Close thumbnail review by tapping the same thumbnail again (toggle).
+#   (Preview tap no longer exits review.)
 # - Log overlay: non-modal panel on bottom of UI with auto-scroll. Menu toggle.
 # - Full-res endpoint fix:
 #     Primary:  https://{ip}{ccapi_path}
@@ -20,10 +19,7 @@
 # - Stills are rotated to preview orientation and center-cropped to fixed portrait aspect 2:3,
 #   so they fill the preview window exactly and align with framing guides.
 #
-# Notes:
-# - This file is Android-only (uses android.* for SAF).
-# - Pinch zoom: this build provides a reliable zoom gesture by dragging up/down on the
-#   right 25% of the preview. (True 2-finger pinch can be added if needed.)
+# Note: This file is Android-only (uses android.* for SAF).
 #
 import os
 import threading
@@ -89,40 +85,36 @@ class PreviewOverlay(FloatLayout):
     oval_w = NumericProperty(0.333)
     oval_h = NumericProperty(0.333)
 
-    # live/still rotation (90° steps)
+    # live/still rotation
     preview_rotation = NumericProperty(270)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # We draw the texture on a Rectangle so we can zoom by changing tex_coords (UV crop).
-        self._tex_rect = None
-        self._tex = None
+        self.img = Image(allow_stretch=True, keep_ratio=True)
+        try:
+            self.img.fit_mode = "contain"
+        except Exception:
+            pass
+        self.add_widget(self.img)
 
-        # Zoom state: zoom-in-within-window (no widget resizing)
-        self.zoom = 1.0
-        self.zoom_min = 1.0
-        self.zoom_max = 4.0
-
-        with self.canvas:
-            Color(0, 0, 0, 1)
-            self._bg = Rectangle(pos=self.pos, size=self.size)
-
-        with self.canvas.after:
+        lw = 2
+        with self.img.canvas.after:
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
-            self._ln_border = Line(width=2)
+            self._ln_border = Line(width=lw)
 
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
-            self._ln_grid_list = []
 
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
-            self._ln_57 = Line(width=2)
+            self._ln_57 = Line(width=lw)
 
             self._c_810 = Color(1.0, 0.9, 0.2, 0.95)
-            self._ln_810 = Line(width=2)
+            self._ln_810 = Line(width=lw)
 
             self._c_oval = Color(0.7, 0.2, 1.0, 0.95)
-            self._ln_oval = Line(width=2)
+            self._ln_oval = Line(width=lw)
+
+        self._ln_grid_list = []
 
         self.bind(pos=self._redraw, size=self._redraw)
         self.bind(
@@ -131,69 +123,23 @@ class PreviewOverlay(FloatLayout):
             grid_n=self._redraw,
             oval_cx=self._redraw, oval_cy=self._redraw, oval_w=self._redraw, oval_h=self._redraw
         )
+        self.img.bind(pos=self._redraw, size=self._redraw, texture=self._redraw, texture_size=self._redraw)
         self._redraw()
 
-    def reset_zoom(self):
-        self.zoom = 1.0
-        self._update_tex_uv()
-
-    def set_texture(self, texture: Texture):
-        self._tex = texture
-        if self._tex_rect is None:
-            with self.canvas:
-                self._tex_rect = Rectangle(texture=self._tex, pos=self.pos, size=self.size)
-        else:
-            self._tex_rect.texture = self._tex
-        self._update_tex_uv()
+    def set_texture(self, texture):
+        self.img.texture = texture
         self._redraw()
-
-    def _update_tex_uv(self):
-        if not self._tex_rect or not self._tex:
-            return
-        z = max(self.zoom_min, min(float(self.zoom), self.zoom_max))
-        self.zoom = z
-
-        # Center crop UV window of size 1/z
-        w = 1.0 / z
-        h = 1.0 / z
-        u0 = (1.0 - w) / 2.0
-        v0 = (1.0 - h) / 2.0
-        u1 = u0 + w
-        v1 = v0 + h
-
-        # tex_coords order: bl, br, tr, tl
-        self._tex_rect.tex_coords = (u0, v0, u1, v0, u1, v1, u0, v1)
-
-    def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos):
-            touch.grab(self)
-            return True
-        return super().on_touch_down(touch)
-
-    def on_touch_up(self, touch):
-        if touch.grab_current is self:
-            touch.ungrab(self)
-            return True
-        return super().on_touch_up(touch)
-
-    def on_touch_move(self, touch):
-        if touch.grab_current is not self:
-            return super().on_touch_move(touch)
-
-        # Reliable zoom gesture: drag up/down on right 25% of the preview
-        x, _y = touch.pos
-        rx = self.x + self.width * 0.75
-        if x >= rx:
-            dy = touch.dy
-            self.zoom = max(self.zoom_min, min(self.zoom_max, self.zoom + dy * 0.01))
-            self._update_tex_uv()
-            return True
-
-        return True
 
     def _drawn_rect(self):
-        # We always fill the widget; overlays align to widget bounds
-        return (self.x, self.y, self.width, self.height)
+        wx, wy = self.img.pos
+        ww, wh = self.img.size
+        try:
+            iw, ih = self.img.norm_image_size
+        except Exception:
+            return (wx, wy, ww, wh)
+        dx = wx + (ww - iw) / 2.0
+        dy = wy + (wh - ih) / 2.0
+        return (dx, dy, iw, ih)
 
     @staticmethod
     def _center_crop_rect(frame_x, frame_y, frame_w, frame_h, aspect):
@@ -224,13 +170,8 @@ class PreviewOverlay(FloatLayout):
             pass
 
     def _redraw(self, *args):
-        self._bg.pos = self.pos
-        self._bg.size = self.size
-        if self._tex_rect is not None:
-            self._tex_rect.pos = self.pos
-            self._tex_rect.size = self.size
-
         fx, fy, fw, fh = self._drawn_rect()
+
         self._ln_border.rectangle = (fx, fy, fw, fh) if self.show_border else (0, 0, 0, 0)
 
         if self.show_57:
@@ -248,7 +189,7 @@ class PreviewOverlay(FloatLayout):
         n = int(self.grid_n)
         for line in list(self._ln_grid_list):
             try:
-                self.canvas.after.remove(line)
+                self.img.canvas.after.remove(line)
             except Exception:
                 pass
         self._ln_grid_list = []
@@ -257,12 +198,12 @@ class PreviewOverlay(FloatLayout):
             for i in range(1, n):
                 x = fx + fw * (i / n)
                 line = Line(points=[x, fy, x, fy + fh], width=2)
-                self.canvas.after.add(line)
+                self.img.canvas.after.add(line)
                 self._ln_grid_list.append(line)
             for i in range(1, n):
                 y = fy + fh * (i / n)
                 line = Line(points=[fx, y, fx + fw, y], width=2)
-                self.canvas.after.add(line)
+                self.img.canvas.after.add(line)
                 self._ln_grid_list.append(line)
 
         if self.show_oval:
@@ -292,8 +233,7 @@ class CaptureType:
 class VolumeToolkitApp(App):
     capture_type = StringProperty(CaptureType.JPG)
 
-    # Fixed portrait aspect: 2:3 (w/h = 2/3)
-    STILL_TARGET_ASPECT = 2.0 / 3.0
+    STILL_TARGET_ASPECT = 2.0 / 3.0  # portrait (w/h = 2/3)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -360,6 +300,7 @@ class VolumeToolkitApp(App):
         self._thumb_images = []
         self._thumb_paths = []
         self.thumb_dir = "thumbs"
+
         self._active_thumb_index = None
         self._thumb_border_lines = []
 
@@ -394,6 +335,30 @@ class VolumeToolkitApp(App):
         self._log_overlay_label = None
         self._log_overlay_sv = None
 
+    # ---------- lifecycle ----------
+    def on_start(self):
+        if platform == "android":
+            try:
+                from android.permissions import request_permissions, Permission
+                request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
+                self.log("Requested storage permissions (Android).")
+            except Exception as e:
+                self.log(f"Permission request failed: {e}")
+
+    def on_stop(self):
+        try:
+            self.stop_liveview()
+        except Exception:
+            pass
+        try:
+            self.stop_polling_new_images()
+        except Exception:
+            pass
+        try:
+            self._decoder_stop.set()
+        except Exception:
+            pass
+
     # ---------- app exit ----------
     def exit_app(self):
         try:
@@ -405,6 +370,68 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
         self.stop()
+
+    # ---------- logging ----------
+    def log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line)
+        self._log_lines.append(line)
+        if len(self._log_lines) > self._max_log_lines:
+            self._log_lines = self._log_lines[-self._max_log_lines:]
+        self._append_log_overlay()
+
+    def _clear_log(self):
+        self._log_lines = []
+        self._append_log_overlay()
+
+    # ---------- log overlay ----------
+    def _set_log_overlay_visible(self, visible: bool):
+        self._log_overlay_visible = bool(visible)
+        if not hasattr(self, "log_overlay"):
+            return
+        self.log_overlay.opacity = 1.0 if self._log_overlay_visible else 0.0
+        self.log_overlay.disabled = not self._log_overlay_visible
+        self.log_overlay.height = dp(220) if self._log_overlay_visible else 0
+
+    def _append_log_overlay(self):
+        if self._log_overlay_label is None:
+            return
+        self._log_overlay_label.text = "\n".join(self._log_lines)
+        if self._log_overlay_sv is not None:
+            Clock.schedule_once(lambda *_: setattr(self._log_overlay_sv, "scroll_y", 0.0), 0)
+
+    # ---------- HTTP ----------
+    def _json_call(self, method, path, payload=None, timeout=8.0):
+        url = f"https://{self.camera_ip}{path}"
+        try:
+            if method == "GET":
+                resp = self._session.get(url, timeout=timeout)
+            elif method == "POST":
+                resp = self._session.post(url, json=payload, timeout=timeout)
+            elif method == "PUT":
+                resp = self._session.put(url, json=payload, timeout=timeout)
+            elif method == "DELETE":
+                resp = self._session.delete(url, timeout=timeout)
+            else:
+                raise ValueError("Unsupported method")
+
+            status = f"{resp.status_code} {resp.reason}"
+            data = None
+            if resp.content:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = None
+            return status, data
+        except Exception as e:
+            return f"ERR {e}", None
+
+    def _get_bytes(self, url: str, timeout=12.0) -> bytes:
+        resp = self._session.get(url, stream=True, timeout=timeout)
+        if resp.status_code != 200:
+            raise Exception(f"HTTP {resp.status_code} {resp.reason}")
+        return resp.content
 
     # ---------- styling helpers ----------
     @staticmethod
@@ -446,78 +473,6 @@ class VolumeToolkitApp(App):
         else:
             self.qr_btn.text = "QR Detect Off"
             self._set_btn_style(self.qr_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
-
-    # ---------- log overlay ----------
-    def _set_log_overlay_visible(self, visible: bool):
-        self._log_overlay_visible = bool(visible)
-        if not hasattr(self, "log_overlay"):
-            return
-        self.log_overlay.opacity = 1.0 if self._log_overlay_visible else 0.0
-        self.log_overlay.disabled = not self._log_overlay_visible
-        self.log_overlay.height = dp(220) if self._log_overlay_visible else 0
-
-    def _append_log_overlay(self):
-        if self._log_overlay_label is None:
-            return
-        self._log_overlay_label.text = "\n".join(self._log_lines)
-        if self._log_overlay_sv is not None:
-            Clock.schedule_once(lambda *_: setattr(self._log_overlay_sv, "scroll_y", 0.0), 0)
-
-    # ---------- lifecycle ----------
-    def on_start(self):
-        if platform == "android":
-            try:
-                from android.permissions import request_permissions, Permission
-                request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
-                self.log("Requested storage permissions (Android).")
-            except Exception as e:
-                self.log(f"Permission request failed: {e}")
-
-    # ---------- logging ----------
-    def log(self, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        print(line)
-        self._log_lines.append(line)
-        if len(self._log_lines) > self._max_log_lines:
-            self._log_lines = self._log_lines[-self._max_log_lines:]
-        self._append_log_overlay()
-
-    def _clear_log(self):
-        self._log_lines = []
-        self._append_log_overlay()
-
-    # ---------- HTTP ----------
-    def _json_call(self, method, path, payload=None, timeout=8.0):
-        url = f"https://{self.camera_ip}{path}"
-        try:
-            if method == "GET":
-                resp = self._session.get(url, timeout=timeout)
-            elif method == "POST":
-                resp = self._session.post(url, json=payload, timeout=timeout)
-            elif method == "PUT":
-                resp = self._session.put(url, json=payload, timeout=timeout)
-            elif method == "DELETE":
-                resp = self._session.delete(url, timeout=timeout)
-            else:
-                raise ValueError("Unsupported method")
-
-            status = f"{resp.status_code} {resp.reason}"
-            data = None
-            if resp.content:
-                try:
-                    data = resp.json()
-                except Exception:
-                    data = None
-            return status, data
-        except Exception as e:
-            return f"ERR {e}", None
-
-    def _get_bytes(self, url: str, timeout=12.0) -> bytes:
-        resp = self._session.get(url, stream=True, timeout=timeout)
-        if resp.status_code != 200:
-            raise Exception(f"HTTP {resp.status_code} {resp.reason}")
-        return resp.content
 
     # ---------- matching colors ----------
     def _match_trimmed(self, s: str) -> str:
@@ -609,7 +564,6 @@ class VolumeToolkitApp(App):
         self.qr_btn.disabled = not self.connected
         self.push_btn.disabled = not self.connected
         self.subject_btn.disabled = not (self.connected and bool(self.csv_rows))
-
         self._apply_connect_btn_style()
         self._apply_live_btn_style()
         self._apply_autofetch_btn_style()
@@ -622,7 +576,6 @@ class VolumeToolkitApp(App):
         self.qr_btn.disabled = False
         self.push_btn.disabled = False
         self.subject_btn.disabled = not bool(self.csv_rows)
-
         self._apply_connect_btn_style()
         self._apply_live_btn_style()
         self._apply_autofetch_btn_style()
@@ -669,7 +622,6 @@ class VolumeToolkitApp(App):
 
         self.session_started = True
         self.live_running = True
-        self.preview.reset_zoom()
         self._set_controls_running()
 
         with self._lock:
@@ -833,21 +785,21 @@ class VolumeToolkitApp(App):
 
         root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
         root.add_widget(Label(text="Choose payload to push:", size_hint=(1, None), height=dp(30), font_size=sp(14)))
+
         popup = Popup(title="Push Payload", content=root, size_hint=(0.95, 0.6))
 
         for label, value in options:
             preview = value[:120] + ("…" if len(value) > 120 else "")
             btn = Button(text=f"{label}: {preview}", size_hint=(1, None), height=dp(48))
-
             def _make_onpress(lbl=label, val=value):
                 return lambda *_: (popup.dismiss(), self._push_author_value(val, source=lbl))
-
             btn.bind(on_release=_make_onpress())
             root.add_widget(btn)
 
         cancel = Button(text="Cancel", size_hint=(1, None), height=dp(44))
         cancel.bind(on_release=lambda *_: popup.dismiss())
         root.add_widget(cancel)
+
         popup.open()
 
     def _push_author_value(self, raw_value: str, source="manual"):
@@ -1012,13 +964,15 @@ class VolumeToolkitApp(App):
         tgt = float(target_aspect_w_over_h)
         if abs(src_aspect - tgt) < 1e-3:
             return bgr
+
         if src_aspect > tgt:
             new_w = int(h * tgt)
             x0 = max(0, (w - new_w) // 2)
             return bgr[:, x0:x0 + new_w]
-        new_h = int(w / tgt)
-        y0 = max(0, (h - new_h) // 2)
-        return bgr[y0:y0 + new_h, :]
+        else:
+            new_h = int(w / tgt)
+            y0 = max(0, (h - new_h) // 2)
+            return bgr[y0:y0 + new_h, :]
 
     def _decoder_loop(self):
         while not self._decoder_stop.is_set():
@@ -1061,6 +1015,7 @@ class VolumeToolkitApp(App):
 
                 Clock.schedule_once(_update_texture_on_main, 0)
                 self._decode_count += 1
+
             except Exception:
                 continue
 
@@ -1101,7 +1056,7 @@ class VolumeToolkitApp(App):
                 self.log(f"QR: {text}")
         Clock.schedule_once(lambda *_: self._set_payload(text), 0)
 
-    # ---------- thumb highlight / review toggle ----------
+    # ---------- freeze/review + thumbs/full-res ----------
     def _update_thumb_borders(self):
         for idx, img in enumerate(self._thumb_images):
             ln = self._thumb_border_lines[idx]
@@ -1118,16 +1073,8 @@ class VolumeToolkitApp(App):
         self._freeze_request_id += 1
         self._active_thumb_index = None
         self._update_thumb_borders()
-        self.preview.reset_zoom()
         self.log("Review closed (thumb toggle)")
-        # Return to live if available
-        if self._frame_texture is not None:
-            try:
-                self.preview.set_texture(self._frame_texture)
-            except Exception:
-                pass
 
-    # ---------- endpoints ----------
     def _contents_fullres_url(self, ccapi_path: str) -> str:
         prefix = "/ccapi/ver120/contents/"
         if ccapi_path.startswith(prefix):
@@ -1137,18 +1084,16 @@ class VolumeToolkitApp(App):
         sd_path_enc = quote(sd_path, safe="/")
         return f"https://{self.camera_ip}/ccapi/ver100/contents/{sd_path_enc}"
 
-    def _primary_fullres_url(self, ccapi_path: str) -> str:
-        return f"https://{self.camera_ip}{ccapi_path}"
-
     def _download_fullres_and_replace(self, ccapi_path: str, request_id: int):
+        # Primary: https://<ip><ccapi_path>
+        # Fallback: /ccapi/ver100/contents/<sdpath> mapping
         urls = [
-            ("PRIMARY", self._primary_fullres_url(ccapi_path)),
+            ("PRIMARY", f"https://{self.camera_ip}{ccapi_path}"),
             ("FALLBACK", self._contents_fullres_url(ccapi_path)),
         ]
 
         jpg_bytes = None
         used = None
-
         for name, url in urls:
             try:
                 self.log(f"FULLRES {name} START url={url}")
@@ -1172,6 +1117,7 @@ class VolumeToolkitApp(App):
             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if bgr is None:
                 raise Exception("cv2.imdecode failed for full-res")
+
             bgr = self._rotate_bgr(bgr)
             bgr = self._center_crop_bgr_to_aspect(bgr, self.STILL_TARGET_ASPECT)
 
@@ -1179,7 +1125,7 @@ class VolumeToolkitApp(App):
             h, w = rgb.shape[:2]
             rgb_bytes = rgb.tobytes()
         except Exception as e:
-            self.log(f"FULLRES {used} DECODE/CROP ERROR {e}")
+            self.log(f"FULLRES {used} DECODE/ROTATE/CROP ERROR: {e}")
             return
 
         def _apply(_dt, rgb_bytes=rgb_bytes, w=w, h=h):
@@ -1196,11 +1142,10 @@ class VolumeToolkitApp(App):
                 self.preview.set_texture(tex)
                 self.log(f"FULLRES {used} APPLY w={w} h={h}")
             except Exception as e:
-                self.log(f"FULLRES {used} APPLY ERROR {e}")
+                self.log(f"FULLRES {used} APPLY ERROR: {e}")
 
         Clock.schedule_once(_apply, 0)
 
-    # ---------- thumbnail download + freeze pipeline ----------
     def _download_thumb_for_path(self, ccapi_path: str):
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         self.log(f"Downloading thumbnail (bg): {thumb_url}")
@@ -1255,7 +1200,6 @@ class VolumeToolkitApp(App):
             for idx, img in enumerate(self._thumb_images):
                 img.texture = self._thumb_textures[idx] if idx < len(self._thumb_textures) else None
 
-            # keep highlight consistent
             if self._active_thumb_index is not None and self._active_thumb_index >= len(self._thumb_paths):
                 self._active_thumb_index = None
             self._update_thumb_borders()
@@ -1277,32 +1221,32 @@ class VolumeToolkitApp(App):
         ccapi_path = self._thumb_paths[idx]
         thumb_tex = self._thumb_textures[idx]
 
-        # Enter freeze/review mode
+        # Enter freeze mode
+        rid = self._freeze_request_id + 1
         self._freeze_active = True
         self._freeze_ccapi_path = ccapi_path
-        self._freeze_request_id += 1
-        rid = self._freeze_request_id
+        self._freeze_request_id = rid
 
         self._active_thumb_index = idx
         self._update_thumb_borders()
 
-        # Immediate feedback
-        self.preview.set_texture(thumb_tex)
-        self.preview.reset_zoom()
+        self.log(f"Thumb tapped -> freeze (rid={rid}): {ccapi_path}")
 
-        self.log(f"REVIEW START idx={idx} rid={rid} path={ccapi_path}")
+        # immediate response
+        self.preview.set_texture(thumb_tex)
+
+        # background: apply cropped thumb then full-res
         threading.Thread(target=self._freeze_pipeline_for_thumb, args=(ccapi_path, rid), daemon=True).start()
         return True
 
     def _freeze_pipeline_for_thumb(self, ccapi_path: str, request_id: int):
-        # Step 1: fetch thumbnail bytes again so we can rotate + crop to 2:3 for exact fill
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         try:
-            self.log(f"REVIEW THUMB START url={thumb_url}")
+            self.log(f"Freeze thumb fetch START (bg): {thumb_url}")
             b = self._get_bytes(thumb_url, timeout=12.0)
-            self.log(f"REVIEW THUMB OK bytes={len(b)}")
+            self.log(f"Freeze thumb fetch OK (bg): {len(b)} bytes")
         except Exception as e:
-            self.log(f"REVIEW THUMB ERROR {e}")
+            self.log(f"Freeze thumb fetch ERROR: {e}")
             return
 
         try:
@@ -1317,7 +1261,7 @@ class VolumeToolkitApp(App):
             h, w = rgb.shape[:2]
             rgb_bytes = rgb.tobytes()
         except Exception as e:
-            self.log(f"REVIEW THUMB DECODE/CROP ERROR {e}")
+            self.log(f"Freeze thumb decode/rotate/crop ERROR: {e}")
             return
 
         def apply_thumb(_dt):
@@ -1332,14 +1276,12 @@ class VolumeToolkitApp(App):
                 tex.flip_vertical()
                 tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
                 self.preview.set_texture(tex)
-                self.preview.reset_zoom()
-                self.log(f"REVIEW THUMB APPLY w={w} h={h}")
+                self.log(f"Freeze thumb applied to preview: {ccapi_path} ({w}x{h})")
             except Exception as e:
-                self.log(f"REVIEW THUMB APPLY ERROR {e}")
+                self.log(f"Freeze thumb texture apply ERROR: {e}")
 
         Clock.schedule_once(apply_thumb, 0)
 
-        # Step 2: full-res background fetch
         if self.capture_type == CaptureType.JPG:
             self._download_fullres_and_replace(ccapi_path, request_id)
         else:
@@ -1370,173 +1312,7 @@ class VolumeToolkitApp(App):
                         images.append(f)
         return images
 
-    # ---------- Menu + popups ----------
-    def _style_menu_button(self, b):
-        b.background_normal = ""
-        b.background_down = ""
-        b.background_color = (0.10, 0.10, 0.10, 0.80)
-        b.color = (1, 1, 1, 1)
-        return b
-
-    def _build_dropdown(self):
-        dd = DropDown(auto_dismiss=True)
-        dd.auto_width = False
-        dd.width = dp(380)
-        dd.max_height = dp(650)
-
-        with dd.canvas.before:
-            Color(0.0, 0.0, 0.0, 0.80)
-            panel = Rectangle(pos=dd.pos, size=dd.size)
-        dd.bind(pos=lambda *_: setattr(panel, "pos", dd.pos), size=lambda *_: setattr(panel, "size", dd.size))
-
-        def add_header(text):
-            dd.add_widget(Label(text=text, size_hint_y=None, height=dp(26),
-                                font_size=sp(15), color=(1, 1, 1, 1)))
-
-        def add_button(text, on_press):
-            b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
-            self._style_menu_button(b)
-            b.bind(on_release=lambda *_: on_press())
-            dd.add_widget(b)
-
-        def add_toggle(text, initial, on_change):
-            row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(6), 0, dp(6), 0])
-            row.add_widget(Label(text=text, font_size=sp(13), color=(1, 1, 1, 1)))
-            cb = CheckBox(active=initial, size_hint=(None, 1), width=dp(44))
-            cb.bind(active=lambda inst, val: on_change(val))
-            row.add_widget(cb)
-            dd.add_widget(row)
-
-        def add_capture_type_buttons():
-            row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4), padding=[dp(4), 0, dp(4), 0])
-            row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70),
-                                 font_size=sp(13), color=(1, 1, 1, 1)))
-
-            def make_btn(label, ctype):
-                b = Button(text=label, size_hint=(1, 1), font_size=sp(12))
-                self._style_menu_button(b)
-                b.bind(on_release=lambda *_: self._set_capture_type(ctype))
-                return b
-
-            row.add_widget(make_btn("JPG", CaptureType.JPG))
-            row.add_widget(make_btn("RAW", CaptureType.RAW))
-            dd.add_widget(row)
-
-        add_header("Framing")
-        add_button("Reset zoom", lambda: self.preview.reset_zoom())
-
-        add_header("Overlays")
-        add_toggle("Border (blue)", True, lambda v: setattr(self.preview, "show_border", v))
-        add_toggle("Grid (orange)", True, lambda v: setattr(self.preview, "show_grid", v))
-        add_toggle("Crop 5:7 (red)", True, lambda v: setattr(self.preview, "show_57", v))
-        add_toggle("Crop 8:10 (yellow)", True, lambda v: setattr(self.preview, "show_810", v))
-        add_toggle("Oval (purple)", True, lambda v: setattr(self.preview, "show_oval", v))
-
-        add_header("Network")
-        add_button("Set camera IP…", lambda: self._open_ip_popup())
-
-        add_header("Display")
-        add_button("Set display FPS…", lambda: self._open_fps_popup())
-        add_button("Show metrics…", lambda: self._open_metrics_popup())
-        add_toggle("Log overlay", False, lambda v: self._set_log_overlay_visible(v))
-
-        add_header("EXIF / Author")
-        add_button("Refresh Current EXIF now", lambda: self.refresh_exif())
-
-        add_header("CSV")
-        add_button("Load CSV…", lambda: self._open_csv_menu_popup())
-        add_button("Subject List", lambda: self.open_subject_list())
-
-        add_header("Capture")
-        add_capture_type_buttons()
-
-        add_header("Debug")
-        add_button("Clear log", lambda: self._clear_log())
-
-        return dd
-
-    def _set_capture_type(self, ctype):
-        self.capture_type = ctype
-        self.log(f"Capture type set to {ctype}")
-
-    def _open_ip_popup(self):
-        if self._ip_popup is not None:
-            try:
-                self._ip_popup.dismiss()
-            except Exception:
-                pass
-            self._ip_popup = None
-
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Camera IP:", size_hint=(1, None), height=dp(28), font_size=sp(12)))
-        ip_in = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16),
-                          size_hint=(1, None), height=dp(44))
-        root.add_widget(ip_in)
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
-        ok = Button(text="OK")
-        cancel = Button(text="Cancel")
-        btns.add_widget(ok)
-        btns.add_widget(cancel)
-        root.add_widget(btns)
-
-        popup = Popup(title="Set Camera IP", content=root, size_hint=(0.9, 0.4))
-
-        def do_ok(*_):
-            new_ip = ip_in.text.strip()
-            if new_ip:
-                self.camera_ip = new_ip
-                self.log(f"Camera IP set to {self.camera_ip}")
-                if self.connected:
-                    self._set_exif_text("(IP changed; reconnect)")
-            popup.dismiss()
-
-        ok.bind(on_release=do_ok)
-        cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.bind(on_dismiss=lambda *_: setattr(self, "_ip_popup", None))
-        popup.open()
-        self._ip_popup = popup
-
-    def _open_fps_popup(self):
-        if self._fps_popup is not None:
-            try:
-                self._fps_popup.dismiss()
-            except Exception:
-                pass
-            self._fps_popup = None
-
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Display FPS (metrics tick)", size_hint=(1, None), height=dp(28),
-                              font_size=sp(12)))
-
-        slider = Slider(min=5, max=30, value=12, step=1)
-        val_lbl = Label(text="12", size_hint=(1, None), height=dp(22), font_size=sp(12))
-        root.add_widget(slider)
-        root.add_widget(val_lbl)
-        slider.bind(value=lambda inst, v: setattr(val_lbl, "text", str(int(v))))
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
-        ok = Button(text="OK")
-        cancel = Button(text="Cancel")
-        btns.add_widget(ok)
-        btns.add_widget(cancel)
-        root.add_widget(btns)
-
-        popup = Popup(title="Set Display FPS", content=root, size_hint=(0.9, 0.5))
-
-        def do_ok(*_):
-            fps = int(slider.value)
-            self._reschedule_display_loop(fps)
-            self.log(f"Display FPS set to {fps}")
-            popup.dismiss()
-
-        ok.bind(on_release=do_ok)
-        cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.bind(on_dismiss=lambda *_: setattr(self, "_fps_popup", None))
-        popup.open()
-        self._fps_popup = popup
-
-    # ---------- CSV SAF loading + Subject List (from v2.0.9, unchanged) ----------
+    # ---------- CSV SAF loading + Subject List (copied from v2.0.9) ----------
     def _bind_android_activity_once(self):
         if getattr(self, "_android_activity_bound", False):
             return
@@ -1686,7 +1462,12 @@ class VolumeToolkitApp(App):
         root.add_widget(btns)
 
         popup = Popup(title="Select CSV columns", content=root, size_hint=(0.9, 0.9))
-        btn_ok.bind(on_release=lambda *_: (self.log(f"Selected headers: {self.selected_headers}"), popup.dismiss()))
+
+        def do_ok(*_):
+            self.log(f"Selected headers: {self.selected_headers}")
+            popup.dismiss()
+
+        btn_ok.bind(on_release=do_ok)
         btn_cancel.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
         self._headers_popup = popup
@@ -1730,6 +1511,7 @@ class VolumeToolkitApp(App):
         root.add_widget(row_sort)
 
         root.add_widget(Label(text="Filters (contains):", size_hint=(1, None), height=dp(22), font_size=sp(12)))
+
         sv_filters = ScrollView(size_hint=(1, None), height=dp(160), do_scroll_x=False)
         filters_inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
         filters_inner.bind(minimum_height=filters_inner.setter("height"))
@@ -1851,6 +1633,175 @@ class VolumeToolkitApp(App):
         self._subject_popup = popup
         render_results()
 
+    # ---------- Menu + popups ----------
+    def _style_menu_button(self, b):
+        b.background_normal = ""
+        b.background_down = ""
+        b.background_color = (0.10, 0.10, 0.10, 0.80)
+        b.color = (1, 1, 1, 1)
+        return b
+
+    def _build_dropdown(self, reset_callback):
+        dd = DropDown(auto_dismiss=True)
+        dd.auto_width = False
+        dd.width = dp(380)
+        dd.max_height = dp(650)
+
+        with dd.canvas.before:
+            Color(0.0, 0.0, 0.0, 0.80)
+            panel = Rectangle(pos=dd.pos, size=dd.size)
+        dd.bind(pos=lambda *_: setattr(panel, "pos", dd.pos), size=lambda *_: setattr(panel, "size", dd.size))
+
+        def add_header(text):
+            dd.add_widget(Label(text=text, size_hint_y=None, height=dp(26),
+                                font_size=sp(15), color=(1, 1, 1, 1)))
+
+        def add_button(text, on_press):
+            b = Button(text=text, size_hint_y=None, height=dp(40), font_size=sp(13))
+            self._style_menu_button(b)
+            b.bind(on_release=lambda *_: on_press())
+            dd.add_widget(b)
+
+        def add_toggle(text, initial, on_change):
+            row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(6), 0, dp(6), 0])
+            row.add_widget(Label(text=text, font_size=sp(13), color=(1, 1, 1, 1)))
+            cb = CheckBox(active=initial, size_hint=(None, 1), width=dp(44))
+            cb.bind(active=lambda inst, val: on_change(val))
+            row.add_widget(cb)
+            dd.add_widget(row)
+
+        def add_capture_type_buttons():
+            row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4), padding=[dp(4), 0, dp(4), 0])
+            row.add_widget(Label(text="Capture:", size_hint=(None, 1), width=dp(70),
+                                 font_size=sp(13), color=(1, 1, 1, 1)))
+
+            def make_btn(label, ctype):
+                b = Button(text=label, size_hint=(1, 1), font_size=sp(12))
+                self._style_menu_button(b)
+
+                def set_type():
+                    self.capture_type = ctype
+                    self.log(f"Capture type set to {ctype}")
+
+                b.bind(on_release=lambda *_: set_type())
+                return b
+
+            row.add_widget(make_btn("JPG", CaptureType.JPG))
+            row.add_widget(make_btn("RAW", CaptureType.RAW))
+            dd.add_widget(row)
+
+        add_header("Framing")
+        add_button("Reset framing", reset_callback)
+
+        add_header("Overlays")
+        add_toggle("Border (blue)", True, lambda v: setattr(self.preview, "show_border", v))
+        add_toggle("Grid (orange)", True, lambda v: setattr(self.preview, "show_grid", v))
+        add_toggle("Crop 5:7 (red)", True, lambda v: setattr(self.preview, "show_57", v))
+        add_toggle("Crop 8:10 (yellow)", True, lambda v: setattr(self.preview, "show_810", v))
+        add_toggle("Oval (purple)", True, lambda v: setattr(self.preview, "show_oval", v))
+
+        add_header("Network")
+        add_button("Set camera IP…", lambda: self._open_ip_popup())
+
+        add_header("Display")
+        add_button("Set display FPS…", lambda: self._open_fps_popup())
+        add_button("Show metrics…", lambda: self._open_metrics_popup())
+        add_toggle("Log overlay", False, lambda v: self._set_log_overlay_visible(v))
+
+        add_header("EXIF / Author")
+        add_button("Refresh Current EXIF now", lambda: self.refresh_exif())
+
+        add_header("CSV")
+        add_button("Load CSV…", lambda: self._open_csv_menu_popup())
+        add_button("Select headers", lambda: self._open_headers_popup())
+        add_button("Subject List", lambda: self.open_subject_list())
+
+        add_header("Capture")
+        add_capture_type_buttons()
+
+        add_header("Debug")
+        add_button("Clear log", lambda: self._clear_log())
+
+        return dd
+
+    def _open_ip_popup(self):
+        if self._ip_popup is not None:
+            try:
+                self._ip_popup.dismiss()
+            except Exception:
+                pass
+            self._ip_popup = None
+
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Camera IP:", size_hint=(1, None), height=dp(28), font_size=sp(12)))
+        ip_in = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16),
+                          size_hint=(1, None), height=dp(44))
+        root.add_widget(ip_in)
+
+        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
+        ok = Button(text="OK")
+        cancel = Button(text="Cancel")
+        btns.add_widget(ok)
+        btns.add_widget(cancel)
+        root.add_widget(btns)
+
+        popup = Popup(title="Set Camera IP", content=root, size_hint=(0.9, 0.4))
+
+        def do_ok(*_):
+            new_ip = ip_in.text.strip()
+            if new_ip:
+                self.camera_ip = new_ip
+                self.log(f"Camera IP set to {self.camera_ip}")
+                if self.connected:
+                    self._set_exif_text("(IP changed; reconnect)")
+            popup.dismiss()
+
+        ok.bind(on_release=do_ok)
+        cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.bind(on_dismiss=lambda *_: setattr(self, "_ip_popup", None))
+        popup.open()
+        self._ip_popup = popup
+
+    def _open_fps_popup(self):
+        if self._fps_popup is not None:
+            try:
+                self._fps_popup.dismiss()
+            except Exception:
+                pass
+            self._fps_popup = None
+
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        root.add_widget(Label(text="Display FPS (metrics tick)", size_hint=(1, None), height=dp(28),
+                              font_size=sp(12)))
+
+        slider = Slider(min=5, max=30, value=12, step=1)
+        val_lbl = Label(text="12", size_hint=(1, None), height=dp(22), font_size=sp(12))
+        root.add_widget(slider)
+        root.add_widget(val_lbl)
+        slider.bind(value=lambda inst, v: setattr(val_lbl, "text", str(int(v))))
+
+        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
+        ok = Button(text="OK")
+        cancel = Button(text="Cancel")
+        btns.add_widget(ok)
+        btns.add_widget(cancel)
+        root.add_widget(btns)
+
+        popup = Popup(title="Set Display FPS", content=root, size_hint=(0.9, 0.5))
+
+        def do_ok(*_):
+            fps = int(slider.value)
+            self._reschedule_display_loop(fps)
+            self.log(f"Display FPS set to {fps}")
+            popup.dismiss()
+
+        ok.bind(on_release=do_ok)
+        cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.bind(on_dismiss=lambda *_: setattr(self, "_fps_popup", None))
+        popup.open()
+        self._fps_popup = popup
+
+    # ---------- CSV menu ----------
     def _open_csv_menu_popup(self):
         root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
         b1 = Button(text="Load CSV file", size_hint=(1, None), height=dp(48))
@@ -1866,9 +1817,8 @@ class VolumeToolkitApp(App):
         b3.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
 
-    # ---------- build UI ----------
+    # ---------- build ----------
     def build(self):
-        # FloatLayout root so we can overlay log panel on top of UI
         outer = FloatLayout()
 
         main = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8), size_hint=(1, 1))
@@ -1883,6 +1833,7 @@ class VolumeToolkitApp(App):
         main.add_widget(header)
 
         top_font = sp(12)
+
         row2 = BoxLayout(spacing=dp(6), size_hint=(1, None), height=dp(44))
         self.connect_btn = Button(text="Connect", font_size=top_font, size_hint=(1, 1))
         self.start_btn = Button(text="Live View Off", disabled=True, font_size=top_font, size_hint=(1, 1))
@@ -1918,12 +1869,10 @@ class VolumeToolkitApp(App):
         row_csv_payload.add_widget(self.csv_payload_label)
         main.add_widget(row_csv_payload)
 
-        # metrics label is used by metrics popup; not shown directly in main UI
         self.metrics = Label(text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0")
 
         main_area = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 0.6))
 
-        # Preview fixed placement (no Scatter). Zoom is inside the window via UV crop.
         preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
         self.preview = PreviewOverlay(size_hint=(None, None))
         preview_holder.add_widget(self.preview)
@@ -1942,10 +1891,9 @@ class VolumeToolkitApp(App):
             with img.canvas.after:
                 Color(0.2, 1.0, 0.2, 1.0)
                 ln = Line(rectangle=(0, 0, 0, 0), width=3)
-
             img.bind(pos=lambda *_: self._update_thumb_borders(), size=lambda *_: self._update_thumb_borders())
-            sidebar.add_widget(img)
 
+            sidebar.add_widget(img)
             self._thumb_images.append(img)
             self._thumb_border_lines.append(ln)
 
@@ -1966,7 +1914,7 @@ class VolumeToolkitApp(App):
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
-        # Bottom log overlay panel
+        # Bottom log overlay
         self.log_overlay = BoxLayout(
             orientation="vertical",
             size_hint=(1, None),
@@ -2005,8 +1953,8 @@ class VolumeToolkitApp(App):
         btn_close.bind(on_release=lambda *_: self._set_log_overlay_visible(False))
         btn_clear.bind(on_release=lambda *_: self._clear_log())
 
-        # Menu and event bindings
-        self.dropdown = self._build_dropdown()
+        # Menu + event bindings
+        self.dropdown = self._build_dropdown(fit_preview_to_holder)
         self.menu_btn.bind(on_release=lambda *_: self.dropdown.open(self.menu_btn))
 
         self.exit_btn.bind(on_press=lambda *_: self.exit_app())
@@ -2027,23 +1975,6 @@ class VolumeToolkitApp(App):
 
         self.log("Android CCAPI GUI ready")
         return outer
-
-    # ---------- contents listing + poller baseline helpers are already present above ----------
-
-    # ---------- stop ----------
-    def on_stop(self):
-        try:
-            self.stop_liveview()
-        except Exception:
-            pass
-        try:
-            self.stop_polling_new_images()
-        except Exception:
-            pass
-        try:
-            self._decoder_stop.set()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
