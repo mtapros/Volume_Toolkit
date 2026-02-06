@@ -1,13 +1,13 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# v2.1.8
+# v2.1.9
 #
-# Base: v2.1.7
+# Base: v2.1.8
 #
 # Fixes:
-# - Force RV row heights in data + view to prevent white rectangles.
-# - Refresh RV layout + data on row size change and insert.
-# - Middle band height computed from remaining space (no overlap with bottom buttons).
+# - Preview layout: middle uses size_hint_y=1, bottom row fixed height, no manual height math.
+# - Thumb RV wrapped in ScrollView with fixed width.
+# - ThumbRow sets size_hint_x=1 to avoid 0-width collapse.
 #
 import os
 import threading
@@ -246,6 +246,7 @@ class ThumbRow(ButtonBehavior, Image):
         super().__init__(**kwargs)
         self.allow_stretch = True
         self.keep_ratio = True
+        self.size_hint_x = 1
         self.size_hint_y = None
         self.color = (1, 1, 1, 1)
 
@@ -1921,7 +1922,7 @@ class VolumeToolkitApp(App):
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         self.exit_btn = Button(text="Exit", size_hint=(None, 1), width=dp(90), font_size=sp(14))
         header.add_widget(self.exit_btn)
-        header.add_widget(Label(text="Volume Toolkit v2.1.8", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v2.1.9", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         main.add_widget(header)
@@ -1957,32 +1958,34 @@ class VolumeToolkitApp(App):
 
         self.metrics = Label(text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0")
 
-        # Middle band (explicit height)
-        middle = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None))
+        # Middle band (fills remaining space)
+        middle = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 1))
         main.add_widget(middle)
 
         preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
-        self.preview = PreviewOverlay(size_hint=(None, None))
+        self.preview = PreviewOverlay(size_hint=(1, 1))
         preview_holder.add_widget(self.preview)
         middle.add_widget(preview_holder)
 
-        sidebar = BoxLayout(orientation="vertical", size_hint=(0.20, 1), spacing=dp(4))
+        sidebar = BoxLayout(orientation="vertical", size_hint=(None, 1), width=dp(120), spacing=dp(4))
         sidebar.add_widget(Label(text="Most Recent", size_hint=(1, None), height=dp(20), font_size=sp(12)))
 
         self.thumb_rv = ThumbRV(size_hint=(1, 1))
         rbl = RecycleBoxLayout(orientation="vertical", default_size=(None, dp(90)),
-                               default_size_hint=(1, None), size_hint=(1, None))
+                               default_size_hint=(1, None), size_hint=(1, None), spacing=dp(4))
         rbl.bind(minimum_height=rbl.setter("height"))
         self.thumb_rv.layout_manager = rbl
         self.thumb_rv.viewclass = ThumbRow
         self.thumb_rv.add_widget(rbl)
-        sidebar.add_widget(self.thumb_rv)
+
+        thumb_scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
+        thumb_scroll.add_widget(self.thumb_rv)
+        sidebar.add_widget(thumb_scroll)
+
         middle.add_widget(sidebar)
 
         def fit_preview_to_holder(*_):
-            w = preview_holder.width * 0.98
-            h = preview_holder.height * 0.98
-            self.preview.size = (w, h)
+            self.preview.size = preview_holder.size
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
@@ -1997,22 +2000,12 @@ class VolumeToolkitApp(App):
 
         sidebar.bind(size=size_thumb_rows)
 
-        bottom = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None), height=dp(52))
+        bottom = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None), height=dp(96))
         self.push_btn = Button(text="Push Payload", font_size=sp(16), disabled=True)
         self.subject_btn = Button(text="Subject List", font_size=sp(16), disabled=True)
         bottom.add_widget(self.push_btn)
         bottom.add_widget(self.subject_btn)
         main.add_widget(bottom)
-
-        def recalc_middle_height(*_):
-            spacing = main.spacing
-            gaps = 6  # header,row2,row_exif,row_qr,row_csv,middle,bottom
-            used = header.height + row2.height + row_exif.height + row_qr.height + row_csv.height + bottom.height
-            used += spacing * gaps
-            middle.height = max(dp(200), main.height - used)
-
-        main.bind(size=recalc_middle_height)
-        Clock.schedule_once(recalc_middle_height, 0)
 
         # Bottom log overlay
         self.log_overlay = BoxLayout(
