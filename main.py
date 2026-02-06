@@ -1,11 +1,11 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# v2.1.6
+# v2.1.7
 #
-# Base: v2.1.5
+# Base: v2.1.6
 #
 # Fixes:
-# - Guard against zero-size frame in PreviewOverlay._center_crop_rect to prevent ZeroDivisionError.
+# - RV layout manager is both assigned and added as child (required by Kivy).
 #
 import os
 import threading
@@ -195,7 +195,7 @@ class PreviewOverlay(FloatLayout):
                 self.img.canvas.after.add(line)
                 self._ln_grid_list.append(line)
             for i in range(1, n):
-                y = fy + fh * (i / n)
+                y = fy + fw * (i / n)
                 line = Line(points=[fx, y, fx + fw, y], width=2)
                 self.img.canvas.after.add(line)
                 self._ln_grid_list.append(line)
@@ -1912,7 +1912,7 @@ class VolumeToolkitApp(App):
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         self.exit_btn = Button(text="Exit", size_hint=(None, 1), width=dp(90), font_size=sp(14))
         header.add_widget(self.exit_btn)
-        header.add_widget(Label(text="Volume Toolkit v2.1.6", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v2.1.7", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         main.add_widget(header)
@@ -1966,6 +1966,7 @@ class VolumeToolkitApp(App):
         rbl.bind(minimum_height=rbl.setter("height"))
         self.thumb_rv.layout_manager = rbl
         self.thumb_rv.viewclass = ThumbRow
+        self.thumb_rv.add_widget(rbl)
         sidebar.add_widget(self.thumb_rv)
         middle.add_widget(sidebar)
 
