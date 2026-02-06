@@ -18,7 +18,8 @@
 # - Grid line color correction to orange.
 # - Removed duplicate _open_csv_menu_popup definition.
 # - Fixed "Set display FPS" label corruption.
-# - Subject List UI: header/value dropdown search, dropdown filters, sort dropdown.
+# - Subject List UI: column filters + per-column sort toggle.
+# - Payload builder UI: separate ordered list for payload fields.
 #
 import os
 import threading
@@ -304,6 +305,7 @@ class VolumeToolkitApp(App):
         self.csv_headers = []
         self.csv_rows = []
         self.selected_headers = []
+        self.payload_fields = []
         self._headers_popup = None
         self._subject_popup = None
 
@@ -359,17 +361,22 @@ class VolumeToolkitApp(App):
     def _set_btn_style(btn: Button, bg_rgba, fg_rgba):
         btn.background_normal = ""
         btn.background_down = ""
+        btn.background_disabled_normal = ""
+        btn.background_disabled_down = ""
         btn.background_color = bg_rgba
         btn.color = fg_rgba
+        btn.disabled_color = fg_rgba
 
     def _apply_connect_btn_style(self):
         self._set_btn_style(self.connect_btn, (0.10, 0.35, 0.85, 1.0), (1, 1, 1, 1))
         if self.connected:
             self.connect_btn.text = "Connected"
             self.connect_btn.color = (1.0, 1.0, 0.0, 1.0)
+            self.connect_btn.disabled_color = (1.0, 1.0, 0.0, 1.0)
         else:
             self.connect_btn.text = "Connect"
             self.connect_btn.color = (1, 1, 1, 1)
+            self.connect_btn.disabled_color = (1, 1, 1, 1)
 
     def _apply_live_btn_style(self):
         if self.live_running:
@@ -594,7 +601,6 @@ class VolumeToolkitApp(App):
         if e_green:
             self.exif_label.color = GREEN
         else:
-            # if E exists but doesn't match either present payload, exif red
             if E and ((C and E != C) or (Q and E != Q)):
                 self.exif_label.color = RED
             else:
@@ -603,11 +609,9 @@ class VolumeToolkitApp(App):
         if c_green:
             self.csv_payload_label.color = GREEN
         else:
-            # if E matches Q but not C and C exists => C red, else white
             if E and C and (E != C) and (E == Q):
                 self.csv_payload_label.color = RED
             elif E and C and (E != C) and (Q == "" or E != Q):
-                # E does not match C; if E doesn't match Q either, payloads should be white
                 self.csv_payload_label.color = WHITE
             else:
                 self.csv_payload_label.color = WHITE
@@ -1167,7 +1171,6 @@ class VolumeToolkitApp(App):
             return False
         if not self.preview.collide_point(*touch.pos):
             return False
-        # Do not close expanded thumbnail here; use thumbnail retap.
         return False
 
     def _freeze_with_texture(self, ccapi_path: str, tex: Texture):
@@ -1186,7 +1189,6 @@ class VolumeToolkitApp(App):
         else:
             sd_path = ccapi_path.lstrip("/")
 
-        # URL-encode path segments (keep slashes)
         sd_path_enc = quote(sd_path, safe="/")
         return f"https://{self.camera_ip}/ccapi/ver100/contents/{sd_path_enc}"
 
@@ -1269,7 +1271,6 @@ class VolumeToolkitApp(App):
             self.log(f"Thumbnail download error: {e}")
             return
 
-        # Save thumb for inspection
         try:
             os.makedirs(self.thumb_dir, exist_ok=True)
             name = os.path.basename(ccapi_path) or "image"
@@ -1281,7 +1282,6 @@ class VolumeToolkitApp(App):
         except Exception:
             pass
 
-        # Sidebar thumb: rotate CCW 90 so it "looks like" the preview, but keep_ratio in sidebar is fine.
         try:
             pil = PILImage.open(BytesIO(thumb_bytes)).convert("RGB")
             try:
@@ -1349,27 +1349,18 @@ class VolumeToolkitApp(App):
 
         self._set_active_thumb_index(idx)
 
-        # Build a "fill-exact" still from the thumbnail by fetching the thumb bytes again
-        # and cropping to the 2:3 portrait aspect after rotation. This avoids using the
-        # sidebar thumb texture (which is square-ish thumbnail) as the preview still.
-        #
-        # (Yes: this is extra network work; but it ensures perfect framing alignment.)
         rid = self._freeze_request_id + 1
         self._freeze_active = True
         self._freeze_ccapi_path = ccapi_path
         self._freeze_request_id = rid
         self.log(f"Thumb tapped -> freeze (rid={rid}): {ccapi_path}")
 
-        # Immediately show *something* (existing sidebar thumb) so UI responds
         self.preview.set_texture(thumb_tex)
 
-        # Now: in background, download a higher-quality thumbnail (same endpoint) and crop to 2:3 for exact fill,
-        # then set it, then start full-res download.
         threading.Thread(target=self._freeze_pipeline_for_thumb, args=(ccapi_path, rid), daemon=True).start()
         return True
 
     def _freeze_pipeline_for_thumb(self, ccapi_path: str, request_id: int):
-        # Step 1: fetch thumbnail bytes again
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         try:
             self.log(f"Freeze thumb fetch START (bg): {thumb_url}")
@@ -1379,7 +1370,6 @@ class VolumeToolkitApp(App):
             self.log(f"Freeze thumb fetch ERROR: {e}")
             return
 
-        # Step 2: decode -> rotate -> crop to 2:3 -> apply on main thread
         try:
             arr = np.frombuffer(b, dtype=np.uint8)
             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -1413,7 +1403,6 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(apply_thumb, 0)
 
-        # Step 3: full-res in background
         if self.capture_type == CaptureType.JPG:
             self._download_fullres_and_replace(ccapi_path, request_id)
         else:
@@ -1762,6 +1751,8 @@ class VolumeToolkitApp(App):
         self.selected_headers = [h for h in preferred if h in headers]
         if not self.selected_headers and headers:
             self.selected_headers = headers[:3]
+        if not self.payload_fields:
+            self.payload_fields = list(self.selected_headers)
 
     def _open_headers_popup(self):
         if not self.csv_headers:
@@ -1819,8 +1810,10 @@ class VolumeToolkitApp(App):
         self._headers_popup = popup
 
     # ---------- Subject List ----------
-    def _build_csv_payload_from_row(self, row: dict) -> str:
-        headers = self.selected_headers if self.selected_headers else (self.csv_headers[:3] if self.csv_headers else [])
+    def _build_csv_payload_from_row(self, row: dict, headers=None) -> str:
+        headers = headers if headers is not None else (
+            self.selected_headers if self.selected_headers else (self.csv_headers[:3] if self.csv_headers else [])
+        )
         parts = []
         for h in headers:
             parts.append((row.get(h) or "").strip())
@@ -1839,9 +1832,13 @@ class VolumeToolkitApp(App):
                 pass
             self._subject_popup = None
 
-        headers = list(self.csv_headers)
+        columns = self.selected_headers if self.selected_headers else list(self.csv_headers)
+        if not columns:
+            self.log("No CSV headers available for Subject List")
+            return
+
         distinct_values = {}
-        for h in headers:
+        for h in columns:
             vals = set()
             for r in self.csv_rows:
                 v = (r.get(h) or "").strip()
@@ -1849,136 +1846,170 @@ class VolumeToolkitApp(App):
                     vals.add(v)
             distinct_values[h] = sorted(vals)
 
-        def make_dropdown_button(options, initial, on_select):
-            btn = Button(text=initial, size_hint=(1, None), height=dp(34), font_size=sp(12))
-            dd = DropDown()
-            for opt in options:
-                item = Button(text=opt, size_hint_y=None, height=dp(34))
-                item.bind(on_release=lambda inst, val=opt: (dd.dismiss(), on_select(val)))
-                dd.add_widget(item)
-            btn.bind(on_release=dd.open)
-            return btn, dd
+        column_width = dp(140)
 
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
 
-        # Search dropdowns
-        row_search = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
-        row_search.add_widget(Label(text="Search", size_hint=(None, 1), width=dp(70), font_size=sp(12)))
+        root.add_widget(Label(text="Payload builder (underscore-joined):",
+                              size_hint=(1, None), height=dp(22), font_size=sp(12)))
 
-        search_header = {"value": ""}
-        search_value = {"value": ""}
+        payload_preview = Label(text="", size_hint=(1, None), height=dp(22), font_size=sp(12))
+        root.add_widget(payload_preview)
 
-        search_header_btn, search_header_dd = make_dropdown_button(
-            ["(none)"] + headers,
-            "(none)",
-            lambda v: None
-        )
-        search_value_btn, search_value_dd = make_dropdown_button(
-            ["(any)"],
-            "(any)",
-            lambda v: None
-        )
+        payload_controls = BoxLayout(size_hint=(1, None), height=dp(34), spacing=dp(6))
+        payload_add_btn = Button(text="Add field", size_hint=(None, 1), width=dp(110), font_size=sp(12))
+        payload_clear_btn = Button(text="Clear", size_hint=(None, 1), width=dp(70), font_size=sp(12))
+        payload_controls.add_widget(payload_add_btn)
+        payload_controls.add_widget(payload_clear_btn)
+        root.add_widget(payload_controls)
 
-        def set_search_header(val):
-            search_header["value"] = "" if val == "(none)" else val
-            search_header_btn.text = val
-            refresh_search_value_dropdown()
+        payload_dd = DropDown()
+
+        def refresh_payload_dropdown():
+            payload_dd.clear_widgets()
+            for h in self.csv_headers:
+                item = Button(text=h, size_hint_y=None, height=dp(34))
+                item.bind(on_release=lambda inst, val=h: (payload_dd.dismiss(), add_payload_field(val)))
+                payload_dd.add_widget(item)
+
+        def add_payload_field(field):
+            if field and field not in self.payload_fields:
+                self.payload_fields.append(field)
+                render_payload_fields()
+
+        def clear_payload_fields(*_):
+            self.payload_fields = []
+            render_payload_fields()
+
+        payload_add_btn.bind(on_release=lambda *_: payload_dd.open(payload_add_btn))
+        payload_clear_btn.bind(on_release=clear_payload_fields)
+
+        payload_list_sv = ScrollView(size_hint=(1, None), height=dp(120))
+        payload_list = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        payload_list.bind(minimum_height=payload_list.setter("height"))
+        payload_list_sv.add_widget(payload_list)
+        root.add_widget(payload_list_sv)
+
+        def render_payload_fields():
+            payload_list.clear_widgets()
+            if not self.payload_fields:
+                payload_list.add_widget(Label(text="(none)", size_hint_y=None, height=dp(24), font_size=sp(11)))
+            for idx, field in enumerate(self.payload_fields):
+                row = BoxLayout(size_hint_y=None, height=dp(30), spacing=dp(4))
+                lbl = Label(text=field, size_hint=(0.55, 1), font_size=sp(11), halign="left", valign="middle")
+                lbl.bind(size=lbl.setter("text_size"))
+                btn_up = Button(text="↑", size_hint=(0.15, 1), font_size=sp(11))
+                btn_down = Button(text="↓", size_hint=(0.15, 1), font_size=sp(11))
+                btn_del = Button(text="Remove", size_hint=(0.15, 1), font_size=sp(11))
+
+                def move_up(i=idx):
+                    if i > 0:
+                        self.payload_fields[i - 1], self.payload_fields[i] = self.payload_fields[i], self.payload_fields[i - 1]
+                        render_payload_fields()
+
+                def move_down(i=idx):
+                    if i < len(self.payload_fields) - 1:
+                        self.payload_fields[i + 1], self.payload_fields[i] = self.payload_fields[i], self.payload_fields[i + 1]
+                        render_payload_fields()
+
+                def remove_field(i=idx):
+                    if 0 <= i < len(self.payload_fields):
+                        del self.payload_fields[i]
+                        render_payload_fields()
+
+                btn_up.bind(on_release=lambda *_: move_up())
+                btn_down.bind(on_release=lambda *_: move_down())
+                btn_del.bind(on_release=lambda *_: remove_field())
+
+                row.add_widget(lbl)
+                row.add_widget(btn_up)
+                row.add_widget(btn_down)
+                row.add_widget(btn_del)
+                payload_list.add_widget(row)
+
+            preview = "_".join(self.payload_fields) if self.payload_fields else "(none)"
+            payload_preview.text = f"Payload: {preview}"
+
+        refresh_payload_dropdown()
+        render_payload_fields()
+
+        root.add_widget(Label(text="Filters + Sort (per column):", size_hint=(1, None), height=dp(22), font_size=sp(12)))
+
+        filter_values = {h: "" for h in columns}
+        sort_state = {h: 0 for h in columns}
+        sort_buttons = {}
+
+        header_controls = BoxLayout(orientation="horizontal", size_hint=(None, None),
+                                    height=dp(90), width=column_width * len(columns), spacing=dp(6))
+
+        def update_sort_buttons():
+            for h, btn in sort_buttons.items():
+                state = sort_state[h]
+                if state == 1:
+                    btn.text = "Sort: A→Z"
+                elif state == 2:
+                    btn.text = "Sort: Z→A"
+                else:
+                    btn.text = "Sort: -"
+
+        def toggle_sort(h):
+            for k in sort_state.keys():
+                if k != h:
+                    sort_state[k] = 0
+            sort_state[h] = (sort_state[h] + 1) % 3
+            update_sort_buttons()
             render_results()
 
-        def set_search_value(val):
-            search_value["value"] = "" if val == "(any)" else val
-            search_value_btn.text = val
-            render_results()
+        for h in columns:
+            col_box = BoxLayout(orientation="vertical", size_hint=(None, 1), width=column_width, spacing=dp(4))
+            lbl = Label(text=h, font_size=sp(11), size_hint=(1, None), height=dp(18))
+            col_box.add_widget(lbl)
 
-        search_header_dd.dismiss()
-        search_header_btn.bind(on_release=search_header_dd.open)
-        search_header_dd.clear_widgets()
-        for opt in ["(none)"] + headers:
-            item = Button(text=opt, size_hint_y=None, height=dp(34))
-            item.bind(on_release=lambda inst, val=opt: (search_header_dd.dismiss(), set_search_header(val)))
-            search_header_dd.add_widget(item)
+            filter_btn = Button(text="All", size_hint=(1, None), height=dp(28), font_size=sp(11))
+            filter_dd = DropDown()
 
-        def refresh_search_value_dropdown():
-            search_value_dd.clear_widgets()
-            options = ["(any)"]
-            if search_header["value"]:
-                options += distinct_values.get(search_header["value"], [])
-            for opt in options:
-                item = Button(text=opt, size_hint_y=None, height=dp(34))
-                item.bind(on_release=lambda inst, val=opt: (search_value_dd.dismiss(), set_search_value(val)))
-                search_value_dd.add_widget(item)
-            if search_value["value"] and search_value["value"] not in options:
-                search_value["value"] = ""
-                search_value_btn.text = "(any)"
-
-        search_value_btn.bind(on_release=search_value_dd.open)
-
-        row_search.add_widget(search_header_btn)
-        row_search.add_widget(search_value_btn)
-        root.add_widget(row_search)
-
-        # Sort controls
-        row_sort = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
-        row_sort.add_widget(Label(text="Sort by", size_hint=(None, 1), width=dp(70), font_size=sp(12)))
-        default_sort = self.selected_headers[0] if self.selected_headers else (headers[0] if headers else "")
-        sort_header = {"value": default_sort}
-
-        sort_btn, sort_dd = make_dropdown_button(
-            headers if headers else [""],
-            default_sort if default_sort else "(none)",
-            lambda v: None
-        )
-        sort_dd.dismiss()
-        sort_dd.clear_widgets()
-        for opt in headers:
-            item = Button(text=opt, size_hint_y=None, height=dp(34))
-            item.bind(on_release=lambda inst, val=opt: (sort_dd.dismiss(), sort_btn.__setattr__("text", val), sort_header.__setitem__("value", val), render_results()))
-            sort_dd.add_widget(item)
-
-        cb_desc = CheckBox(active=False, size_hint=(None, 1), width=dp(44))
-        row_sort.add_widget(sort_btn)
-        row_sort.add_widget(Label(text="Desc", size_hint=(None, 1), width=dp(50), font_size=sp(12)))
-        row_sort.add_widget(cb_desc)
-        root.add_widget(row_sort)
-
-        root.add_widget(Label(text="Filters (select value):", size_hint=(1, None), height=dp(22), font_size=sp(12)))
-
-        sv_filters = ScrollView(size_hint=(1, None), height=dp(180), do_scroll_x=False)
-        filters_inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
-        filters_inner.bind(minimum_height=filters_inner.setter("height"))
-        sv_filters.add_widget(filters_inner)
-
-        filter_values = {}
-
-        for h in headers:
-            r = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(6))
-            lbl = Label(text=h, size_hint=(0.4, 1), font_size=sp(11), halign="left", valign="middle")
-            lbl.bind(size=lbl.setter("text_size"))
-
-            def _make_filter_setter(header):
+            def make_filter_select(header, btn, dd):
                 def set_filter(val):
-                    if val == "(any)":
+                    if val == "(all)":
                         filter_values[header] = ""
+                        btn.text = "All"
                     else:
                         filter_values[header] = val
+                        btn.text = val
                     render_results()
-                return set_filter
 
-            options = ["(any)"] + distinct_values.get(h, [])
-            btn, dd = make_dropdown_button(options, "(any)", _make_filter_setter(h))
-            btn.size_hint = (0.6, 1)
+                dd.clear_widgets()
+                for opt in ["(all)"] + distinct_values.get(header, []):
+                    item = Button(text=opt, size_hint_y=None, height=dp(34))
+                    item.bind(on_release=lambda inst, val=opt: (dd.dismiss(), set_filter(val)))
+                    dd.add_widget(item)
+                btn.bind(on_release=dd.open)
 
-            r.add_widget(lbl)
-            r.add_widget(btn)
-            filters_inner.add_widget(r)
+            make_filter_select(h, filter_btn, filter_dd)
+            col_box.add_widget(filter_btn)
 
-        root.add_widget(sv_filters)
+            sort_btn = Button(text="Sort: -", size_hint=(1, None), height=dp(28), font_size=sp(11))
+            sort_btn.bind(on_release=lambda *_ , hdr=h: toggle_sort(hdr))
+            sort_buttons[h] = sort_btn
+            col_box.add_widget(sort_btn)
 
-        root.add_widget(Label(text="Results:", size_hint=(1, None), height=dp(22), font_size=sp(12)))
-        sv_results = ScrollView(size_hint=(1, 1), do_scroll_x=False)
-        results_inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
-        results_inner.bind(minimum_height=results_inner.setter("height"))
-        sv_results.add_widget(results_inner)
+            header_controls.add_widget(col_box)
+
+        update_sort_buttons()
+
+        table_container = BoxLayout(orientation="vertical", size_hint=(None, None),
+                                    width=column_width * len(columns), spacing=dp(4))
+        table_container.add_widget(header_controls)
+
+        results_grid = BoxLayout(orientation="vertical", size_hint=(None, None),
+                                 width=column_width * len(columns), spacing=dp(2))
+        results_grid.bind(minimum_height=results_grid.setter("height"))
+
+        table_container.add_widget(results_grid)
+        table_container.bind(minimum_height=table_container.setter("height"))
+
+        sv_results = ScrollView(size_hint=(1, 1), do_scroll_x=True, do_scroll_y=True)
+        sv_results.add_widget(table_container)
         root.add_widget(sv_results)
 
         btn_bar = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
@@ -1993,71 +2024,71 @@ class VolumeToolkitApp(App):
         def compute_filtered_rows():
             rows = self.csv_rows
 
-            # Filters by header dropdowns
             for h, val in filter_values.items():
                 if val:
                     rows = [r for r in rows if (r.get(h) or "").strip().lower() == val.lower()]
 
-            # Search by selected header/value dropdown
-            if search_header["value"] and search_value["value"]:
-                h = search_header["value"]
-                v = search_value["value"]
-                rows = [r for r in rows if (r.get(h) or "").strip().lower() == v.lower()]
+            sort_col = None
+            sort_desc = False
+            for h, state in sort_state.items():
+                if state in (1, 2):
+                    sort_col = h
+                    sort_desc = (state == 2)
+                    break
 
-            # Sort
-            sort_h = sort_header.get("value") or ""
-            if sort_h:
+            if sort_col:
                 def key_fn(r):
-                    return (r.get(sort_h) or "").lower()
+                    return (r.get(sort_col) or "").lower()
                 try:
-                    rows = sorted(rows, key=key_fn, reverse=bool(cb_desc.active))
+                    rows = sorted(rows, key=key_fn, reverse=sort_desc)
                 except Exception:
                     pass
 
             return rows
 
         def render_results():
-            results_inner.clear_widgets()
+            results_grid.clear_widgets()
             rows = compute_filtered_rows()
             max_show = 200
             show_rows = rows[:max_show]
 
             if not show_rows:
-                results_inner.add_widget(Label(text="(no results)", size_hint_y=None, height=dp(24), font_size=sp(12)))
+                results_grid.add_widget(Label(text="(no results)", size_hint=(1, None), height=dp(24), font_size=sp(12)))
                 return
 
-            headers_to_show = self.selected_headers if self.selected_headers else (self.csv_headers[:3] if self.csv_headers else [])
+            fields_for_payload = self.payload_fields if self.payload_fields else (
+                self.selected_headers if self.selected_headers else self.csv_headers[:3]
+            )
 
             for r in show_rows:
-                payload = self._build_csv_payload_from_row(r)
-                display = payload if payload else " / ".join([(r.get(h) or "") for h in headers_to_show])
-                btn = Button(text=display[:120], size_hint_y=None, height=dp(44), font_size=sp(12))
-
-                def _make_pick(row=r, payload=payload):
-                    def _pick(*_):
-                        p = payload or self._build_csv_payload_from_row(row)
-                        self._set_csv_payload(p)
-                        self.log(f"CSV payload selected: {p}")
-                        popup.dismiss()
-                    return _pick
-
-                btn.bind(on_release=_make_pick())
-                results_inner.add_widget(btn)
+                row_box = BoxLayout(orientation="horizontal", size_hint=(None, None),
+                                    width=column_width * len(columns), height=dp(34))
+                for h in columns:
+                    val = (r.get(h) or "")
+                    cell = Button(text=val[:120], size_hint=(None, 1), width=column_width, font_size=sp(11))
+                    def _make_pick(row=r, fields=fields_for_payload):
+                        def _pick(*_):
+                            p = self._build_csv_payload_from_row(row, headers=fields)
+                            self._set_csv_payload(p)
+                            self.log(f"CSV payload selected: {p}")
+                            popup.dismiss()
+                        return _pick
+                    cell.bind(on_release=_make_pick())
+                    row_box.add_widget(cell)
+                results_grid.add_widget(row_box)
 
             if len(rows) > max_show:
-                results_inner.add_widget(Label(
+                results_grid.add_widget(Label(
                     text=f"(showing first {max_show} of {len(rows)} matches)",
-                    size_hint_y=None, height=dp(24), font_size=sp(11)
+                    size_hint=(1, None), height=dp(24), font_size=sp(11)
                 ))
 
         btn_refresh.bind(on_release=lambda *_: render_results())
         btn_close.bind(on_release=lambda *_: popup.dismiss())
-        cb_desc.bind(active=lambda *_: render_results())
 
         popup.bind(on_dismiss=lambda *_: setattr(self, "_subject_popup", None))
         popup.open()
         self._subject_popup = popup
-        refresh_search_value_dropdown()
         render_results()
 
     # ---------- exit / stop ----------
