@@ -1,24 +1,17 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# v2.1.1
+# v2.1.2
 #
-# Base: v2.0.9 (keeps known-good Live View + AutoFetch + CSV load + Push Payload)
+# Base: main2.1.1_Version5.py (provided by user)
 #
-# Changes included:
-# - QR Detect button styling matches Live View / Autofetch (On/Off color scheme).
-# - Remove "Reset framing" (no longer meaningful; placement locked / no zoom).
-# - Layout:
-#   - Compact EXIF / QR / CSV rows.
-#   - Preview + thumb strip are in a middle band above the bottom buttons (no overlap).
-# - Thumbnails:
-#   - Right strip uses RecycleView (shows ~4 items tall).
-#   - Unbounded history list stored on disk (thumbs/) + small texture cache.
-#   - Active reviewed thumb highlighted with a green border.
-#   - Close review by tapping the same thumb again (toggle).
-# - Log overlay: non-modal bottom overlay panel with auto-scroll (menu toggle).
-# - Full-res fetch endpoints:
-#     Primary:  https://{ip}{ccapi_path}
-#     Fallback: https://{ip}/ccapi/ver100/contents/<sdpath> mapping (url-encoded)
+# Fixes vs v2.1.1 (v5):
+# - Thumb strip images render correctly:
+#     * Correct RecycleView setup (layout_manager is not added as a child widget).
+#     * ThumbRow Image fills row; force redraw on texture set.
+#     * Row height changes trigger refresh_from_layout().
+# - Layout fix: preview no longer collides with Push Payload / Subject List buttons:
+#     * Middle band uses explicit computed height based on Window size and fixed rows.
+# - Gridlines color fix: grid lines are orange again (explicitly set grid Color before lines).
 #
 import os
 import threading
@@ -40,7 +33,7 @@ from kivy.clock import Clock
 from kivy.graphics import Color, Line, Rectangle
 from kivy.graphics.texture import Texture
 from kivy.metrics import dp, sp
-from kivy.properties import NumericProperty, BooleanProperty, StringProperty, ObjectProperty, ListProperty
+from kivy.properties import NumericProperty, BooleanProperty, StringProperty, ObjectProperty
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -54,10 +47,10 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.utils import platform
+from kivy.core.window import Window
 
 # RecycleView for scrollable unlimited thumb list
 from kivy.uix.recycleview import RecycleView
-from kivy.uix.recycleview.views import RecycleDataViewBehavior
 from kivy.uix.recycleboxlayout import RecycleBoxLayout
 from kivy.uix.behaviors import ButtonBehavior
 
@@ -107,6 +100,7 @@ class PreviewOverlay(FloatLayout):
             self._c_border = Color(0.2, 0.6, 1.0, 1.0)
             self._ln_border = Line(width=lw)
 
+            # grid color (orange)
             self._c_grid = Color(1.0, 0.6, 0.0, 0.85)
 
             self._c_57 = Color(1.0, 0.2, 0.2, 0.95)
@@ -199,6 +193,9 @@ class PreviewOverlay(FloatLayout):
         self._ln_grid_list = []
 
         if self.show_grid and n >= 2:
+            # Ensure grid color is active (prevents purple bleed from oval color)
+            self._c_grid.rgba = (1.0, 0.6, 0.0, 0.85)
+
             for i in range(1, n):
                 x = fx + fw * (i / n)
                 line = Line(points=[x, fy, x, fy + fh], width=2)
@@ -255,17 +252,17 @@ class ThumbRow(ButtonBehavior, BoxLayout):
         self.size_hint_y = None
         self.height = dp(90)
 
-        self._img = Image(allow_stretch=True, keep_ratio=True)
+        # Important: Image must fill the row; RV may reuse widgets.
+        self._img = Image(allow_stretch=True, keep_ratio=True, size_hint=(1, 1))
         self.add_widget(self._img)
 
         with self.canvas.after:
-            self._c = Color(0.2, 1.0, 0.2, 1.0)
+            Color(0.2, 1.0, 0.2, 1.0)
             self._ln = Line(rectangle=(0, 0, 0, 0), width=3)
 
         self.bind(pos=self._redraw_border, size=self._redraw_border, active=self._redraw_border)
 
     def refresh_view_attrs(self, rv, index, data):
-        # called by RecycleView
         self.app = data.get("app")
         self.index = int(data.get("index", -1))
         self.local_path = data.get("local_path", "")
@@ -275,7 +272,13 @@ class ThumbRow(ButtonBehavior, BoxLayout):
         tex = None
         if self.app is not None and self.local_path:
             tex = self.app._load_thumb_texture_from_file(self.local_path)
+
         self._img.texture = tex
+        # Force draw refresh (helps on some Android/Kivy builds with RV reuse)
+        try:
+            self._img.canvas.ask_update()
+        except Exception:
+            pass
 
         self._redraw_border()
         return super().refresh_view_attrs(rv, index, data)
@@ -388,8 +391,6 @@ class VolumeToolkitApp(App):
 
         # popups
         self.dropdown = None
-        self._ip_popup = None
-        self._fps_popup = None
         self._metrics_popup = None
 
         # freeze (still) mode
@@ -404,6 +405,9 @@ class VolumeToolkitApp(App):
 
         # RV
         self.thumb_rv = None
+
+        # middle band for height control
+        self._middle = None
 
     # ---------- styling helpers ----------
     @staticmethod
@@ -1135,7 +1139,6 @@ class VolumeToolkitApp(App):
         base = os.path.basename(ccapi_path) or "image"
         if not base.lower().endswith((".jpg", ".jpeg")):
             base = base + ".jpg"
-        # Use url-quoted path to avoid invalid chars; still long, so hash it too
         safe = quote(ccapi_path, safe="")
         h = str(abs(hash(safe)))
         name = f"{h}_{base}"
@@ -1332,7 +1335,6 @@ class VolumeToolkitApp(App):
 
         def _add_item(_dt):
             self._thumb_items.insert(0, {"ccapi_path": ccapi_path, "local_path": local_path})
-            # Keep active selection stable: if currently active, it shifts by +1
             if self._active_thumb_index is not None:
                 self._active_thumb_index += 1
             self._rv_rebuild_data()
@@ -1476,16 +1478,9 @@ class VolumeToolkitApp(App):
         add_toggle("Crop 8:10 (yellow)", True, lambda v: setattr(self.preview, "show_810", v))
         add_toggle("Oval (purple)", True, lambda v: setattr(self.preview, "show_oval", v))
 
-        add_header("Network")
-        add_button("Set camera IP…", lambda: self._open_ip_popup())
-
         add_header("Display")
-        add_button("Set display FPS…", lambda: self._open_fps_popup())
         add_button("Show metrics…", lambda: self._open_metrics_popup())
         add_toggle("Log overlay", False, lambda v: self._set_log_overlay_visible(v))
-
-        add_header("EXIF / Author")
-        add_button("Refresh Current EXIF now", lambda: self.refresh_exif())
 
         add_header("CSV")
         add_button("Load CSV…", lambda: self._open_csv_menu_popup())
@@ -1498,66 +1493,6 @@ class VolumeToolkitApp(App):
         add_button("Clear log", lambda: self._clear_log())
 
         return dd
-
-    # ---------- popups ----------
-    def _open_ip_popup(self):
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Camera IP:", size_hint=(1, None), height=dp(28), font_size=sp(12)))
-        ip_in = TextInput(text=self.camera_ip, multiline=False, font_size=sp(16),
-                          size_hint=(1, None), height=dp(44))
-        root.add_widget(ip_in)
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
-        ok = Button(text="OK")
-        cancel = Button(text="Cancel")
-        btns.add_widget(ok)
-        btns.add_widget(cancel)
-        root.add_widget(btns)
-
-        popup = Popup(title="Set Camera IP", content=root, size_hint=(0.9, 0.4))
-
-        def do_ok(*_):
-            new_ip = ip_in.text.strip()
-            if new_ip:
-                self.camera_ip = new_ip
-                self.log(f"Camera IP set to {self.camera_ip}")
-                if self.connected:
-                    self._set_exif_text("(IP changed; reconnect)")
-            popup.dismiss()
-
-        ok.bind(on_release=do_ok)
-        cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.open()
-
-    def _open_fps_popup(self):
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        root.add_widget(Label(text="Display FPS (metrics tick)", size_hint=(1, None), height=dp(28),
-                              font_size=sp(12)))
-
-        slider = Slider(min=5, max=30, value=12, step=1)
-        val_lbl = Label(text="12", size_hint=(1, None), height=dp(22), font_size=sp(12))
-        root.add_widget(slider)
-        root.add_widget(val_lbl)
-        slider.bind(value=lambda inst, v: setattr(val_lbl, "text", str(int(v))))
-
-        btns = BoxLayout(size_hint=(1, None), height=dp(44), spacing=dp(6))
-        ok = Button(text="OK")
-        cancel = Button(text="Cancel")
-        btns.add_widget(ok)
-        btns.add_widget(cancel)
-        root.add_widget(btns)
-
-        popup = Popup(title="Set Display FPS", content=root, size_hint=(0.9, 0.5))
-
-        def do_ok(*_):
-            fps = int(slider.value)
-            self._reschedule_display_loop(fps)
-            self.log(f"Display FPS set to {fps}")
-            popup.dismiss()
-
-        ok.bind(on_release=do_ok)
-        cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.open()
 
     # ---------- CSV menu + SAF + Subject List ----------
     def _open_csv_menu_popup(self):
@@ -1831,6 +1766,7 @@ class VolumeToolkitApp(App):
 
             if search:
                 headers = self.selected_headers if self.selected_headers else self.csv_headers
+
                 def hit(r):
                     for h in headers:
                         if search in ((r.get(h) or "").lower()):
@@ -1895,6 +1831,30 @@ class VolumeToolkitApp(App):
         self._subject_popup = popup
         render_results()
 
+    # ---------- layout helper ----------
+    def _update_middle_height(self, *_):
+        if self._middle is None:
+            return
+
+        fixed = (
+            dp(40) +  # header
+            dp(44) +  # row2
+            dp(28) +  # exif
+            dp(28) +  # qr
+            dp(24) +  # csv
+            dp(52)    # bottom
+        )
+
+        # padding + spacing safety margin
+        fixed += dp(8) * 2  # padding
+        fixed += dp(6) * 8  # spacing approximate
+
+        self._middle.height = max(dp(220), Window.height - fixed)
+
+        # ensure RV re-layout after height changes
+        if self.thumb_rv is not None:
+            Clock.schedule_once(lambda *_: self.thumb_rv.refresh_from_layout(), 0)
+
     # ---------- build ----------
     def build(self):
         outer = FloatLayout()
@@ -1904,7 +1864,7 @@ class VolumeToolkitApp(App):
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         self.exit_btn = Button(text="Exit", size_hint=(None, 1), width=dp(90), font_size=sp(14))
         header.add_widget(self.exit_btn)
-        header.add_widget(Label(text="Volume Toolkit v2.1.1", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v2.1.2", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         main.add_widget(header)
@@ -1940,8 +1900,9 @@ class VolumeToolkitApp(App):
 
         self.metrics = Label(text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0")
 
-        # Middle band
-        middle = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 1))
+        # Middle band: fixed height so it can't overlap bottom buttons
+        middle = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None))
+        self._middle = middle
         main.add_widget(middle)
 
         preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
@@ -1953,13 +1914,18 @@ class VolumeToolkitApp(App):
         sidebar.add_widget(Label(text="Most Recent", size_hint=(1, None), height=dp(20), font_size=sp(12)))
 
         self.thumb_rv = ThumbRV(size_hint=(1, 1))
-        # configure layout manager
-        rbl = RecycleBoxLayout(orientation="vertical", default_size=(None, dp(90)),
-                               default_size_hint=(1, None), size_hint=(1, None))
+
+        # Correct RV setup: layout_manager only, not added as a widget child.
+        rbl = RecycleBoxLayout(
+            orientation="vertical",
+            default_size=(None, dp(90)),
+            default_size_hint=(1, None),
+            size_hint=(1, None)
+        )
         rbl.bind(minimum_height=rbl.setter("height"))
         self.thumb_rv.layout_manager = rbl
         self.thumb_rv.viewclass = ThumbRow
-        self.thumb_rv.add_widget(rbl)
+
         sidebar.add_widget(self.thumb_rv)
         middle.add_widget(sidebar)
 
@@ -1970,11 +1936,12 @@ class VolumeToolkitApp(App):
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
-        # keep thumb list ~4 visible
+        # keep thumb list ~4 visible, and force RV re-layout after size changes
         def size_thumb_rows(*_):
             avail = max(dp(240), sidebar.height - dp(20) - dp(4))
             row_h = max(dp(56), avail / 4.0)
             self.thumb_rv.layout_manager.default_size = (None, row_h)
+            Clock.schedule_once(lambda *_: self.thumb_rv.refresh_from_layout(), 0)
 
         sidebar.bind(size=size_thumb_rows)
 
@@ -2046,6 +2013,10 @@ class VolumeToolkitApp(App):
 
         # init rv data
         self._rv_rebuild_data()
+
+        # middle height updates
+        Clock.schedule_once(self._update_middle_height, 0)
+        Window.bind(size=self._update_middle_height)
 
         self.log("Android CCAPI GUI ready")
         return outer
