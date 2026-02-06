@@ -7,6 +7,15 @@
 #     Primary: https://{ip}{ccapi_path}
 #     Fallback: existing /ccapi/ver100/contents/<sdpath> mapping
 #
+# Changes from v2.1.0:
+# - Autofetch baseline now always starts from the latest image (no older shots).
+# - Expanded thumbnail inherits live preview pinch/zoom via the same Scatter.
+# - Expanded thumbnail closes by retapping the same small thumbnail.
+# - Active thumbnail highlighted with yellow border.
+# - Live View, Autofetch, QR Detect share unified color scheme:
+#     Off: red button, white text
+#     On: green button, yellow text
+#
 import os
 import threading
 import time
@@ -289,6 +298,7 @@ class VolumeToolkitApp(App):
         self._thumb_images = []
         self._thumb_paths = []
         self.thumb_dir = "thumbs"
+        self._active_thumb_index = None
 
         # poller
         self._last_seen_image = None
@@ -362,6 +372,14 @@ class VolumeToolkitApp(App):
         else:
             self.autofetch_btn.text = "Autofetch Off"
             self._set_btn_style(self.autofetch_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
+
+    def _apply_qr_btn_style(self):
+        if self.qr_enabled:
+            self.qr_btn.text = "QR Detect: ON"
+            self._set_btn_style(self.qr_btn, (0.15, 0.65, 0.20, 1.0), (1.0, 1.0, 0.0, 1.0))
+        else:
+            self.qr_btn.text = "QR Detect: OFF"
+            self._set_btn_style(self.qr_btn, (0.80, 0.15, 0.15, 1.0), (1, 1, 1, 1))
 
     # ---------- build ----------
     def build(self):
@@ -476,6 +494,7 @@ class VolumeToolkitApp(App):
         self._apply_connect_btn_style()
         self._apply_live_btn_style()
         self._apply_autofetch_btn_style()
+        self._apply_qr_btn_style()
         self._set_controls_idle()
 
         self.log("Android CCAPI GUI ready")
@@ -513,7 +532,7 @@ class VolumeToolkitApp(App):
             elif method == "PUT":
                 resp = self._session.put(url, json=payload, timeout=timeout)
             elif method == "DELETE":
-                resp = self._session.delete(url, timeout=timeout)
+                resp = self._session.delete(url, json=payload, timeout=timeout)
             else:
                 raise ValueError("Unsupported method")
 
@@ -634,6 +653,7 @@ class VolumeToolkitApp(App):
         self._apply_connect_btn_style()
         self._apply_live_btn_style()
         self._apply_autofetch_btn_style()
+        self._apply_qr_btn_style()
 
     def _set_controls_running(self):
         self.connect_btn.disabled = True
@@ -645,6 +665,7 @@ class VolumeToolkitApp(App):
         self._apply_connect_btn_style()
         self._apply_live_btn_style()
         self._apply_autofetch_btn_style()
+        self._apply_qr_btn_style()
 
     def connect_camera(self):
         if self.live_running:
@@ -812,7 +833,7 @@ class VolumeToolkitApp(App):
     # ---------- QR ----------
     def toggle_qr_detect(self):
         self.qr_enabled = not bool(self.qr_enabled)
-        self.qr_btn.text = "QR Detect: ON" if self.qr_enabled else "QR Detect: OFF"
+        self._apply_qr_btn_style()
         self.log(f"QR detect {'enabled' if self.qr_enabled else 'disabled'}")
 
     # ---------- push payload chooser ----------
@@ -1132,11 +1153,8 @@ class VolumeToolkitApp(App):
             return False
         if not self.preview.collide_point(*touch.pos):
             return False
-        self._freeze_active = False
-        self._freeze_ccapi_path = None
-        self._freeze_request_id += 1
-        self.log("Unfroze preview (returning to live)")
-        return True
+        # Do not close expanded thumbnail here; use thumbnail retap.
+        return False
 
     def _freeze_with_texture(self, ccapi_path: str, tex: Texture):
         self._freeze_active = True
@@ -1208,6 +1226,22 @@ class VolumeToolkitApp(App):
 
         Clock.schedule_once(_apply, 0)
 
+    def _set_active_thumb_index(self, idx):
+        self._active_thumb_index = idx
+        for i, img in enumerate(self._thumb_images):
+            if i == idx:
+                img.canvas.after.clear()
+                with img.canvas.after:
+                    Color(1.0, 1.0, 0.0, 1.0)
+                    Line(rectangle=(img.x, img.y, img.width, img.height), width=2)
+            else:
+                img.canvas.after.clear()
+
+    def _clear_active_thumb(self):
+        self._active_thumb_index = None
+        for img in self._thumb_images:
+            img.canvas.after.clear()
+
     def _download_thumb_for_path(self, ccapi_path: str):
         thumb_url = f"https://{self.camera_ip}{ccapi_path}?kind=thumbnail"
         self.log(f"Downloading thumbnail (bg): {thumb_url}")
@@ -1264,6 +1298,9 @@ class VolumeToolkitApp(App):
             for idx, img in enumerate(self._thumb_images):
                 img.texture = self._thumb_textures[idx] if idx < len(self._thumb_textures) else None
 
+            if self._active_thumb_index is not None:
+                self._set_active_thumb_index(self._active_thumb_index)
+
         Clock.schedule_once(_make_texture_and_update, 0)
 
     def _texture_from_bgr(self, bgr):
@@ -1275,6 +1312,13 @@ class VolumeToolkitApp(App):
         tex.blit_buffer(rgb_bytes, colorfmt="rgb", bufferfmt="ubyte")
         return tex
 
+    def _close_expanded_thumb(self):
+        self._freeze_active = False
+        self._freeze_ccapi_path = None
+        self._freeze_request_id += 1
+        self._clear_active_thumb()
+        self.log("Closed expanded thumbnail (returning to live)")
+
     def _on_thumb_touch(self, image_widget, touch):
         if not image_widget.collide_point(*touch.pos):
             return False
@@ -1284,6 +1328,12 @@ class VolumeToolkitApp(App):
 
         ccapi_path = self._thumb_paths[idx]
         thumb_tex = self._thumb_textures[idx]
+
+        if self._freeze_active and self._freeze_ccapi_path == ccapi_path:
+            self._close_expanded_thumb()
+            return True
+
+        self._set_active_thumb_index(idx)
 
         # Build a "fill-exact" still from the thumbnail by fetching the thumb bytes again
         # and cropping to the 2:3 portrait aspect after rotation. This avoids using the
@@ -1451,7 +1501,7 @@ class VolumeToolkitApp(App):
         add_button("Set camera IP…", lambda: self._open_ip_popup())
 
         add_header("Display")
-        add_button("Set display FPS���", lambda: self._open_fps_popup())
+        add_button("Set display FPS…", lambda: self._open_fps_popup())
         add_button("Show metrics…", lambda: self._open_metrics_popup())
 
         add_header("EXIF / Author")
