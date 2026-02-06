@@ -1,14 +1,11 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# v2.1.5
+# v2.1.6
 #
-# Base: v2.1.4
+# Base: v2.1.5
 #
 # Fixes:
-# - RecycleView row is ButtonBehavior + Image (no nested BoxLayout).
-# - RecycleBoxLayout used only as layout_manager (not added as a child).
-# - refresh_from_layout() on dynamic row height change.
-# - Thumbs load without extra rotation in strip (rotate only once in preview pipeline).
+# - Guard against zero-size frame in PreviewOverlay._center_crop_rect to prevent ZeroDivisionError.
 #
 import os
 import threading
@@ -138,6 +135,8 @@ class PreviewOverlay(FloatLayout):
 
     @staticmethod
     def _center_crop_rect(frame_x, frame_y, frame_w, frame_h, aspect):
+        if frame_w <= 0 or frame_h <= 0:
+            return (frame_x, frame_y, 0, 0)
         frame_aspect = frame_w / frame_h
         if frame_aspect >= aspect:
             h = frame_h
@@ -189,7 +188,7 @@ class PreviewOverlay(FloatLayout):
                 pass
         self._ln_grid_list = []
 
-        if self.show_grid and n >= 2:
+        if self.show_grid and n >= 2 and fw > 0 and fh > 0:
             for i in range(1, n):
                 x = fx + fw * (i / n)
                 line = Line(points=[x, fy, x, fy + fh], width=2)
@@ -201,7 +200,7 @@ class PreviewOverlay(FloatLayout):
                 self.img.canvas.after.add(line)
                 self._ln_grid_list.append(line)
 
-        if self.show_oval:
+        if self.show_oval and fw > 0 and fh > 0:
             cx = fx + fw * float(self.oval_cx)
             cy = fy + fh * float(self.oval_cy)
             ow = fw * float(self.oval_w)
@@ -1913,7 +1912,7 @@ class VolumeToolkitApp(App):
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         self.exit_btn = Button(text="Exit", size_hint=(None, 1), width=dp(90), font_size=sp(14))
         header.add_widget(self.exit_btn)
-        header.add_widget(Label(text="Volume Toolkit v2.1.5", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v2.1.6", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         main.add_widget(header)
