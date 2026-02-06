@@ -1,11 +1,13 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# v2.1.7
+# v2.1.8
 #
-# Base: v2.1.6
+# Base: v2.1.7
 #
 # Fixes:
-# - RV layout manager is both assigned and added as child (required by Kivy).
+# - Force RV row heights in data + view to prevent white rectangles.
+# - Refresh RV layout + data on row size change and insert.
+# - Middle band height computed from remaining space (no overlap with bottom buttons).
 #
 import os
 import threading
@@ -195,7 +197,7 @@ class PreviewOverlay(FloatLayout):
                 self.img.canvas.after.add(line)
                 self._ln_grid_list.append(line)
             for i in range(1, n):
-                y = fy + fw * (i / n)
+                y = fy + fh * (i / n)
                 line = Line(points=[fx, y, fx + fw, y], width=2)
                 self.img.canvas.after.add(line)
                 self._ln_grid_list.append(line)
@@ -232,6 +234,7 @@ class ThumbRow(ButtonBehavior, Image):
       - local_path: str
       - ccapi_path: str
       - active: bool
+      - height: float
     """
     app = ObjectProperty(None)
     index = NumericProperty(-1)
@@ -244,6 +247,7 @@ class ThumbRow(ButtonBehavior, Image):
         self.allow_stretch = True
         self.keep_ratio = True
         self.size_hint_y = None
+        self.color = (1, 1, 1, 1)
 
         with self.canvas.after:
             self._c = Color(0.2, 1.0, 0.2, 1.0)
@@ -257,6 +261,7 @@ class ThumbRow(ButtonBehavior, Image):
         self.local_path = data.get("local_path", "")
         self.ccapi_path = data.get("ccapi_path", "")
         self.active = bool(data.get("active", False))
+        self.height = float(data.get("height", self.height or dp(90)))
 
         tex = None
         if self.app is not None and self.local_path:
@@ -354,6 +359,7 @@ class VolumeToolkitApp(App):
         self.thumb_dir = os.path.join(self.user_data_dir, "thumbs")
         self._active_thumb_index = None
         self._thumb_items_max = 2000
+        self._thumb_row_height = dp(90)
 
         # thumb texture cache
         self._thumb_tex_cache = {}       # local_path -> Texture
@@ -1182,6 +1188,7 @@ class VolumeToolkitApp(App):
             active_idx = self._active_thumb_index
             freeze_active = self._freeze_active
             items = list(self._thumb_items)
+            row_h = float(self._thumb_row_height)
         for i, item in enumerate(items):
             data.append({
                 "app": self,
@@ -1189,8 +1196,10 @@ class VolumeToolkitApp(App):
                 "local_path": item.get("local_path", ""),
                 "ccapi_path": item.get("ccapi_path", ""),
                 "active": (active_idx == i and freeze_active),
+                "height": row_h,
             })
         self.thumb_rv.data = data
+        self.thumb_rv.refresh_from_data()
 
     def _rv_rebuild_data_main(self):
         Clock.schedule_once(lambda *_: self._rv_rebuild_data(), 0)
@@ -1912,7 +1921,7 @@ class VolumeToolkitApp(App):
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         self.exit_btn = Button(text="Exit", size_hint=(None, 1), width=dp(90), font_size=sp(14))
         header.add_widget(self.exit_btn)
-        header.add_widget(Label(text="Volume Toolkit v2.1.7", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v2.1.8", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         main.add_widget(header)
@@ -1948,8 +1957,8 @@ class VolumeToolkitApp(App):
 
         self.metrics = Label(text="Delay: -- ms | Fetch: 0 | Decode: 0 | Display: 0")
 
-        # Middle band
-        middle = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, 1))
+        # Middle band (explicit height)
+        middle = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint=(1, None))
         main.add_widget(middle)
 
         preview_holder = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(0.80, 1))
@@ -1977,12 +1986,14 @@ class VolumeToolkitApp(App):
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
 
-        # keep thumb list ~4 visible
+        # keep thumb list ~4 visible + enforce row height
         def size_thumb_rows(*_):
             avail = max(dp(240), sidebar.height - dp(20) - dp(4))
             row_h = max(dp(56), avail / 4.0)
+            self._thumb_row_height = row_h
             self.thumb_rv.layout_manager.default_size = (None, row_h)
             self.thumb_rv.refresh_from_layout()
+            self._rv_rebuild_data_main()
 
         sidebar.bind(size=size_thumb_rows)
 
@@ -1992,6 +2003,16 @@ class VolumeToolkitApp(App):
         bottom.add_widget(self.push_btn)
         bottom.add_widget(self.subject_btn)
         main.add_widget(bottom)
+
+        def recalc_middle_height(*_):
+            spacing = main.spacing
+            gaps = 6  # header,row2,row_exif,row_qr,row_csv,middle,bottom
+            used = header.height + row2.height + row_exif.height + row_qr.height + row_csv.height + bottom.height
+            used += spacing * gaps
+            middle.height = max(dp(200), main.height - used)
+
+        main.bind(size=recalc_middle_height)
+        Clock.schedule_once(recalc_middle_height, 0)
 
         # Bottom log overlay
         self.log_overlay = BoxLayout(
