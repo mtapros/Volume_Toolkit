@@ -1,14 +1,14 @@
 # Android-focused Volume Toolkit (threaded decoder + background poller)
 #
-# v2.1.3
+# v2.1.5
 #
-# Base: v2.1.1
+# Base: v2.1.4
 #
-# Important fixes:
-# - Main-thread UI updates for log overlay + RV rebuilds.
-# - Shared-state lock for freeze/thumb state.
-# - Stable thumbnail filenames via SHA-1 hash.
-# - Bounded in-memory thumbnail history to avoid unbounded growth.
+# Fixes:
+# - RecycleView row is ButtonBehavior + Image (no nested BoxLayout).
+# - RecycleBoxLayout used only as layout_manager (not added as a child).
+# - refresh_from_layout() on dynamic row height change.
+# - Thumbs load without extra rotation in strip (rotate only once in preview pipeline).
 #
 import os
 import threading
@@ -225,7 +225,7 @@ class CaptureType:
     RAW = "RAW"
 
 
-class ThumbRow(ButtonBehavior, BoxLayout):
+class ThumbRow(ButtonBehavior, Image):
     """
     RecycleView row: clickable thumbnail + border highlight.
     Data keys expected:
@@ -242,12 +242,9 @@ class ThumbRow(ButtonBehavior, BoxLayout):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.orientation = "vertical"
+        self.allow_stretch = True
+        self.keep_ratio = True
         self.size_hint_y = None
-        self.height = dp(90)
-
-        self._img = Image(allow_stretch=True, keep_ratio=True)
-        self.add_widget(self._img)
 
         with self.canvas.after:
             self._c = Color(0.2, 1.0, 0.2, 1.0)
@@ -256,7 +253,6 @@ class ThumbRow(ButtonBehavior, BoxLayout):
         self.bind(pos=self._redraw_border, size=self._redraw_border, active=self._redraw_border)
 
     def refresh_view_attrs(self, rv, index, data):
-        # called by RecycleView
         self.app = data.get("app")
         self.index = int(data.get("index", -1))
         self.local_path = data.get("local_path", "")
@@ -266,7 +262,7 @@ class ThumbRow(ButtonBehavior, BoxLayout):
         tex = None
         if self.app is not None and self.local_path:
             tex = self.app._load_thumb_texture_from_file(self.local_path)
-        self._img.texture = tex
+        self.texture = tex
 
         self._redraw_border()
         return super().refresh_view_attrs(rv, index, data)
@@ -356,7 +352,7 @@ class VolumeToolkitApp(App):
 
         # thumbnails (history)
         self._thumb_items = []  # newest first; dict: {ccapi_path, local_path}
-        self.thumb_dir = "thumbs"
+        self.thumb_dir = os.path.join(self.user_data_dir, "thumbs")
         self._active_thumb_index = None
         self._thumb_items_max = 2000
 
@@ -404,8 +400,10 @@ class VolumeToolkitApp(App):
     def _set_btn_style(btn: Button, bg_rgba, fg_rgba):
         btn.background_normal = ""
         btn.background_down = ""
+        btn.background_disabled_normal = ""
         btn.background_color = bg_rgba
         btn.color = fg_rgba
+        btn.disabled_color = fg_rgba
 
     def _apply_connect_btn_style(self):
         self._set_btn_style(self.connect_btn, (0.10, 0.35, 0.85, 1.0), (1, 1, 1, 1))
@@ -1165,10 +1163,6 @@ class VolumeToolkitApp(App):
             return None
         try:
             pil = PILImage.open(local_path).convert("RGB")
-            try:
-                pil = pil.transpose(PILImage.Transpose.ROTATE_90)
-            except Exception:
-                pil = pil.transpose(PILImage.ROTATE_90)
             pil.thumbnail((240, 240))
             w, h = pil.size
             rgb_bytes = pil.tobytes()
@@ -1343,10 +1337,8 @@ class VolumeToolkitApp(App):
         def _add_item(_dt):
             with self._state_lock:
                 self._thumb_items.insert(0, {"ccapi_path": ccapi_path, "local_path": local_path})
-                # Keep active selection stable: if currently active, it shifts by +1
                 if self._active_thumb_index is not None:
                     self._active_thumb_index += 1
-                # Trim oldest
                 if len(self._thumb_items) > self._thumb_items_max:
                     self._thumb_items = self._thumb_items[:self._thumb_items_max]
             self._rv_rebuild_data()
@@ -1921,7 +1913,7 @@ class VolumeToolkitApp(App):
         header = BoxLayout(size_hint=(1, None), height=dp(40), spacing=dp(6))
         self.exit_btn = Button(text="Exit", size_hint=(None, 1), width=dp(90), font_size=sp(14))
         header.add_widget(self.exit_btn)
-        header.add_widget(Label(text="Volume Toolkit v2.1.3", font_size=sp(18)))
+        header.add_widget(Label(text="Volume Toolkit v2.1.5", font_size=sp(18)))
         self.menu_btn = Button(text="Menu", size_hint=(None, 1), width=dp(90), font_size=sp(16))
         header.add_widget(self.menu_btn)
         main.add_widget(header)
@@ -1970,19 +1962,17 @@ class VolumeToolkitApp(App):
         sidebar.add_widget(Label(text="Most Recent", size_hint=(1, None), height=dp(20), font_size=sp(12)))
 
         self.thumb_rv = ThumbRV(size_hint=(1, 1))
-        # configure layout manager
         rbl = RecycleBoxLayout(orientation="vertical", default_size=(None, dp(90)),
                                default_size_hint=(1, None), size_hint=(1, None))
         rbl.bind(minimum_height=rbl.setter("height"))
         self.thumb_rv.layout_manager = rbl
         self.thumb_rv.viewclass = ThumbRow
-        self.thumb_rv.add_widget(rbl)
         sidebar.add_widget(self.thumb_rv)
         middle.add_widget(sidebar)
 
         def fit_preview_to_holder(*_):
-            w = max(dp(220), preview_holder.width * 0.98)
-            h = max(dp(220), preview_holder.height * 0.98)
+            w = preview_holder.width * 0.98
+            h = preview_holder.height * 0.98
             self.preview.size = (w, h)
 
         preview_holder.bind(pos=fit_preview_to_holder, size=fit_preview_to_holder)
@@ -1992,6 +1982,7 @@ class VolumeToolkitApp(App):
             avail = max(dp(240), sidebar.height - dp(20) - dp(4))
             row_h = max(dp(56), avail / 4.0)
             self.thumb_rv.layout_manager.default_size = (None, row_h)
+            self.thumb_rv.refresh_from_layout()
 
         sidebar.bind(size=size_thumb_rows)
 
